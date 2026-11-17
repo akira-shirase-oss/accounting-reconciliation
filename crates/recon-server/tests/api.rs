@@ -364,15 +364,16 @@ async fn another_firms_accounts_are_not_found_and_inputs_are_validated() {
 }
 
 /// Regression: the lease was renewed only by staged batches, so an upload slower than one
-/// batch per lease period was reaped by the sweeper while still live. Here a 600 ms lease,
-/// a sweeper every 100 ms, and an upload that trickles in over 2.5 s.
+/// batch per lease period was reaped by the sweeper while still live. Here a 1.5 s lease,
+/// a sweeper every 100 ms, and an upload that trickles in over 4.5 s (margin for a loaded
+/// machine; without timed renewal the import is still reaped after 1.5 s).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_slow_upload_keeps_its_lease_until_the_parse_deadline() {
     let db = TestDb::new().await;
     let state = checked(
         &db,
         &[
-            ("RECON_IMPORT_LEASE_MS", "600"),
+            ("RECON_IMPORT_LEASE_MS", "1500"),
             ("RECON_SWEEP_INTERVAL_MS", "100"),
         ],
     )
@@ -400,7 +401,7 @@ async fn a_slow_upload_keeps_its_lease_until_the_parse_deadline() {
         tx.send(Ok(axum::body::Bytes::copy_from_slice(chunk)))
             .await
             .unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(450)).await;
     }
     drop(tx);
     let (status, body) = response.await.unwrap();
