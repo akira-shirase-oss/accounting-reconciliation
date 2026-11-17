@@ -1,0 +1,60 @@
+{
+  "checks": {
+    "decision_log_replays": true,
+    "every_file_complete": true,
+    "every_line_exactly_once": true,
+    "fingerprints_unique_per_account": true,
+    "nothing_left_in_staging": true,
+    "repeats_answered_by_the_earlier_import": true
+  },
+  "checks_pass": true,
+  "commit": "8cb393bc43c8eec80f168c03bead8efaa1cef926",
+  "generator": "gen-v1",
+  "load_average_after": "3:48  up 14:16, 3 users, load averages: 12.36 5.16 3.24",
+  "load_average_before": " 3:47  up 14:15, 3 users, load averages: 14.73 5.22 3.23",
+  "machine": "Apple M2 Pro, 12 cores, 32 GiB, macOS 27.2.1; PostgreSQL in Docker (deploy/compose.yaml) on the same machine",
+  "mode": "full",
+  "pass": true,
+  "results": {
+    "database_growth_bytes": 978190336,
+    "errors": 0,
+    "file_latency_ms": {
+      "max": 410.0,
+      "p50": 54.0,
+      "p95": 90.0,
+      "p99": 402.0
+    },
+    "first_errors": [],
+    "import_seconds": 8.28,
+    "lines_in_database": 1000000,
+    "lines_per_s": 120771.0,
+    "repeats": 100,
+    "repeats_ok": 100,
+    "replay": {
+      "clients": 200,
+      "decisions": 1100,
+      "imports": 1100,
+      "lines": 1000000
+    },
+    "server_peak_rss_bytes": 34045952
+  },
+  "scenario": "r0-import",
+  "shape": {
+    "accounts": 200,
+    "clients": 200,
+    "files": 1000,
+    "firms": 1,
+    "lines": 1000000,
+    "lines_per_file": 1000,
+    "server_import_concurrency": 8,
+    "workers": 8
+  },
+  "thresholds": {
+    "errors_max": 0,
+    "file_p99_ms_max": 3000,
+    "lines_per_s_min": 10000,
+    "server_peak_rss_bytes_max": 268435456
+  },
+  "thresholds_pass": true,
+  "unit": "statement line imported and fingerprinted (D-027, import half)"
+}
