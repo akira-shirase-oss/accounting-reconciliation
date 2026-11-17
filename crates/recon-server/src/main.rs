@@ -69,6 +69,10 @@ async fn run() -> anyhow::Result<ExitCode> {
         header_read_timeout: config.header_read_timeout,
         max_connections: config.max_connections,
         drain_timeout: config.drain_timeout,
+        write_stall: config.write_stall,
+        max_requests_per_connection: config.max_requests_per_connection,
+        max_age: config.connection_max_age,
+        request_grace: config.request_timeout,
     };
     let state = AppState::new(pool.clone(), config, faults);
     tracing::info!(listen = %listener.local_addr()?, "listening");

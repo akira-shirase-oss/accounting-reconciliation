@@ -62,6 +62,13 @@ pub struct Config {
     pub max_in_flight: usize,
     /// Bytes of parsed rows all uploads together may hold before staging (D-050).
     pub staging_budget_bytes: usize,
+    /// Longest a response write may make no progress before its connection is closed
+    /// (D-058).
+    pub write_stall: Duration,
+    /// Most requests one connection serves; the last answer says `Connection: close`.
+    pub max_requests_per_connection: usize,
+    /// Longest a connection lives; then it finishes the request in flight and closes.
+    pub connection_max_age: Duration,
 }
 
 impl fmt::Debug for Config {
@@ -83,6 +90,12 @@ impl fmt::Debug for Config {
             .field("max_connections", &self.max_connections)
             .field("max_in_flight", &self.max_in_flight)
             .field("staging_budget_bytes", &self.staging_budget_bytes)
+            .field("write_stall", &self.write_stall)
+            .field(
+                "max_requests_per_connection",
+                &self.max_requests_per_connection,
+            )
+            .field("connection_max_age", &self.connection_max_age)
             .finish()
     }
 }
@@ -119,6 +132,8 @@ impl Config {
         let statement_timeout = millis("RECON_STATEMENT_TIMEOUT_MS", 10_000, 100, 600_000);
         let acquire_timeout = millis("RECON_DB_ACQUIRE_MS", 1_500, 50, 60_000);
         let header_read_timeout = millis("RECON_HEADER_READ_TIMEOUT_MS", 10_000, 100, 120_000);
+        let write_stall = millis("RECON_WRITE_STALL_MS", 10_000, 100, 120_000);
+        let connection_max_age = millis("RECON_CONNECTION_MAX_AGE_MS", 300_000, 1_000, 3_600_000);
 
         let database_url = get("RECON_DATABASE_URL").unwrap_or_default();
         if database_url.is_empty() {
@@ -149,6 +164,12 @@ impl Config {
         let max_connections = count("RECON_DB_MAX_CONNECTIONS", 32, 256, &mut problems);
         let max_open_connections = count("RECON_MAX_CONNECTIONS", 512, 65_536, &mut problems);
         let max_in_flight = count("RECON_MAX_IN_FLIGHT", 256, 4_096, &mut problems);
+        let max_requests = count(
+            "RECON_MAX_REQUESTS_PER_CONNECTION",
+            1_000,
+            1_000_000,
+            &mut problems,
+        );
         // At least two batches' worth, so one upload can always make progress.
         let staging_budget_mib = count("RECON_STAGING_BUDGET_MIB", 64, 4_096, &mut problems);
         if staging_budget_mib < 8 {
@@ -184,6 +205,9 @@ impl Config {
             staging_budget_bytes: usize::try_from(staging_budget_mib)
                 .unwrap_or(64)
                 .saturating_mul(1024 * 1024),
+            write_stall,
+            max_requests_per_connection: usize::try_from(max_requests).unwrap_or(1_000),
+            connection_max_age,
         })
     }
 

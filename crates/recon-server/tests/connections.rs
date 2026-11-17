@@ -243,3 +243,137 @@ async fn requests_beyond_the_in_flight_limit_are_shed() {
     drop(stalled);
     server.stop().await;
 }
+
+/// A client that sends requests and never reads the answers: once its receive window and
+/// the server's send buffer are full, every write the server attempts is pending.
+async fn non_reader(addr: &str) -> TcpStream {
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.set_recv_buffer_size(2048).unwrap();
+    socket.connect(addr.parse().unwrap()).await.unwrap()
+}
+
+/// Non-reading clients cannot hold the connection slots: a write that makes no progress for
+/// the write-stall deadline closes its connection, and capacity comes back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn non_reading_clients_cannot_hold_connection_slots() {
+    let server = server(&[
+        ("RECON_MAX_CONNECTIONS", "4"),
+        ("RECON_WRITE_STALL_MS", "1000"),
+        ("RECON_MAX_REQUESTS_PER_CONNECTION", "1000000"),
+    ])
+    .await;
+    let target = addr(&server);
+    let mut writers = Vec::new();
+    for _ in 0..4 {
+        let mut stream = non_reader(&target).await;
+        writers.push(tokio::spawn(async move {
+            let requests = b"GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n".repeat(20_000);
+            let _ = stream.write_all(&requests).await;
+            // Hold the socket open without ever reading.
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            drop(stream);
+        }));
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(10);
+    loop {
+        let answered = tokio::time::timeout(
+            Duration::from_secs(2),
+            common::http()
+                .get(format!("{}/healthz", server.base))
+                .send(),
+        )
+        .await;
+        if matches!(answered, Ok(Ok(ref r)) if r.status() == 200) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "non-reading clients still hold every slot after {:?}",
+            started.elapsed()
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    for w in writers {
+        w.abort();
+    }
+    server.stop().await;
+}
+
+/// Pipelined requests past the per-connection cap: the limiting response says
+/// `Connection: close` and nothing after it is answered on that connection.
+#[tokio::test]
+async fn pipelined_requests_past_the_cap_close_the_connection() {
+    let server = server(&[("RECON_MAX_REQUESTS_PER_CONNECTION", "10")]).await;
+    let mut stream = TcpStream::connect(addr(&server)).await.unwrap();
+    stream
+        .write_all(&b"GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n".repeat(20))
+        .await
+        .unwrap();
+    let (responses, closed) = read_until_closed(&mut stream, Duration::from_secs(8)).await;
+    let answered = responses.matches("HTTP/1.1 200").count();
+    assert!(closed, "the connection stayed open after the cap");
+    assert_eq!(
+        answered, 10,
+        "{answered} requests were answered on one connection"
+    );
+    let last = responses
+        .rsplit("HTTP/1.1 200")
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    assert!(
+        last.contains("connection: close"),
+        "the limiting response must say so: {last}"
+    );
+    server.stop().await;
+}
+
+/// A busy keep-alive connection is closed once it outlives its lifetime, after the request
+/// in flight completes.
+#[tokio::test]
+async fn a_busy_connection_is_closed_after_its_lifetime() {
+    let server = server(&[
+        ("RECON_CONNECTION_MAX_AGE_MS", "1500"),
+        ("RECON_HEADER_READ_TIMEOUT_MS", "5000"),
+    ])
+    .await;
+    let mut stream = TcpStream::connect(addr(&server)).await.unwrap();
+    let started = Instant::now();
+    let mut answered = 0;
+    let closed_after = loop {
+        if stream
+            .write_all(b"GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .is_err()
+        {
+            break started.elapsed();
+        }
+        let mut buf = [0_u8; 2048];
+        let read = tokio::time::timeout(Duration::from_secs(3), stream.read(&mut buf))
+            .await
+            .expect("no answer on a live connection");
+        match read {
+            Ok(0) | Err(_) => break started.elapsed(),
+            Ok(n) => {
+                assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200"));
+                answered += 1;
+            }
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(8),
+            "a busy connection outlived its 1.5 s lifetime ({answered} requests)"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert!(
+        answered >= 1,
+        "the connection answered nothing before closing"
+    );
+    assert!(
+        closed_after >= Duration::from_millis(1_400),
+        "closed before its lifetime: {closed_after:?}"
+    );
+    server.stop().await;
+}

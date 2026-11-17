@@ -572,6 +572,21 @@ conservative side.
   hashlib), `the_password_never_appears_and_salts_differ`, and every database
   test logs in through such a verifier.
 
+- **D-058 — A connection's writes, requests and age are bounded too.** The
+  header-read timeout (D-047) does not run while a response write is
+  pending, so a client that sent requests (or pipelined `/readyz`) and never
+  read the answers held its slot indefinitely. Three bounds, because the
+  write deadline alone still lets steady pipelining keep a connection busy:
+  a write-stall deadline (`RECON_WRITE_STALL_MS`, default 10 s: a write or
+  flush that makes no progress that long fails and closes the connection); a
+  requests-per-connection cap (`RECON_MAX_REQUESTS_PER_CONNECTION`, default
+  1,000: the limiting response carries `Connection: close`); and a lifetime
+  (`RECON_CONNECTION_MAX_AGE_MS`, default 5 min: then the connection finishes
+  its request in flight, within the request deadline, and closes). Tests:
+  `non_reading_clients_cannot_hold_connection_slots`,
+  `pipelined_requests_past_the_cap_close_the_connection`,
+  `a_busy_connection_is_closed_after_its_lifetime`.
+
 ## Open questions (blocked on the maintainer or an outside party)
 
 Each is in the README's *Blocked on* table. None blocks R0–R6.
