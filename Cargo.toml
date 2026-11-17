@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/recon-domain", "crates/recon-import", "crates/recon-db"]
+members = ["crates/recon-domain", "crates/recon-import", "crates/recon-db", "crates/recon-cli"]
 resolver = "3"
 
 [workspace.package]
