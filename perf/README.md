@@ -30,6 +30,29 @@ MODE=full scripts/load.sh r0-import    # writes perf/results/r0-import-full-<sta
 MODE=smoke scripts/load.sh r0-import   # 50,000 lines (20 accounts x 5 x 500), target/perf/
 ```
 
+## `r1-import` (ROADMAP R1, D-067)
+
+The same unit, through R1's overlap handling. Each account gets one continuous
+140-day `gen-v2` statement cut into five files whose day windows overlap by
+seven days, so every file after the first repeats the last week of the one
+before byte for byte (about 1,200,000 rows read for 1,000,000 lines in the full
+run: 200 accounts x 5,000 lines). Every tenth file is uploaded again. An upload
+that meets a busy account (`409 account_busy`) is retried after a pause and
+counted.
+
+Checks (all must hold, every run): every line exactly once; fingerprints
+unique; every file complete; no revision held; the overlap rows are duplicates
+(lines created equal the lines, lines plus duplicates equal the rows read);
+nothing staged; repeats answered; the replay check. Thresholds — full: as
+`r0-import`; smoke (20 accounts, CI on every push, gating): at least 1,000
+lines/s, file p99 at most 10,000 ms, peak RSS at most 256 MiB, zero errors.
+`CLIENTS=N` runs fewer accounts as a functional check, never a result.
+
+```sh
+MODE=full scripts/load.sh r1-import    # owed: not yet run (R1)
+MODE=smoke scripts/load.sh r1-import
+```
+
 Run the full size only on a quiet machine (`uptime` load average below about
 6 on this 12-core laptop); otherwise run the smoke and record the full run as
 owed. CI runs the smoke on every push.

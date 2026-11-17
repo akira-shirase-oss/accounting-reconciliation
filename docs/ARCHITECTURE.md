@@ -1,9 +1,10 @@
 # Architecture
 
-R0 (the spine) is built: `recon-domain`, `recon-import`, `recon-db`,
-`recon-server` and `recon-cli` exist with the behaviour described here for
-imports; the rest of this document is the plan for later milestones.
-`DECISIONS.md` D-036 to D-045 record what R0 decided while building.
+R0 (the spine) and R1 (imports) are built: `recon-domain`, `recon-import`,
+`recon-db`, `recon-server` and `recon-cli` exist with the behaviour described
+here for imports and revisions; matching, review, the model, reports and the
+workspace are the plan for later milestones. `DECISIONS.md` D-036 to D-059
+record what R0 decided while building, D-060 to D-067 what R1 decided.
 
 ## Sources of truth
 
@@ -30,7 +31,7 @@ imports; the rest of this document is the plan for later milestones.
 | Piece | Role |
 |---|---|
 | `recon-domain` | Pure types and rules: `Money` over a fixed ISO 4217 exponent table, the normalized line and document, line and match state machines, allocation balancing and residual codes, fingerprints, narration, reference and counterparty normalization, the typed rule language, the scoring function, every limit and named refusal. No I/O — CI enforces it. |
-| `recon-import` | Bounded parsers from bytes to normalized rows: CSV through import profiles (delimiter, encoding, date and number formats, debit/credit columns), OFX 1.x SGML and 2.x XML with entity expansion disabled. Pure functions; fuzzed. |
+| `recon-import` | Bounded parsers from bytes to normalized rows: a streaming decoder (UTF-8, UTF-16 by its mark, declared Windows-1252), strict CSV, CSV statement and document profiles (delimiter, encoding, date and number formats, money-out/money-in columns, balance continuity), OFX 1.x SGML and 2.x XML with no declaration or entity expansion. Pure functions; fuzzed (`fuzz/`). |
 | `recon-match` | The deterministic engine: a candidate index per client and currency, the tiers of D-011, the bounded combination search of D-013, scoring, exception typing. Pure and deterministic — same inputs and engine version, same output — so it is property-tested and benchmarked without a database. |
 | `recon-db` | SQLx over PostgreSQL: migrations, composite-key scoping, staged imports, the decision log with its triggers and hash chain, allocation `CHECK` constraints, leased jobs, reports. |
 | `recon-model` | The provider-neutral model port (a trait) and its adapters: an OpenAI-compatible HTTP adapter, a local-model adapter on loopback, and the recorded-response adapter CI uses. The only crate allowed an HTTP client, and only to configured hosts (D-016, D-024). |
@@ -83,11 +84,14 @@ the decisions. A crash before the flip leaves a `staging` import that
 matching never sees; the job resumes or discards it. A file whose hash is
 already imported answers with the earlier import.
 
-**Revision.** An overlapping import whose lines differ from the stored
-ones in the shared range (a changed amount, a missing or an added line)
-creates a statement revision: differences listed, existing lines never
-overwritten, matched lines that changed become `source_changed` exceptions
-with their match suspended (D-009).
+**Revision.** An import whose dates hold a stored live line the file does
+not have is held as a revision (`202`): its rows kept in `import_held_rows`,
+every difference listed in `import_revision_changes` (added, removed,
+changed with its fields) and pinned by a digest, nothing visible. Accepting
+recomputes the list (refused when stale), supersedes each replaced line with
+its own decision and publishes the rest; rejecting discards it (D-009,
+D-065). Matched lines that changed become `source_changed` exceptions with
+their match suspended from R3.
 
 **Match.** A matching job claims a client's open lines under a lease with a
 fencing token → loads candidates (same client and currency, open amount,
@@ -187,8 +191,9 @@ workers/     pdf                (R9)
 docs/        END_GOAL, ARCHITECTURE, ROADMAP, DECISIONS
 fixtures/    generator seeds, labelled sets, hostile-files, injection,
              model-wrong-match, recorded model responses, import profiles
+fuzz/        cargo-fuzz targets, one per parser (its own workspace, nightly)
 perf/        loadgen (the load driver), results (machine + commit on every run)
-scripts/     check.sh (what CI runs), stack.sh, load.sh, drills
+scripts/     check.sh (what CI runs), stack.sh, load.sh, fuzz.sh
 ```
 
 ## Failure cases

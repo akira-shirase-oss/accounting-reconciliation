@@ -1,0 +1,3 @@
+booking_date,value_date,amount,currency,narration,reference,counterparty,balance_after
+2026-03-01,,100.00,USD,OPENING,,,100.00
+2026-03-02,,-10.00,USD,BREAKS,,,95.00

@@ -1,0 +1,67 @@
+# The cargo-fuzz targets (D-066): one per parser, each checking that any bytes end in a
+# line, a document or a named refusal, never a panic, and that streaming is invisible (the
+# whole input and the same input in chunks give the same outcome). Its own workspace, built
+# with the pinned nightly by `scripts/fuzz.sh` (CI's fuzz job); not a production crate.
+[package]
+name = "recon-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "MIT"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4.13"
+recon-domain = { path = "../crates/recon-domain" }
+recon-import = { path = "../crates/recon-import" }
+uuid = "1.29"
+
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "statement-csv"
+path = "fuzz_targets/statement_csv.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "statement-profile"
+path = "fuzz_targets/statement_profile.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ofx"
+path = "fuzz_targets/ofx.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "documents"
+path = "fuzz_targets/documents.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "amounts-and-dates"
+path = "fuzz_targets/amounts_and_dates.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode"
+path = "fuzz_targets/decode.rs"
+test = false
+doc = false
+bench = false

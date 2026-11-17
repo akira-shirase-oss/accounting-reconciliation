@@ -7,6 +7,10 @@
 #   MODE=smoke scripts/load.sh r0-import   50,000 lines; written under target/perf/
 #                                          (KEEP=1 writes it to perf/results/ as well,
 #                                          labelled smoke)
+#   MODE=full  scripts/load.sh r1-import   1,000,000 lines (200 accounts, a 140-day
+#                                          statement each cut into 5 files overlapping by
+#                                          7 days: about 1,200,000 rows read, the overlap
+#                                          rows duplicates); MODE=smoke: 20 accounts
 #
 # Every result records the machine, the commit (and whether the tree was dirty) and the
 # load average before and after: a run on a busy machine is visibly a busy-machine
@@ -15,8 +19,11 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-scenario="${1:?usage: MODE=full|smoke scripts/load.sh r0-import}"
-[ "$scenario" = "r0-import" ] || { echo "error: unknown scenario $scenario" >&2; exit 2; }
+scenario="${1:?usage: MODE=full|smoke scripts/load.sh r0-import|r1-import}"
+case "$scenario" in
+  r0-import | r1-import) ;;
+  *) echo "error: unknown scenario $scenario" >&2; exit 2 ;;
+esac
 mode="${MODE:-smoke}"
 if [ -z "${RECON_ADMIN_DATABASE_URL:-}" ]; then
   eval "$(scripts/stack.sh env)"
@@ -49,7 +56,7 @@ if [ "$mode" = "full" ] || [ "${KEEP:-}" = "1" ]; then outdir="perf/results"; el
 mkdir -p "$outdir" target/perf
 out="${outdir}/${scenario}-${mode}-${stamp}.json"
 
-MODE="$mode" PORT="${RECON_LOAD_PORT:-62490}" OUT="$out" \
+SCENARIO="$scenario" MODE="$mode" PORT="${RECON_LOAD_PORT:-62490}" OUT="$out" \
 SERVER_BIN="./target/release/recon-server" MACHINE="$machine" COMMIT="$commit" LOAD_BEFORE="$load_before" \
 RECON_DATABASE_URL="postgres://recon_app:${RECON_APP_PASSWORD}@${host}/${db}" \
   ./target/release/recon-loadgen

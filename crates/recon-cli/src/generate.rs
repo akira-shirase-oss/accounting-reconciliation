@@ -30,6 +30,10 @@ pub struct StatementSpec {
     pub days: u32,
     /// Every n-th row repeats the previous one exactly (0: never).
     pub twin_every: u32,
+    /// Only the rows booked on these day indexes (inclusive, from 0) are written; the
+    /// sequence is generated whole, so two windows of one spec share their common days'
+    /// rows byte for byte, running balances included (the `r1-import` overlaps).
+    pub window: Option<(u32, u32)>,
 }
 
 impl StatementSpec {
@@ -42,6 +46,7 @@ impl StatementSpec {
             start,
             days: 28,
             twin_every: 997,
+            window: None,
         }
     }
 }
@@ -110,7 +115,8 @@ fn add_days(start: Date, days: u32) -> Date {
     d
 }
 
-/// Writes the statement as `r0-generic-csv` v1 to `out`. Returns the number of data rows.
+/// Writes the statement as `r0-generic-csv` to `out`. Returns the number of data rows
+/// written (all of them, or the window's).
 pub fn write_statement(spec: &StatementSpec, out: &mut impl Write) -> io::Result<u32> {
     let mut rng = Rng::new(spec.seed);
     let exponent = u32::from(spec.currency.exponent());
@@ -122,8 +128,9 @@ pub fn write_statement(spec: &StatementSpec, out: &mut impl Write) -> io::Result
     buf.extend_from_slice(
         b"booking_date,value_date,amount,currency,narration,reference,counterparty,balance_after\n",
     );
-    // The previous row without its balance, and its amount, for a twin.
-    let mut previous: Option<(Vec<u8>, i64)> = None;
+    // The previous row without its balance, its amount and its day, for a twin.
+    let mut previous: Option<(Vec<u8>, i64, u32)> = None;
+    let mut written = 0_u32;
     let days = spec.days.max(1);
     let mut date = spec.start;
     let mut day_index = 0_u32;
@@ -136,17 +143,24 @@ pub fn write_statement(spec: &StatementSpec, out: &mut impl Write) -> io::Result
             day_index = target_day;
         }
         let twin = spec.twin_every > 0 && i > 0 && i % spec.twin_every == 0;
-        if let Some((head, amount)) = previous.as_ref().filter(|_| twin) {
+        let in_window = |day: u32| spec.window.is_none_or(|(a, b)| (a..=b).contains(&day));
+        if let Some((head, amount, day)) = previous.as_ref().filter(|_| twin) {
             // An identical twin: same day, amount, narration and reference; the balance
-            // moves on by the amount again.
+            // moves on by the amount again. It is booked on the original's day.
             balance = balance.saturating_add(*amount);
-            buf.extend_from_slice(head);
-            push_balance(&mut buf, balance, spec.currency);
+            if in_window(*day) {
+                buf.extend_from_slice(head);
+                push_balance(&mut buf, balance, spec.currency);
+                written = written.saturating_add(1);
+            }
         } else {
             let (head, amount) = row(&mut rng, spec, date, unit, &mut balance, i);
-            buf.extend_from_slice(&head);
-            push_balance(&mut buf, balance, spec.currency);
-            previous = Some((head, amount));
+            if in_window(day_index) {
+                buf.extend_from_slice(&head);
+                push_balance(&mut buf, balance, spec.currency);
+                written = written.saturating_add(1);
+            }
+            previous = Some((head, amount, day_index));
         }
         if buf.len() >= 192 * 1024 {
             out.write_all(&buf)?;
@@ -155,7 +169,7 @@ pub fn write_statement(spec: &StatementSpec, out: &mut impl Write) -> io::Result
     }
     out.write_all(&buf)?;
     out.flush()?;
-    Ok(spec.lines)
+    Ok(written)
 }
 
 fn push_balance(out: &mut Vec<u8>, balance: i64, currency: Currency) {
@@ -270,6 +284,34 @@ mod tests {
             assert_eq!(lines.len(), 5_000);
             // Twins are present and identical.
             assert_eq!(lines[997].tuple_hash, lines[996].tuple_hash);
+            // Two windows of one spec share their common days' rows byte for byte, and
+            // each window's balances continue (the parser accepts it).
+            let first = statement(&StatementSpec {
+                window: Some((0, 14)),
+                ..spec
+            });
+            let second = statement(&StatementSpec {
+                window: Some((10, 27)),
+                ..spec
+            });
+            let rows = |b: &[u8]| -> Vec<Vec<u8>> {
+                b.split(|c| *c == b'\n')
+                    .skip(1)
+                    .map(<[u8]>::to_vec)
+                    .collect()
+            };
+            let later: std::collections::HashSet<Vec<u8>> = rows(&second).into_iter().collect();
+            let shared: Vec<_> = rows(&first)
+                .into_iter()
+                .filter(|r| later.contains(r))
+                .collect();
+            assert!(shared.len() > 500, "{} shared rows", shared.len());
+            let mut parser = StatementParser::new(AccountContext {
+                account: AccountId::from_uuid(Uuid::from_u128(1)),
+                currency,
+            });
+            parser.push(&second, &mut |_| {}).unwrap();
+            assert!(parser.finish(&mut |_| {}).unwrap().is_clean());
             assert!(lines.last().unwrap().booking_date <= Date::new(2026, 3, 1).unwrap());
         }
     }

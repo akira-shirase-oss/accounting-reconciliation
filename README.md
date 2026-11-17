@@ -3,10 +3,13 @@
 > **Status — in development.** R0, the spine, is done, including an
 > independent review's fixes: CI, the pure domain, the import path through
 > staging with its database guards, the `kill-mid-import` and `db-down`
-> drills, and a 1,000,000-line `r0-import` load run (`perf/results/`;
-> `docs/ROADMAP.md` names the tests, the evidence and what is owed). Nothing here
-> matches documents yet (R2). The ship gate needs one or two real
-> accountants, who have not been found yet (see *Blocked on*).
+> drills, and a 1,000,000-line `r0-import` load run (`perf/results/`). R1, the
+> imports, is built and its gate met except the full 1,000,000-line `r1-import`
+> run, which is owed: declared CSV profiles, OFX, document imports, overlap
+> detection, statement revisions held for a person, the hostile-file drill and
+> six fuzz targets (`docs/ROADMAP.md` names the tests, the evidence and what is
+> owed). Nothing here matches documents yet (R2). The ship gate needs one or
+> two real accountants, who have not been found yet (see *Blocked on*).
 
 Bank statements and invoices in; every bank line out as matched, excluded
 or an exception — each with a decision you can explain. A reconciliation
@@ -57,9 +60,9 @@ in `docs/DECISIONS.md`.
   R3 review, rules and periods → R4 the model for ambiguous cases → R5
   reports and workspace → R6 evidence battery → R7 pilot and ship gate →
   R8 India → R9 PDF
-- `docs/DECISIONS.md` — D-001 to D-057 and the questions still open
+- `docs/DECISIONS.md` — D-001 to D-067 and the questions still open
 
-## Running it (R0)
+## Running it (R0, R1)
 
 ```sh
 scripts/stack.sh up        # PostgreSQL 18.7 on 127.0.0.1:62432 (compose project accounting-reconciliation)
@@ -67,7 +70,19 @@ scripts/stack.sh setup     # roles recon_owner / recon_runtime / recon_app, data
 eval "$(scripts/stack.sh env)"
 RECON_OPERATOR_TOKEN=$(openssl rand -hex 24) cargo run -p recon-server   # 127.0.0.1:62480
 scripts/check.sh           # what CI runs: fmt, clippy, architecture, tests, drills, cargo-deny
+FUZZ_TOOLCHAIN=nightly FUZZ_SECONDS=20 scripts/fuzz.sh   # CI's fuzz job (60 s per target)
 ```
+
+Imports (every `/v1` route takes `Authorization: Bearer $RECON_OPERATOR_TOKEN`):
+
+| Route | What it does |
+|---|---|
+| `POST /v1/firms/{f}/profiles` | store the next version of a CSV profile (`statement_csv` or `documents_csv`, D-062) |
+| `GET /v1/firms/{f}/profiles/{name}[?version=]` | a profile: the firm's, or `r0-generic-csv`, `ofx`, `r1-generic-documents` |
+| `POST /v1/firms/{f}/accounts/{a}/imports[?profile=&version=]` | a statement: `text/csv`, or `application/x-ofx` with `profile=ofx`; `201` complete, `200` the same file again, `202` held as a revision, `422` refused with rows (or `ambiguous_date_format` with its question) |
+| `POST /v1/firms/{f}/clients/{c}/document-imports[?profile=]` | invoices, bills, receipts, credit notes, book entries (`text/csv`) |
+| `GET /v1/firms/{f}/imports/{i}[/changes]` | an import; a revision's differences |
+| `POST /v1/firms/{f}/imports/{i}/accept`, `…/reject` | decide a held revision (D-065) |
 
 Prefix cargo with `export PATH="$(brew --prefix rustup)/bin:$PATH"` on a
 machine where Homebrew's cargo shadows rustup (the toolchain is pinned to

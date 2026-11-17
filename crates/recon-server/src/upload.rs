@@ -4,7 +4,7 @@
 //!
 //! Bounded at every step: one import permit per upload (none free: `503`, never queued);
 //! 50 MiB (by `Content-Length` before reading, and by counting while reading); 60 s to
-//! parse; 15 s of silence between chunks; one staged batch of 5,000 rows or 4 MiB in memory,
+//! parse; 15 s of silence between chunks; one staged batch of 5,000 rows or 1 MiB in memory (D-067),
 //! under a staging budget shared by every upload, and the next chunk is not read until it is
 //! stored (backpressure). Any refused row refuses the file and nothing is persisted. A `201`
 //! (complete), `200` (the same file again) or `202` (held as a revision, D-065) is sent only
@@ -411,7 +411,7 @@ async fn read_and_stage<P: FileParser>(
                 None => reserved = Some(more),
             }
         }
-        // Exact cuts: 5,000 rows, or fewer when 4 MiB comes first (at least one row).
+        // Exact cuts: 5,000 rows, or fewer when 1 MiB comes first (at least one row).
         while batch.len() >= imports::STAGING_BATCH_ROWS
             || batch_bytes >= imports::STAGING_BATCH_BYTES
         {
@@ -442,7 +442,7 @@ async fn read_and_stage<P: FileParser>(
     }
 }
 
-/// The first batch to stage: up to 5,000 rows and 4 MiB, at least one row. Returns the row
+/// The first batch to stage: up to 5,000 rows and 1 MiB, at least one row. Returns the row
 /// count and its bytes.
 fn batch_cut<R: StagedRow>(batch: &[R]) -> (usize, usize) {
     let mut cut = 0_usize;

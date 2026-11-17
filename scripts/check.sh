@@ -3,7 +3,8 @@
 # directly (set -e, no pipes into grep): the toolchain pin, formatting, Clippy with
 # warnings denied (plus the fault-injection build the drills use), the architecture rules
 # and the proof that each can fail, every test against the local stack (started here
-# when RECON_TEST_ADMIN_URL is unset), the drills, then cargo-deny when installed.
+# when RECON_TEST_ADMIN_URL is unset), the drills, then cargo-deny when installed. Fuzzing
+# is CI's own job (scripts/fuzz.sh, a minute per target), not part of this gate.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

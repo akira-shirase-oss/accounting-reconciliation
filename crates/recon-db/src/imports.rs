@@ -32,6 +32,7 @@ use recon_domain::import::{
     DiscardReason, FileHash, ImportKind, ImportStatus, NewLine, PROFILE_R0, PROFILE_R0_VERSION,
     StagedRow,
 };
+use recon_domain::limits::MAX_UPLOAD_BYTES;
 use recon_domain::line::ActorKind;
 use recon_domain::refusal::{RefusalCode, RowRefusal};
 use recon_domain::{AccountId, ClientId, Currency, Date, FirmId, ImportId};
@@ -49,7 +50,10 @@ use crate::tenancy::Account;
 /// Rows per staged batch: one statement, one short transaction.
 pub const STAGING_BATCH_ROWS: usize = 5_000;
 /// Bytes per staged batch ([`StagedRow::heap_bytes`]): wide rows flush before 5,000 (D-050).
-pub const STAGING_BATCH_BYTES: usize = 4 * 1024 * 1024;
+/// 1 MiB, not R0's 4 MiB (D-067): measured by the hostile drill, a valid 50 MiB wide-row
+/// file grew the server by 111 MiB at 4 MiB — the allocator kept each batch's freed
+/// multi-MiB encoding buffers resident — and by 9 MiB at 1 MiB, in the same time.
+pub const STAGING_BATCH_BYTES: usize = 1024 * 1024;
 /// The document fingerprint's version, recorded with document imports (D-064).
 pub const DOCUMENT_FINGERPRINT_VERSION: &str = "document-v1";
 /// Most revision changes one page lists.
@@ -1972,7 +1976,7 @@ pub struct Refusal<'a> {
     pub refusals: &'a [RowRefusal],
     /// The file's hash, when it was read to the end.
     pub file_hash: Option<FileHash>,
-    /// Bytes read.
+    /// Bytes read (recorded at most as the 50 MiB bound).
     pub file_bytes: u64,
     /// The question to put to the user (`ambiguous_date_format`).
     pub question: Option<serde_json::Value>,
@@ -2035,7 +2039,10 @@ async fn refuse_in(
     .bind(refusal.rows_read.map(count_i32).transpose()?)
     .bind(count_i32(refusal.rows_refused)?)
     .bind(refusal.file_hash.as_ref().map(|h| h.0.to_vec()))
-    .bind(i64::try_from(refusal.file_bytes).unwrap_or(i64::MAX))
+    // A file refused as too large was read past the bound before the refusal: it records
+    // the bound it passed. Recording what was read broke the column's check, so the refusal
+    // was lost (`409`, the import left to the sweeper) — found by the hostile drill.
+    .bind(i64::try_from(refusal.file_bytes.min(MAX_UPLOAD_BYTES)).unwrap_or(i64::MAX))
     .bind(refusal.question.as_ref().map(Json))
     .execute(&mut *tx)
     .await?;

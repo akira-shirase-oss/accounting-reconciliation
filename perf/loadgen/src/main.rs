@@ -1,5 +1,12 @@
-//! `recon-loadgen`: the `r0-import` load scenario (ROADMAP R0; the unit, D-027, is one
-//! statement line taken through import).
+//! `recon-loadgen`: the `r0-import` and `r1-import` load scenarios (ROADMAP R0 and R1; the
+//! unit, D-027, is one statement line taken through import).
+//!
+//! `r1-import` (D-067) gives each account one continuous 140-day statement cut into five
+//! files whose day windows overlap by seven days, so every file after the first repeats the
+//! last week of the one before byte for byte: those rows must come back as duplicates
+//! naming the existing lines, never as new lines and never as a revision; identical twins
+//! inside a file must both stay. Uploads that meet a busy account (`409 account_busy`) are
+//! retried after `Retry-After`, and counted.
 //!
 //! It starts the release `recon-server` under `/usr/bin/time` (for an exact peak RSS),
 //! creates one firm with `clients` clients and one account each, then `workers` concurrent
@@ -26,6 +33,7 @@ use tokio::process::Command;
 use tokio::sync::Mutex;
 
 struct Plan {
+    scenario: String,
     mode: String,
     clients: usize,
     files_per_account: usize,
@@ -46,13 +54,23 @@ fn env(name: &str) -> anyhow::Result<String> {
 
 impl Plan {
     fn from_env() -> anyhow::Result<Self> {
+        let scenario = std::env::var("SCENARIO").unwrap_or_else(|_| "r0-import".into());
+        if !matches!(scenario.as_str(), "r0-import" | "r1-import") {
+            bail!("SCENARIO must be r0-import or r1-import, not {scenario:?}");
+        }
         let mode = std::env::var("MODE").unwrap_or_else(|_| "smoke".into());
         let (clients, files, lines) = match mode.as_str() {
             "full" => (200, 5, 1_000),
             "smoke" => (20, 5, 500),
             other => bail!("MODE must be full or smoke, not {other:?}"),
         };
+        // A functional check with fewer accounts (not a load result; see perf/README.md).
+        let clients = std::env::var("CLIENTS")
+            .ok()
+            .and_then(|c| c.parse().ok())
+            .unwrap_or(clients);
         Ok(Self {
+            scenario,
             mode,
             clients,
             files_per_account: files,
@@ -134,7 +152,29 @@ async fn post(
     Ok(body)
 }
 
+/// `r1-import`'s day window for file `file`: 28 days each, the first seven repeating the
+/// previous file's last week.
+fn window(file: usize) -> (u32, u32) {
+    let start = u32::try_from(file * 28).unwrap_or(0);
+    (start.saturating_sub(7), start + 27)
+}
+
 fn spec(plan: &Plan, client: usize, file: usize) -> StatementSpec {
+    if plan.scenario == "r1-import" {
+        let seed = 0x5EED_1000_u64 ^ (u64::try_from(client).unwrap_or(0) << 8);
+        let lines = plan.lines_per_file * u32::try_from(plan.files_per_account).unwrap_or(1);
+        return StatementSpec {
+            days: 28 * u32::try_from(plan.files_per_account).unwrap_or(1),
+            twin_every: 997,
+            window: Some(window(file)),
+            ..StatementSpec::month(
+                seed,
+                lines,
+                Currency::Usd,
+                Date::new(2026, 1, 1).expect("invariant: a real date"),
+            )
+        };
+    }
     let seed = 0x5EED_0000_u64
         ^ (u64::try_from(client).unwrap_or(0) << 8)
         ^ u64::try_from(file).unwrap_or(0);
@@ -248,16 +288,18 @@ async fn main() -> anyhow::Result<()> {
     let next = Arc::new(AtomicUsize::new(0));
     let latencies = Arc::new(Mutex::new(Vec::<f64>::with_capacity(jobs.len())));
     let errors = Arc::new(Mutex::new(Vec::<String>::new()));
+    let busy = Arc::new(AtomicUsize::new(0));
     let started = Instant::now();
     let mut workers = tokio::task::JoinSet::new();
     for _ in 0..plan.workers {
-        let (plan, jobs, next, latencies, errors, accounts) = (
+        let (plan, jobs, next, latencies, errors, accounts, busy) = (
             plan.clone(),
             jobs.clone(),
             next.clone(),
             latencies.clone(),
             errors.clone(),
             accounts.clone(),
+            busy.clone(),
         );
         let (http, base, token, firm_id) =
             (http.clone(), base.clone(), token.clone(), firm_id.clone());
@@ -269,16 +311,27 @@ async fn main() -> anyhow::Result<()> {
                 };
                 let body = statement(&spec(&plan, client, file));
                 let sent = Instant::now();
-                let result = http
-                    .post(format!(
-                        "{base}/v1/firms/{firm_id}/accounts/{}/imports",
-                        accounts[client]
-                    ))
-                    .bearer_auth(&token)
-                    .header("content-type", "text/csv")
-                    .body(body)
-                    .send()
-                    .await;
+                let mut attempt = 0;
+                let result = loop {
+                    let result = http
+                        .post(format!(
+                            "{base}/v1/firms/{firm_id}/accounts/{}/imports",
+                            accounts[client]
+                        ))
+                        .bearer_auth(&token)
+                        .header("content-type", "text/csv")
+                        .body(body.clone())
+                        .send()
+                        .await;
+                    match result {
+                        Ok(r) if r.status() == 409 && attempt < 10 => {
+                            attempt += 1;
+                            busy.fetch_add(1, Ordering::Relaxed);
+                            tokio::time::sleep(Duration::from_millis(200)).await;
+                        }
+                        other => break other,
+                    }
+                };
                 let elapsed = sent.elapsed().as_secs_f64() * 1_000.0;
                 match result {
                     Ok(r) if r.status() == 201 => latencies.lock().await.push(elapsed),
@@ -335,6 +388,15 @@ async fn main() -> anyhow::Result<()> {
     .bind(firm.as_uuid())
     .fetch_one(&pool)
     .await?;
+    let (rows_read, lines_created, duplicates, revisions): (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT coalesce(sum(rows_read) FILTER (WHERE status = 'complete'), 0)::int8,
+                coalesce(sum(lines_created), 0)::int8, coalesce(sum(duplicates), 0)::int8,
+                count(*) FILTER (WHERE status = 'revision')
+           FROM recon.imports WHERE firm_id = $1",
+    )
+    .bind(firm.as_uuid())
+    .fetch_one(&pool)
+    .await?;
     let replay = recon_db::replay::check(&pool, firm).await?;
     let db_after: i64 =
         sqlx::query_scalar("SELECT pg_catalog.pg_database_size(pg_catalog.current_database())")
@@ -360,14 +422,22 @@ async fn main() -> anyhow::Result<()> {
     let errors = errors.lock().await.clone();
     let expected = plan.total_lines();
     let lines_per_s = expected as f64 / import_seconds;
+    let rows_per_s = rows_read as f64 / import_seconds;
     let p99 = percentile(&latencies, 99.0);
+    // Full runs gate on capacity thresholds; an r1-import smoke gates on its own looser
+    // ones (a shared CI runner); an r0-import smoke records them only (as in R0).
+    let (lines_min, p99_max) = if plan.mode == "full" {
+        (10_000.0, 3_000.0)
+    } else {
+        (1_000.0, 10_000.0)
+    };
     let thresholds = json!({
-        "lines_per_s_min": 10_000,
-        "file_p99_ms_max": 3_000,
+        "lines_per_s_min": lines_min,
+        "file_p99_ms_max": p99_max,
         "server_peak_rss_bytes_max": 268_435_456_u64,
         "errors_max": 0,
     });
-    let checks = json!({
+    let mut checks = json!({
         "every_line_exactly_once": u64::try_from(lines).unwrap_or(0) == expected,
         "fingerprints_unique_per_account": distinct == lines,
         "every_file_complete": usize::try_from(complete).unwrap_or(0) == jobs.len(),
@@ -375,17 +445,23 @@ async fn main() -> anyhow::Result<()> {
         "repeats_answered_by_the_earlier_import": repeats_ok == repeats,
         "decision_log_replays": replay.is_ok(),
     });
+    if plan.scenario == "r1-import" {
+        checks["overlaps_are_duplicates_never_lines"] = json!(
+            lines_created == lines && lines_created + duplicates == rows_read && duplicates > 0
+        );
+        checks["no_revision_held"] = json!(revisions == 0);
+    }
     let checks_pass = checks
         .as_object()
         .is_some_and(|o| o.values().all(|v| v == true));
     let thresholds_pass = errors.is_empty()
-        && lines_per_s >= 10_000.0
-        && p99 <= 3_000.0
+        && lines_per_s >= lines_min
+        && p99 <= p99_max
         && rss.is_some_and(|r| r <= 268_435_456);
     let result = json!({
-        "scenario": "r0-import",
+        "scenario": plan.scenario,
         "mode": plan.mode,
-        "unit": "statement line imported and fingerprinted (D-027, import half)",
+        "unit": "statement line imported and fingerprinted (D-027, import half); r1-import also counts overlap rows read as duplicates",
         "machine": plan.machine,
         "commit": plan.commit,
         "load_average_before": plan.load_before,
@@ -406,6 +482,9 @@ async fn main() -> anyhow::Result<()> {
                 "max": latencies.last().copied().unwrap_or(0.0).round(),
             },
             "errors": errors.len(),
+            "account_busy_retries": busy.load(Ordering::Relaxed),
+            "rows_read": rows_read, "rows_per_s": rows_per_s.round(),
+            "lines_created": lines_created, "duplicates": duplicates, "revisions_held": revisions,
             "first_errors": errors.iter().take(5).collect::<Vec<_>>(),
             "repeats": repeats, "repeats_ok": repeats_ok,
             "lines_in_database": lines,
@@ -421,9 +500,11 @@ async fn main() -> anyhow::Result<()> {
     });
     std::fs::write(&plan.out, serde_json::to_string_pretty(&result)? + "\n")?;
     println!("{}", serde_json::to_string_pretty(&result)?);
-    // Correctness always gates. Thresholds gate a full run; a smoke records them, labelled,
-    // but is not capacity evidence (a shared CI runner or a busy laptop).
-    if !checks_pass || (plan.mode == "full" && !thresholds_pass) {
+    // Correctness always gates. Thresholds gate a full run and an r1-import smoke (its
+    // looser smoke thresholds); an r0-import smoke records them, labelled. No smoke is
+    // capacity evidence (a shared CI runner or a busy laptop).
+    let gate_thresholds = plan.mode == "full" || plan.scenario == "r1-import";
+    if !checks_pass || (gate_thresholds && !thresholds_pass) {
         std::process::exit(1);
     }
     Ok(())

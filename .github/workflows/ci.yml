@@ -45,6 +45,7 @@ jobs:
         run: |
           eval "$(scripts/stack.sh env)"
           MODE=smoke scripts/load.sh r0-import
+          MODE=smoke scripts/load.sh r1-import
 
   load-full:
     # The full r0-import run (1,000,000 lines) on a fresh runner: on demand, or when a
@@ -69,6 +70,32 @@ jobs:
         run: |
           eval "$(scripts/stack.sh env)"
           MODE=full scripts/load.sh r0-import
+
+  fuzz:
+    # Failure case 6 (D-066): every cargo-fuzz target, 60 s each, on the pinned nightly.
+    # A crash leaves its input under fuzz/artifacts/, uploaded for a fixture.
+    name: fuzz (every parser, 60 s each)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned nightly and cargo-fuzz
+        run: |
+          rustup toolchain install nightly-2026-09-06 --profile minimal
+          (cd "$RUNNER_TEMP" && cargo install cargo-fuzz --version 0.13.2 --locked)
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: fuzz -> target
+      - name: Fuzz every parser
+        run: FUZZ_SECONDS=60 scripts/fuzz.sh
+      - name: Keep a crashing input
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts/
 
   supply-chain:
     name: supply chain (cargo-deny)
