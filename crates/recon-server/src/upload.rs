@@ -423,10 +423,7 @@ async fn fail(
                 state,
                 staging,
                 parser,
-                FileRefusal {
-                    code: RefusalCode::ParseDeadlineExceeded,
-                    row: None,
-                },
+                FileRefusal::new(RefusalCode::ParseDeadlineExceeded, None),
             )
             .await
             {

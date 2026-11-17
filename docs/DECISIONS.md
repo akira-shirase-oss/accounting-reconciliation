@@ -597,6 +597,50 @@ conservative side.
   `anchor_refuses_to_sign_a_chain_that_does_not_verify`,
   `verify_of_a_firm_with_no_chains_fails_unless_empty_is_expected`.
 
+## Built in R1 (2026-11-17)
+
+- **D-060 — R1 is the smallest import milestone that meets its gate.** R1 builds: declared
+  CSV statement profiles (D-062), OFX 1.x and 2.x (D-063), CSV document imports (D-064),
+  overlap detection and statement revisions held for a person (D-065), balance continuity
+  inside a file, the hostile-file fixtures and `cargo-fuzz` targets (D-066), and the
+  `r1-import` load scenario (D-067). Left out, each on purpose: balance continuity *across*
+  files (a statement may legitimately follow a gap, and an opening balance is not in every
+  format; the period report of R5 shows the gap instead), document revisions (a changed
+  document is a `document_number_conflict` refusal until R3's review API can supersede one),
+  accepting a revision that touches a decided line (no line is decided before R2; R3 adds
+  the `source_changed` path), and a UI (R3). Until sessions exist (R3) every new route is
+  behind the operator token (D-041), like R0's.
+- **D-061 — `r0-generic-csv` v2 and `gen-v2`.** The built-in profile keeps R0's layout and
+  adds what R1 requires of every statement: running balances must continue (D-008) and text
+  fields that a spreadsheet would run as formulas are refused (D-062). Because a profile
+  version is immutable (D-040), this is version 2; v1 imports keep their recorded version.
+  The generator (`gen-v2`) now gives an identical twin its own running balance: `gen-v1`
+  copied the previous row's, which continuity correctly refuses. Cost: R0's load results
+  name `gen-v1`, R1's `gen-v2`; the two are not byte-comparable.
+- **D-062 — Declared import profiles.** A statement profile is JSON (unknown fields refused)
+  naming: the encoding — UTF-8, which also reads UTF-16 when a byte-order mark says so, or
+  Windows-1252 only when declared (a mark that contradicts the declaration, and UTF-32, are
+  `unsupported_encoding`; undecodable bytes reach the reader as an invalid byte and refuse
+  their row as `invalid_utf8`, never replaced); the delimiter (`,` `;` `|` tab); the exact
+  header; the column of each field; the date format (order `ymd`, `dmy` or `mdy`, a
+  separator or none for `YYYYMMDD`, numeric or English three-letter months, optional
+  zero-padding; four-digit years only, since a two-digit year is a guess at the century);
+  the number format (`.` or `,` decimals, an optional grouping mark with Western or Indian
+  grouping checked group by group, the negative forms in use — leading minus, parentheses,
+  trailing minus — and whether `+` may lead); one signed amount column or a `money_out` and
+  a `money_in` column of magnitudes (exactly one non-zero per row: both is
+  `debit_and_credit`, a sign is `unexpected_sign`); and the row order for balance
+  continuity. A field is rewritten to the plain decimal `Money::parse` reads, so there is
+  still one exact parser and no float. A profile may leave the order of day and month
+  undeclared: its files are then refused whole as `ambiguous_date_format`, with the
+  question — which orders every date in the file fits — and the person declares the order
+  in a new profile version; the tool never picks one, even when only one fits. Text fields
+  beginning (after spaces) with `=` or `@` are `formula_cell`; `+` and `-` are too common at
+  the start of real narrations and are escaped at export instead (R5). Profiles are stored
+  per firm, immutable per version, at most 500 names per firm; each import records the
+  profile's name, version and the SHA-256 of its canonical JSON. Cost: every bank layout
+  needs a profile someone writes once; nothing is auto-detected.
+
 ## Open questions (blocked on the maintainer or an outside party)
 
 Each is in the README's *Blocked on* table. None blocks R0–R6.

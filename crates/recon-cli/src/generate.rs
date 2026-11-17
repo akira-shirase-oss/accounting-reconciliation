@@ -1,17 +1,19 @@
-//! The seeded statement generator (`gen-v1`, D-028): the same seed always writes the same
+//! The seeded statement generator (`gen-v2`, D-028): the same seed always writes the same
 //! bytes, so drills and load runs are reproducible and two runs can be compared by digest.
 //!
-//! R0 generates bank statement lines only (documents and the labelled ground truth come
-//! with matching, R2). The lines are shaped like real exports: references on most rows,
-//! a handful of counterparties, quoted narrations with commas, running balances, and
-//! identical same-day twins (two genuine transactions D-008 must keep).
+//! It generates bank statement lines (documents and the labelled ground truth come with
+//! matching, R2). The lines are shaped like real exports: references on most rows, a
+//! handful of counterparties, quoted narrations with commas, running balances that continue
+//! row to row, and identical same-day twins (two genuine transactions D-008 must keep: the
+//! same date, amount, narration and reference, each with its own running balance).
+//! `gen-v1` copied a twin's balance too, which balance continuity (D-008, R1) refuses.
 
 use std::io::{self, Write};
 
 use recon_domain::{Currency, Date, Money};
 
 /// The generator's version, recorded with every result it feeds.
-pub const GENERATOR_VERSION: &str = "gen-v1";
+pub const GENERATOR_VERSION: &str = "gen-v2";
 
 /// What to generate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,7 +122,8 @@ pub fn write_statement(spec: &StatementSpec, out: &mut impl Write) -> io::Result
     buf.extend_from_slice(
         b"booking_date,value_date,amount,currency,narration,reference,counterparty,balance_after\n",
     );
-    let mut previous: Vec<u8> = Vec::new();
+    // The previous row without its balance, and its amount, for a twin.
+    let mut previous: Option<(Vec<u8>, i64)> = None;
     let days = spec.days.max(1);
     let mut date = spec.start;
     let mut day_index = 0_u32;
@@ -132,13 +135,18 @@ pub fn write_statement(spec: &StatementSpec, out: &mut impl Write) -> io::Result
             date = add_days(date, target_day - day_index);
             day_index = target_day;
         }
-        if spec.twin_every > 0 && i > 0 && i % spec.twin_every == 0 && !previous.is_empty() {
-            // An identical twin: same day, same amount, same narration and reference.
-            buf.extend_from_slice(&previous);
+        let twin = spec.twin_every > 0 && i > 0 && i % spec.twin_every == 0;
+        if let Some((head, amount)) = previous.as_ref().filter(|_| twin) {
+            // An identical twin: same day, amount, narration and reference; the balance
+            // moves on by the amount again.
+            balance = balance.saturating_add(*amount);
+            buf.extend_from_slice(head);
+            push_balance(&mut buf, balance, spec.currency);
         } else {
-            let row = row(&mut rng, spec, date, unit, &mut balance, i);
-            buf.extend_from_slice(&row);
-            previous = row;
+            let (head, amount) = row(&mut rng, spec, date, unit, &mut balance, i);
+            buf.extend_from_slice(&head);
+            push_balance(&mut buf, balance, spec.currency);
+            previous = Some((head, amount));
         }
         if buf.len() >= 192 * 1024 {
             out.write_all(&buf)?;
@@ -150,6 +158,16 @@ pub fn write_statement(spec: &StatementSpec, out: &mut impl Write) -> io::Result
     Ok(spec.lines)
 }
 
+fn push_balance(out: &mut Vec<u8>, balance: i64, currency: Currency) {
+    let text = Money::new(balance, currency)
+        .map(Money::to_decimal_string)
+        .unwrap_or_default();
+    out.extend_from_slice(text.as_bytes());
+    out.push(b'\n');
+}
+
+/// One row up to and including the comma before its balance, and its amount; `balance`
+/// moves by the amount.
 fn row(
     rng: &mut Rng,
     spec: &StatementSpec,
@@ -157,7 +175,7 @@ fn row(
     unit: i64,
     balance: &mut i64,
     i: u32,
-) -> Vec<u8> {
+) -> (Vec<u8>, i64) {
     let counterparty = COUNTERPARTIES[usize::try_from(rng.below(12)).unwrap_or(0)];
     // Amounts from 1 minor unit up to 25,000 major units, a third of them receipts.
     let magnitude = i64::try_from(rng.below(2_500_000))
@@ -199,9 +217,6 @@ fn row(
     let money = Money::new(amount, spec.currency)
         .map(Money::to_decimal_string)
         .unwrap_or_default();
-    let balance_text = Money::new(*balance, spec.currency)
-        .map(Money::to_decimal_string)
-        .unwrap_or_default();
     let mut out = Vec::with_capacity(160);
     out.extend_from_slice(date.to_iso().as_bytes());
     out.push(b',');
@@ -217,9 +232,7 @@ fn row(
     out.push(b',');
     csv_field(&mut out, counterparty);
     out.push(b',');
-    out.extend_from_slice(balance_text.as_bytes());
-    out.push(b'\n');
-    out
+    (out, amount)
 }
 
 /// The statement as bytes (tests and the load driver).

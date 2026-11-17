@@ -1,20 +1,19 @@
-//! A strict, streaming RFC 4180 reader. Bytes arrive in chunks of any size (an upload as
-//! it streams in); records come out as soon as they end. Memory is bounded by one record
-//! (at most 64 KiB) whatever the file size.
+//! A strict, streaming RFC 4180 reader over UTF-8 text (the [`crate::decode`] stage has
+//! already decided the encoding, dropped a byte-order mark and counted the file's bytes).
+//! Bytes arrive in chunks of any size; records come out as soon as they end. Memory is
+//! bounded by one record (at most 64 KiB) whatever the file size.
 //!
 //! Strict means refusing, never guessing (D-010):
 //!
-//! * fields are separated by `,` and records end with `\n` or `\r\n`; a `\r` anywhere
-//!   else is `bare_carriage_return`;
+//! * fields are separated by the profile's delimiter (`,` by default; `;`, `|` or tab) and
+//!   records end with `\n` or `\r\n`; a `\r` anywhere else is `bare_carriage_return`;
 //! * a quoted field is `"…"` with `""` for a literal quote; a quote inside an unquoted
-//!   field, or anything but `,` or a terminator after a closing quote, is `stray_quote`;
-//!   a quoted field open at the end of the file is `unterminated_quote`;
+//!   field, or anything but the delimiter or a terminator after a closing quote, is
+//!   `stray_quote`; a quoted field open at the end of the file is `unterminated_quote`;
 //! * an empty record is `empty_row`; fields must be valid UTF-8 without control,
-//!   byte-order-mark or bidirectional-override characters;
-//! * a UTF-8 byte-order mark is allowed at the very start; a UTF-16 or UTF-32 one refuses
-//!   the file (`unsupported_encoding`);
-//! * records over 64 KiB, fields over 8 KiB, more than 256 fields, more than 2,000,000
-//!   data rows or more than 50 MiB refuse the record or the file.
+//!   byte-order-mark, bidirectional or invisible format characters;
+//! * records over 64 KiB, fields over 8 KiB, more than 256 fields or more than 2,000,000
+//!   data rows refuse the record or the file.
 //!
 //! After a refused record the reader keeps scanning (without storing bytes) to the end of
 //! that record, so one bad row does not hide the next one's error in the report.
@@ -27,6 +26,11 @@ use recon_domain::limits::{
 use recon_domain::refusal::{RefusalCode, RowRefusal};
 use recon_domain::text::is_forbidden;
 
+use crate::dates::DateQuestion;
+
+/// The delimiters a profile may declare.
+pub const DELIMITERS: [char; 4] = [',', ';', '|', '\t'];
+
 /// The bounds a reader enforces (D-010 by default; smaller in tests).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CsvLimits {
@@ -38,7 +42,7 @@ pub struct CsvLimits {
     pub max_fields: usize,
     /// Most records after the first (the header).
     pub max_data_rows: u32,
-    /// Most bytes in the file.
+    /// Most bytes in the file, before decoding (enforced by the decoder).
     pub max_file_bytes: u64,
 }
 
@@ -62,6 +66,19 @@ pub struct FileRefusal {
     pub code: RefusalCode,
     /// The record it concerns, when there is one.
     pub row: Option<u32>,
+    /// The question to put to the user, for `ambiguous_date_format`.
+    pub question: Option<DateQuestion>,
+}
+
+impl FileRefusal {
+    /// A refusal without a question.
+    pub const fn new(code: RefusalCode, row: Option<u32>) -> Self {
+        Self {
+            code,
+            row,
+            question: None,
+        }
+    }
 }
 
 /// One complete, valid record: its fields are UTF-8 text without forbidden characters.
@@ -116,6 +133,7 @@ enum State {
 #[derive(Debug)]
 pub struct CsvReader {
     limits: CsvLimits,
+    delimiter: u8,
     state: State,
     /// Unquoted bytes of the current record's fields, concatenated.
     buf: Vec<u8>,
@@ -129,20 +147,21 @@ pub struct CsvReader {
     record_no: u32,
     /// The first refusal of the current record.
     error: Option<RefusalCode>,
-    /// Bytes read so far.
-    file_bytes: u64,
-    /// Up to four leading bytes held until the byte-order mark is decided.
-    head: Vec<u8>,
-    head_done: bool,
     /// Set once the file is refused; every later call returns it.
     poisoned: Option<FileRefusal>,
 }
 
 impl CsvReader {
-    /// A reader with the given bounds.
+    /// A comma-separated reader with the given bounds.
     pub fn new(limits: CsvLimits) -> Self {
+        Self::with_delimiter(limits, b',')
+    }
+
+    /// A reader for `delimiter` (one of [`DELIMITERS`], checked by the profile).
+    pub fn with_delimiter(limits: CsvLimits, delimiter: u8) -> Self {
         Self {
             limits,
+            delimiter,
             state: State::FieldStart,
             buf: Vec::with_capacity(1024),
             bounds: Vec::with_capacity(16),
@@ -150,16 +169,8 @@ impl CsvReader {
             record_bytes: 0,
             record_no: 1,
             error: None,
-            file_bytes: 0,
-            head: Vec::with_capacity(4),
-            head_done: false,
             poisoned: None,
         }
-    }
-
-    /// Bytes read so far.
-    pub const fn file_bytes(&self) -> u64 {
-        self.file_bytes
     }
 
     /// Feeds the next chunk; `on_record` receives each finished record or its refusal.
@@ -181,43 +192,7 @@ impl CsvReader {
     where
         F: FnMut(Result<Record<'_>, RowRefusal>) -> Result<(), FileRefusal>,
     {
-        let len = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
-        self.file_bytes = self.file_bytes.saturating_add(len);
-        if self.file_bytes > self.limits.max_file_bytes {
-            return Err(FileRefusal {
-                code: RefusalCode::FileTooLarge,
-                row: None,
-            });
-        }
-        let mut rest = chunk;
-        if !self.head_done {
-            let take = rest.len().min(4_usize.saturating_sub(self.head.len()));
-            let (head, tail) = rest.split_at(take);
-            self.head.extend_from_slice(head);
-            rest = tail;
-            if self.head.len() < 4 {
-                return Ok(());
-            }
-            let head = std::mem::take(&mut self.head);
-            let body = Self::decide_bom(&head)?;
-            self.head_done = true;
-            self.scan(body, on_record)?;
-        }
-        self.scan(rest, on_record)
-    }
-
-    /// Strips a UTF-8 byte-order mark and refuses UTF-16/32 ones; returns the bytes after it.
-    fn decide_bom(head: &[u8]) -> Result<&[u8], FileRefusal> {
-        let unsupported = head.starts_with(&[0x00, 0x00, 0xFE, 0xFF])
-            || head.starts_with(&[0xFF, 0xFE])
-            || head.starts_with(&[0xFE, 0xFF]);
-        if unsupported {
-            return Err(FileRefusal {
-                code: RefusalCode::UnsupportedEncoding,
-                row: None,
-            });
-        }
-        Ok(head.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(head))
+        self.scan(chunk, on_record)
     }
 
     fn scan<F>(&mut self, bytes: &[u8], on_record: &mut F) -> Result<(), FileRefusal>
@@ -285,7 +260,9 @@ impl CsvReader {
                 self.store(b'"');
                 self.state = State::Quoted;
             }
-            (State::QuoteInQuoted | State::FieldStart | State::Unquoted, b',') => {
+            (State::QuoteInQuoted | State::FieldStart | State::Unquoted, d)
+                if d == self.delimiter =>
+            {
                 self.end_field();
                 self.state = State::FieldStart;
             }
@@ -323,10 +300,7 @@ impl CsvReader {
         // Data rows are every record after the header; the first one past the bound
         // refuses the file before it is handed on.
         if row.saturating_sub(1) > self.limits.max_data_rows {
-            return Err(FileRefusal {
-                code: RefusalCode::TooManyRows,
-                row: Some(row),
-            });
+            return Err(FileRefusal::new(RefusalCode::TooManyRows, Some(row)));
         }
         if self.record_bytes == 0 && self.error.is_none() {
             self.refuse(RefusalCode::EmptyRow);
@@ -390,12 +364,6 @@ impl CsvReader {
     {
         if let Some(refusal) = self.poisoned {
             return Err(refusal);
-        }
-        if !self.head_done {
-            let head = std::mem::take(&mut self.head);
-            let body = Self::decide_bom(&head).inspect_err(|r| self.poisoned = Some(*r))?;
-            self.head_done = true;
-            self.scan(body, on_record)?;
         }
         match self.state {
             State::Quoted => {
@@ -471,8 +439,37 @@ mod tests {
         assert_eq!(read(",,"), [ok(&["", "", ""])]);
         assert_eq!(read("\"\""), [ok(&[""])]);
         assert_eq!(read(""), Vec::<Outcome>::new());
-        assert_eq!(read("\u{feff}a\n"), [ok(&["a"])]);
+        // The decoder drops a leading byte-order mark; one that reaches the reader is data.
+        assert_eq!(
+            read("\u{feff}a\n"),
+            [bad(1, RefusalCode::ForbiddenCharacter)]
+        );
         assert_eq!(read("é,₹\n"), [ok(&["é", "₹"])]);
+    }
+
+    #[test]
+    fn other_delimiters_split_and_commas_become_text() {
+        for (delimiter, input) in [
+            (b';', "a;\"x;y\";1,50\n"),
+            (b'|', "a|\"x|y\"|1,50\n"),
+            (b'\t', "a\t\"x\ty\"\t1,50\n"),
+        ] {
+            let mut reader = CsvReader::with_delimiter(CsvLimits::default(), delimiter);
+            let mut out = vec![];
+            let mut sink = |r: Result<Record<'_>, RowRefusal>| {
+                out.push(r.map(|rec| rec.fields().map(str::to_owned).collect::<Vec<_>>()));
+                Ok(())
+            };
+            reader.push(input.as_bytes(), &mut sink).unwrap();
+            reader.finish(&mut sink).unwrap();
+            let quoted = format!("x{}y", char::from(delimiter));
+            if delimiter == b'\t' {
+                // A tab inside a quoted field is still a control character in the text.
+                assert_eq!(out, [bad(1, RefusalCode::ForbiddenCharacter)]);
+            } else {
+                assert_eq!(out, [ok(&["a", &quoted, "1,50"])]);
+            }
+        }
     }
 
     #[test]
@@ -530,38 +527,7 @@ mod tests {
         assert_eq!(read_with(small, b"h\n1\n2\n", 1).unwrap().len(), 3);
         assert_eq!(
             read_with(small, b"h\n1\n2\n3\n", 1),
-            Err(FileRefusal {
-                code: C::TooManyRows,
-                row: Some(4)
-            })
-        );
-        assert_eq!(
-            read_with(small, &[b'a'; 65], 7),
-            Err(FileRefusal {
-                code: C::FileTooLarge,
-                row: None
-            })
-        );
-        for bom in [
-            &[0xFF, 0xFE, b'a', 0][..],
-            &[0xFE, 0xFF, 0, b'a'],
-            &[0, 0, 0xFE, 0xFF],
-        ] {
-            assert_eq!(
-                read_with(CsvLimits::default(), bom, 1),
-                Err(FileRefusal {
-                    code: C::UnsupportedEncoding,
-                    row: None
-                })
-            );
-        }
-        // A file shorter than four bytes still gets its byte-order mark decided.
-        assert_eq!(
-            read_with(CsvLimits::default(), b"\xFF\xFE", 1),
-            Err(FileRefusal {
-                code: C::UnsupportedEncoding,
-                row: None
-            })
+            Err(FileRefusal::new(C::TooManyRows, Some(4)))
         );
         assert_eq!(
             read_with(CsvLimits::default(), b"ab", 1).unwrap(),

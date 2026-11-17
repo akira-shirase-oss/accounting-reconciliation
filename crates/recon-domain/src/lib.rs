@@ -1,7 +1,7 @@
 //! Pure domain of Accounting Reconciliation: exact money over the D-005 table, strict
 //! dates, field text rules, the normalized line and its fingerprint (D-008), the line and
-//! match state machines (D-006, D-011), balanced matches (D-014), import batches (D-010)
-//! and the hash-chained decision record (D-019).
+//! match state machines (D-006, D-011), balanced matches (D-014), import batches (D-010),
+//! documents (D-007) and the hash-chained decision record (D-019).
 //!
 //! No I/O, no clock, no randomness: `scripts/check-architecture.sh` fails the build if
 //! this crate gains an I/O dependency or touches the filesystem, network, environment or
@@ -11,6 +11,7 @@
 pub mod anchor;
 pub mod date;
 pub mod decision;
+pub mod document;
 pub mod fingerprint;
 pub mod ids;
 pub mod import;

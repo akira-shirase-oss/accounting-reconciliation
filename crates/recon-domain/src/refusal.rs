@@ -38,16 +38,29 @@ codes! {
     TooManyRows => "too_many_rows",
     /// No header, or a header and no rows.
     EmptyFile => "empty_file",
-    /// A byte-order mark of an encoding the profile does not declare (UTF-16, UTF-32).
+    /// An encoding this tool does not read (UTF-32, a byte-order mark the profile's
+    /// encoding contradicts, an OFX charset outside UTF-8, US-ASCII and Windows-1252).
     UnsupportedEncoding => "unsupported_encoding",
     /// The header is not exactly the profile's columns in the profile's order.
     HeaderMismatch => "header_mismatch",
     /// The parse took longer than 60 s.
     ParseDeadlineExceeded => "parse_deadline_exceeded",
+    /// Day-month or month-day dates in a profile that does not declare which (`01/02/2026`):
+    /// a question for the user, never a guess (D-010).
+    AmbiguousDateFormat => "ambiguous_date_format",
+    /// OFX markup that declares or comments (`<!DOCTYPE`, `<!ENTITY`, `<!--`): refused unread.
+    DeclarationRefused => "declaration_refused",
+    /// A reference to an entity other than the five XML predefined ones or a character
+    /// reference: nothing is expanded or resolved.
+    EntityRefused => "entity_refused",
+    /// OFX that is not a well-formed statement (header, tags, nesting or a missing part).
+    MalformedOfx => "malformed_ofx",
+    /// More than one account statement in one OFX file.
+    MultipleStatements => "multiple_statements",
     // Structural row refusals (the CSV layer).
     /// A field is not valid UTF-8.
     InvalidUtf8 => "invalid_utf8",
-    /// A control, byte-order-mark or bidirectional-override character in a field.
+    /// A control, byte-order-mark, bidirectional or invisible format character in a field.
     ForbiddenCharacter => "forbidden_character",
     /// A record longer than 64 KiB.
     LineTooLong => "line_too_long",
@@ -68,11 +81,11 @@ codes! {
     // Field refusals (the profile).
     /// A required field is empty.
     MissingRequiredField => "missing_required_field",
-    /// Not `YYYY-MM-DD`, or not a real day.
+    /// Not a date in the profile's format, or not a real day.
     InvalidDate => "invalid_date",
     /// A date outside 1990–2100.
     DateOutOfRange => "date_out_of_range",
-    /// Not a plain decimal amount.
+    /// Not an amount in the profile's number format.
     InvalidAmount => "invalid_amount",
     /// More decimal places than the currency has.
     TooManyDecimalPlaces => "too_many_decimal_places",
@@ -86,6 +99,19 @@ codes! {
     CurrencyMismatch => "currency_mismatch",
     /// The running balance is not a valid amount.
     InvalidBalance => "invalid_balance",
+    /// The running balance does not continue the previous one by this row's amount.
+    BalanceDiscontinuity => "balance_discontinuity",
+    /// A text field that a spreadsheet would run as a formula (it starts with `=` or `@`).
+    FormulaCell => "formula_cell",
+    /// Both the money-out and the money-in column carry an amount.
+    DebitAndCredit => "debit_and_credit",
+    /// A sign where the profile declares magnitudes (a money-out, money-in or by-kind column).
+    UnexpectedSign => "unexpected_sign",
+    /// A document kind outside the five the schema knows.
+    InvalidDocumentKind => "invalid_document_kind",
+    /// A document number already used by another document of the same kind and
+    /// counterparty, in this file or already imported.
+    DocumentNumberConflict => "document_number_conflict",
 }
 
 impl From<MoneyError> for RefusalCode {

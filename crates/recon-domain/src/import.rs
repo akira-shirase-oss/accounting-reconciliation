@@ -1,6 +1,7 @@
 //! Import batches (D-008, D-010): a file identified by its SHA-256, staged, then complete,
-//! refused or discarded — never partly visible. The normalized row a parser produces is
-//! [`NewLine`].
+//! refused, discarded or held as a revision (D-009) — never partly visible. The normalized
+//! rows a parser produces are [`NewLine`] (statements) and
+//! [`NewDocument`](crate::document::NewDocument) (documents).
 
 use std::fmt;
 
@@ -10,10 +11,39 @@ use crate::date::Date;
 use crate::fingerprint::TupleHash;
 use crate::money::Money;
 
-/// The R0 import profile's name (D-040): one fixed CSV layout.
+/// The built-in statement profile's name (D-040): the R0 CSV layout, the default.
 pub const PROFILE_R0: &str = "r0-generic-csv";
-/// Its version, recorded on every import and decision (D-035).
-pub const PROFILE_R0_VERSION: i32 = 1;
+/// Its version, recorded on every import and decision (D-035). Version 2 (R1) adds balance
+/// continuity and the formula-cell refusal to version 1 (D-061).
+pub const PROFILE_R0_VERSION: i32 = 2;
+/// The built-in OFX statement profile (D-063).
+pub const PROFILE_OFX: &str = "ofx";
+/// Its version.
+pub const PROFILE_OFX_VERSION: i32 = 1;
+/// The built-in document profile (D-064).
+pub const PROFILE_DOCUMENTS: &str = "r1-generic-documents";
+/// Its version.
+pub const PROFILE_DOCUMENTS_VERSION: i32 = 1;
+
+/// What an import brings in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImportKind {
+    /// A bank statement into one account: statement lines.
+    Statement,
+    /// Documents of one client: invoices, bills, receipts, credit notes, book entries.
+    Documents,
+}
+
+impl ImportKind {
+    /// The stored name.
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Statement => "statement",
+            Self::Documents => "documents",
+        }
+    }
+}
 
 /// SHA-256 of an uploaded file's bytes: the file's identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -35,8 +65,13 @@ pub enum ImportStatus {
     Complete,
     /// At least one row (or the file) was refused; nothing was persisted. Final.
     Refused,
-    /// Abandoned (a crash, a lost upload) or a repeat of an already complete file. Final.
+    /// Abandoned (a crash, a lost upload), a repeat of an already complete file, or a
+    /// rejected revision. Final.
     Discarded,
+    /// A statement that disagrees with stored lines in the range they share: held, with
+    /// every difference listed, until a person accepts or rejects it (D-009). Nothing of it
+    /// is visible.
+    Revision,
 }
 
 impl ImportStatus {
@@ -47,29 +82,33 @@ impl ImportStatus {
             Self::Complete => "complete",
             Self::Refused => "refused",
             Self::Discarded => "discarded",
+            Self::Revision => "revision",
         }
     }
 
+    /// Every status.
+    pub const ALL: [Self; 5] = [
+        Self::Staging,
+        Self::Complete,
+        Self::Refused,
+        Self::Discarded,
+        Self::Revision,
+    ];
+
     /// Parses a stored name.
     pub fn from_code(code: &str) -> Option<Self> {
-        [
-            Self::Staging,
-            Self::Complete,
-            Self::Refused,
-            Self::Discarded,
-        ]
-        .into_iter()
-        .find(|s| s.code() == code)
+        Self::ALL.into_iter().find(|s| s.code() == code)
     }
 
-    /// Only `staging` moves, and only to a final state.
+    /// `staging` moves to any other state; a held `revision` only to `complete` (accepted)
+    /// or `discarded` (rejected); the rest are final.
     pub const fn can_become(self, to: Self) -> bool {
         matches!(
             (self, to),
             (
                 Self::Staging,
-                Self::Complete | Self::Refused | Self::Discarded
-            )
+                Self::Complete | Self::Refused | Self::Discarded | Self::Revision
+            ) | (Self::Revision, Self::Complete | Self::Discarded)
         )
     }
 }
@@ -86,6 +125,8 @@ pub enum DiscardReason {
     UploadFailed,
     /// Another flip held the account; the file may be uploaded again (D-053).
     AccountBusy,
+    /// A person rejected the revision this import was held as (D-009).
+    RevisionRejected,
 }
 
 impl DiscardReason {
@@ -96,6 +137,7 @@ impl DiscardReason {
             Self::LeaseExpired => "lease_expired",
             Self::UploadFailed => "upload_failed",
             Self::AccountBusy => "account_busy",
+            Self::RevisionRejected => "revision_rejected",
         }
     }
 }
@@ -144,6 +186,48 @@ impl NewLine {
     }
 }
 
+/// A parsed row on its way to staging: its record number and the bytes it holds.
+pub trait StagedRow {
+    /// The record number in the file.
+    fn row(&self) -> u32;
+    /// Bytes held in memory, approximately (D-050).
+    fn heap_bytes(&self) -> usize;
+}
+
+impl StagedRow for NewLine {
+    fn row(&self) -> u32 {
+        self.row
+    }
+
+    fn heap_bytes(&self) -> usize {
+        Self::heap_bytes(self)
+    }
+}
+
+/// How one row of a revision differs from the stored lines it overlaps (D-009).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RevisionChange {
+    /// A row in the shared range that no stored line has.
+    Added,
+    /// A stored line in the shared range the new file does not have.
+    Removed,
+    /// A stored line and a new row that are the same transaction (one each with the same
+    /// booking date and reference, or narration when neither has a reference) but differ.
+    Changed,
+}
+
+impl RevisionChange {
+    /// The stored code.
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Added => "added",
+            Self::Removed => "removed",
+            Self::Changed => "changed",
+        }
+    }
+}
+
 /// Row accounting for a finished import: every row read is a new line, a duplicate of an
 /// existing line, or refused (invariant 1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -173,11 +257,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_staging_moves_and_counts_balance() {
+    fn only_staging_and_a_held_revision_move_and_counts_balance() {
         use ImportStatus as S;
-        for from in [S::Staging, S::Complete, S::Refused, S::Discarded] {
-            for to in [S::Staging, S::Complete, S::Refused, S::Discarded] {
-                assert_eq!(from.can_become(to), from == S::Staging && to != S::Staging);
+        for from in S::ALL {
+            for to in S::ALL {
+                let allowed = (from == S::Staging && to != S::Staging)
+                    || (from == S::Revision && matches!(to, S::Complete | S::Discarded));
+                assert_eq!(from.can_become(to), allowed, "{from:?} -> {to:?}");
             }
             assert_eq!(S::from_code(from.code()), Some(from));
         }
