@@ -22,15 +22,20 @@ async fn server(extra: &[(&str, &str)]) -> Server {
     ];
     env.extend_from_slice(extra);
     let server = Server::spawn(UNREACHABLE, &env);
+    let target = addr(&server);
     let deadline = Instant::now() + Duration::from_secs(60);
+    // A raw probe with Connection: close, so no pooled client connection keeps holding a
+    // permit while a test counts connections.
     loop {
-        if let Ok(r) = common::http()
-            .get(format!("{}/healthz", server.base))
-            .send()
-            .await
-            && r.status() == 200
+        if let Ok(mut s) = TcpStream::connect(&target).await
+            && s.write_all(b"GET /healthz HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+                .await
+                .is_ok()
         {
-            return server;
+            let (response, _) = read_until_closed(&mut s, Duration::from_secs(5)).await;
+            if response.starts_with("HTTP/1.1 200") {
+                break;
+            }
         }
         assert!(
             Instant::now() < deadline,
@@ -38,6 +43,9 @@ async fn server(extra: &[(&str, &str)]) -> Server {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    // Let the probe's connection task end and return its permit.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    server
 }
 
 fn addr(server: &Server) -> String {
@@ -169,6 +177,18 @@ async fn connections_beyond_the_cap_are_closed_at_once() {
         held.push(s);
     }
     tokio::time::sleep(Duration::from_millis(300)).await;
+    // All four hold a permit: none was closed on arrival.
+    for (i, s) in held.iter_mut().enumerate() {
+        let mut probe = [0_u8; 1];
+        // Still waiting for data (the read times out) means the connection is open.
+        let open = tokio::time::timeout(Duration::from_millis(50), s.read(&mut probe))
+            .await
+            .is_err();
+        assert!(
+            open,
+            "held connection {i} was closed before the cap was reached"
+        );
+    }
     let mut extra = TcpStream::connect(addr(&server)).await.unwrap();
     let _ = extra
         .write_all(b"GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n")
