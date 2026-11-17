@@ -1,0 +1,5 @@
+/target
+**/*.rs.bk
+.DS_Store
+# Local load-run scratch (generated files, server logs); committed evidence lives in perf/results/.
+/perf/work/

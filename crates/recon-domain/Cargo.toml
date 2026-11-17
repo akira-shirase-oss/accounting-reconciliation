@@ -1,0 +1,21 @@
+[package]
+name = "recon-domain"
+description = "Pure types and rules for Accounting Reconciliation: exact money, the normalized line, fingerprints, state machines, match and decision records. No I/O."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+hex.workspace = true
+serde.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true
