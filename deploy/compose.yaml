@@ -6,8 +6,11 @@
 # only creates roles and databases (`recon db setup`); migrations run as recon_owner and
 # the server as recon_app (D-037).
 #
-# TLS is on with the image's self-signed certificate, so the tests exercise the rustls
-# path (`sslmode=require`) that Neon-style URLs use.
+# TLS is on with the image's self-signed certificate, so every test connection is
+# encrypted (`sslmode=require` is allowed here only because 127.0.0.1 never crosses a
+# network, D-070). `postgres-tls` on 62433 serves a certificate from a private development
+# CA (scripts/dev-tls.sh) for the tests that prove `verify-full`: the right CA and name
+# connect, a wrong name or an unknown CA is refused.
 #
 # The image is pinned by digest. To upgrade, change the tag, look up the new digest with
 # `docker buildx imagetools inspect postgres:<tag>`, and run `scripts/check.sh`.
@@ -47,6 +50,38 @@ services:
       - "127.0.0.1:${RECON_PG_PORT:-62432}:5432"
     volumes:
       - postgres:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD", "pg_isready", "--host=127.0.0.1", "--username=recon_admin", "--dbname=recon_admin"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 60s
+      start_interval: 1s
+
+  # The TLS test database (D-070): ephemeral (tmpfs), small, its certificate signed by the
+  # development CA in .dev-tls/ and copied in as the postgres user, mode 0600, at start.
+  postgres-tls:
+    image: postgres:18.7-trixie@sha256:2ea8630df176ad090ec92136dee850397c5af8781e4bcf2e4162593691c61bbc
+    entrypoint:
+      - /bin/sh
+      - -c
+      - >-
+        install -d -o postgres -g postgres -m 0700 /run/recon-tls &&
+        install -o postgres -g postgres -m 0600 /dev-tls/server.key /run/recon-tls/server.key &&
+        install -o postgres -g postgres -m 0644 /dev-tls/server.pem /run/recon-tls/server.pem &&
+        exec docker-entrypoint.sh postgres -c max_connections=20 -c ssl=on
+        -c ssl_cert_file=/run/recon-tls/server.pem -c ssl_key_file=/run/recon-tls/server.key
+        -c log_parameter_max_length=0 -c log_parameter_max_length_on_error=0
+    environment:
+      POSTGRES_USER: recon_admin
+      POSTGRES_PASSWORD: recon-admin-dev
+      POSTGRES_DB: recon_admin
+    ports:
+      - "127.0.0.1:${RECON_PG_TLS_PORT:-62433}:5432"
+    volumes:
+      - ../.dev-tls:/dev-tls:ro
+    tmpfs:
+      - /var/lib/postgresql
     healthcheck:
       test: ["CMD", "pg_isready", "--host=127.0.0.1", "--username=recon_admin", "--dbname=recon_admin"]
       interval: 10s

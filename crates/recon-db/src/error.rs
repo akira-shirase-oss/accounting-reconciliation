@@ -56,6 +56,9 @@ pub enum DbError {
     /// A migration failed.
     #[error("migration failed")]
     Migrate(#[source] sqlx::migrate::MigrateError),
+    /// The database URL is refused before any connection (D-070).
+    #[error(transparent)]
+    Url(#[from] crate::pool::UrlRefusal),
     /// Anything else.
     #[error("database error")]
     Other(#[source] sqlx::Error),

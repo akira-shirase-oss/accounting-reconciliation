@@ -139,6 +139,9 @@ impl Config {
         if database_url.is_empty() {
             problems
                 .push("RECON_DATABASE_URL is required (the runtime role, not the owner)".into());
+        } else if let Err(refusal) = recon_db::pool::checked_options(&database_url) {
+            // Named, with the fix; the host only, never the password (D-070).
+            problems.push(format!("RECON_DATABASE_URL: {refusal}"));
         }
         let token = get("RECON_OPERATOR_TOKEN").unwrap_or_default();
         if token.len() < 32 || token.bytes().any(|b| !b.is_ascii_graphic()) {
@@ -247,5 +250,19 @@ mod tests {
             "{printed}"
         );
         assert_eq!(config.listen.to_string(), DEFAULT_LISTEN);
+        // A remote database without verified TLS is a named problem (D-070).
+        let err = Config::from_source(|name| match name {
+            "RECON_DATABASE_URL" => {
+                Some("postgres://recon_app:hunter2@db.example.com/recon?sslmode=require".into())
+            }
+            "RECON_OPERATOR_TOKEN" => Some("x".repeat(40)),
+            _ => None,
+        })
+        .unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("database_tls_unverified") && !text.contains("hunter2"),
+            "{text}"
+        );
     }
 }

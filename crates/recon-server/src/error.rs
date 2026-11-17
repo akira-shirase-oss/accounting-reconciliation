@@ -144,6 +144,7 @@ impl ApiError {
                 )
             }
             DbError::Refused(_)
+            | DbError::Url(_)
             | DbError::Inconsistent(_)
             | DbError::Migrate(_)
             | DbError::Other(_) => {

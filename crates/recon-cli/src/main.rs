@@ -6,13 +6,11 @@ use std::process::ExitCode;
 
 use anyhow::{Context as _, bail};
 use recon_cli::generate::{self, StatementSpec};
-use std::str::FromStr as _;
 
 use recon_db::roles;
 use recon_domain::anchor::Anchor;
 use recon_domain::{ClientId, Currency, Date, FirmId};
 use sqlx::Connection as _;
-use sqlx::postgres::PgConnectOptions;
 
 fn flag(args: &[String], name: &str) -> Option<String> {
     args.iter()
@@ -266,7 +264,9 @@ fn profile_check(args: &[String]) -> anyhow::Result<ExitCode> {
 
 async fn setup(args: &[String]) -> anyhow::Result<ExitCode> {
     let name = flag(args, "--database").unwrap_or_else(|| "recon".to_owned());
-    let mut admin = sqlx::PgConnection::connect(&env("RECON_ADMIN_DATABASE_URL")?)
+    let options = recon_db::pool::checked_options(&env("RECON_ADMIN_DATABASE_URL")?)
+        .context("RECON_ADMIN_DATABASE_URL")?;
+    let mut admin = sqlx::PgConnection::connect_with(&options)
         .await
         .context("connecting as the administrator")?;
     roles::ensure_roles(&mut admin, &env("RECON_APP_PASSWORD")?)
@@ -296,8 +296,8 @@ async fn setup(args: &[String]) -> anyhow::Result<ExitCode> {
 
 async fn migrate(args: &[String]) -> anyhow::Result<ExitCode> {
     let name = flag(args, "--database").unwrap_or_else(|| "recon".to_owned());
-    let options = PgConnectOptions::from_str(&env("RECON_ADMIN_DATABASE_URL")?)
-        .context("RECON_ADMIN_DATABASE_URL does not parse")?
+    let options = recon_db::pool::checked_options(&env("RECON_ADMIN_DATABASE_URL")?)
+        .context("RECON_ADMIN_DATABASE_URL")?
         .database(&name);
     recon_db::migrate(options)
         .await

@@ -18,11 +18,11 @@ fi
 scripts/check-architecture.sh
 scripts/test-architecture-check.sh
 
-if [ -z "${RECON_TEST_ADMIN_URL:-}" ]; then
+if [ -z "${RECON_TEST_ADMIN_URL:-}" ] || [ -z "${RECON_TLS_TEST_URL:-}" ]; then
   scripts/stack.sh up >/dev/null
   eval "$(scripts/stack.sh env)"
 fi
-export RECON_TEST_ADMIN_URL
+export RECON_TEST_ADMIN_URL RECON_TLS_TEST_URL RECON_TLS_TEST_CA
 cargo test --workspace --locked
 if cargo metadata --no-deps --format-version 1 --locked | grep -q '"fault-injection"'; then
   # The drills: the real server binary, killed at seeded points and cut off from its

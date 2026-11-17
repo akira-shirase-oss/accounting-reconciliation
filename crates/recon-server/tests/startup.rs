@@ -54,3 +54,43 @@ async fn the_server_refuses_an_unsafe_configuration() {
     }
     db.cleanup().await;
 }
+
+/// A database on another machine is reached only over TLS that checks its certificate and
+/// its name (D-070): `sslmode=require` encrypts but accepts any certificate, so anyone on
+/// the network path could impersonate the database. Each refusal is named, says how to
+/// fix the URL, and never prints the password.
+#[tokio::test]
+async fn the_server_refuses_a_remote_database_without_verified_tls() {
+    let remote = "recon_app:hunter2-secret@db.recon.test:5432/recon";
+    for (url, code) in [
+        (
+            format!("postgres://{remote}?sslmode=require"),
+            "database_tls_unverified",
+        ),
+        (format!("postgres://{remote}"), "database_tls_unverified"),
+        (
+            format!("postgres://{remote}?sslmode=prefer"),
+            "database_tls_unverified",
+        ),
+        (
+            "postgres://recon_app:hunter2-secret@10.1.2.3:5432/recon?sslmode=verify-ca".into(),
+            "database_tls_no_root_certificate",
+        ),
+        (
+            format!("postgres://{remote}?sslmode=verify-full&channel_binding=require"),
+            "database_channel_binding_unsupported",
+        ),
+    ] {
+        let server = Server::spawn(&url, &[]);
+        let (exit, log) = server.exit_code(Duration::from_secs(15)).await;
+        assert_eq!(exit, Some(78), "{url}: {log}");
+        assert!(
+            log.contains(code) && log.contains("verify-full"),
+            "{url}: the refusal names {code} and the fix: {log}"
+        );
+        assert!(
+            !log.contains("hunter2-secret"),
+            "the password must not be printed: {log}"
+        );
+    }
+}
