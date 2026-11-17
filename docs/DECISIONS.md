@@ -532,6 +532,17 @@ conservative side.
   `a_flip_into_a_busy_account_is_refused_at_once` (5.02 s before, immediate
   now).
 
+- **D-054 — Invisible characters are refused, not normalized.** Zero-width
+  spaces and joiners, the bidi marks (LRM, RLM, ALM), the line and paragraph
+  separators, the soft hyphen, word joiner, invisible operators and the
+  deprecated format controls passed every field: visually identical
+  narrations became different lines, and the marks still reordered text on
+  screen. They are now `forbidden_character`, like the controls and bidi
+  overrides already were. Refusing keeps `normalization v1` and every
+  fingerprint unchanged; collapsing the remaining Unicode spaces (U+2000–200A,
+  U+3000) would change fingerprints and waits for a v2 definition. Test:
+  `zero_widths_bidi_marks_and_separators_are_forbidden`.
+
 ## Open questions (blocked on the maintainer or an outside party)
 
 Each is in the README's *Blocked on* table. None blocks R0–R6.

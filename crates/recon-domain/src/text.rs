@@ -10,11 +10,26 @@
 pub const NORMALIZATION_VERSION: u8 = 1;
 
 /// Characters refused in every text field: Unicode control characters (category Cc,
-/// which includes NUL, tab, CR and LF), the byte-order mark, and the bidirectional
-/// embedding, override and isolate controls (a narration that reorders itself on screen
-/// is an attack on the reviewer, not data).
+/// which includes NUL, tab, CR and LF); the byte-order mark; the bidirectional embedding,
+/// override and isolate controls and the bidi marks (LRM, RLM, ALM) — a narration that
+/// reorders itself on screen is an attack on the reviewer, not data; and the invisible
+/// format characters (zero-width spaces and joiners, the soft hyphen, the Mongolian vowel
+/// separator, word joiner and invisible operators, the deprecated format controls) and the
+/// line and paragraph separators, which would make visually identical narrations different
+/// lines (D-054).
 pub const fn is_forbidden(c: char) -> bool {
-    c.is_control() || matches!(c, '\u{FEFF}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+    c.is_control()
+        || matches!(
+            c,
+            '\u{00AD}'
+                | '\u{061C}'
+                | '\u{180E}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{2028}'..='\u{202E}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{2066}'..='\u{206F}'
+                | '\u{FEFF}'
+        )
 }
 
 const fn is_space(c: char) -> bool {
@@ -52,6 +67,18 @@ mod tests {
         assert_eq!(normalize("café Ä"), "CAFé Ä");
         assert_eq!(normalize("   "), "");
         assert_eq!(normalize("a"), "A");
+    }
+
+    /// L-4 regression: invisible characters made visually identical narrations different
+    /// lines, and bidi marks still reordered text on screen.
+    #[test]
+    fn zero_widths_bidi_marks_and_separators_are_forbidden() {
+        for c in [
+            '\u{00AD}', '\u{061C}', '\u{180E}', '\u{200B}', '\u{200C}', '\u{200D}', '\u{200E}',
+            '\u{200F}', '\u{2028}', '\u{2029}', '\u{2060}', '\u{2064}', '\u{206A}', '\u{206F}',
+        ] {
+            assert!(is_forbidden(c), "U+{:04X}", u32::from(c));
+        }
     }
 
     #[test]
