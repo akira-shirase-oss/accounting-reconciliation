@@ -1,0 +1,45 @@
+# Reverse proxy in front of recon-server: TLS (Caddy obtains and renews the certificate
+# for the site name), bounded bodies and timeouts, and an access log without the operator
+# token or the uploaded file's name (D-025). Replace recon.example.com with your host.
+# Install: /etc/caddy/Caddyfile; `caddy validate --config /etc/caddy/Caddyfile`.
+{
+	servers {
+		timeouts {
+			read_header 10s
+			read_body 90s
+			write 180s
+			idle 2m
+		}
+	}
+}
+
+recon.example.com {
+	# The server refuses more than 50 MiB itself; this stops a larger body at the edge.
+	request_body {
+		max_size 51MB
+	}
+	# Uploads stream through unbuffered, so the server's backpressure and its idle and
+	# parse deadlines apply end to end.
+	reverse_proxy 127.0.0.1:62480 {
+		flush_interval -1
+		request_buffers 0
+		transport http {
+			dial_timeout 5s
+			response_header_timeout 170s
+		}
+	}
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+	log {
+		output stderr
+		format filter {
+			wrap json
+			request>headers>Authorization delete
+			request>headers>X-File-Name delete
+		}
+	}
+}

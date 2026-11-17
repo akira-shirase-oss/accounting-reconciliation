@@ -13,7 +13,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use recon_domain::refusal::{RefusalCode as C, RowRefusal};
+use recon_domain::refusal::RefusalCode as C;
 use recon_domain::{AccountId, Currency};
 use recon_import::dates::DateFormat;
 use recon_import::{
@@ -98,14 +98,8 @@ fn check(name: &str, outcome: &Result<ParseSummary, FileRefusal>, expect: &Expec
             assert_eq!((refusal.code, refusal.row), (*code, *row), "{name}");
         }
         (Ok(summary), Expect::Rows(rows)) => {
-            let expected: Vec<RowRefusal> = rows
-                .iter()
-                .map(|(row, code)| RowRefusal {
-                    row: *row,
-                    code: *code,
-                })
-                .collect();
-            assert_eq!(summary.refusals, expected, "{name}");
+            let found: Vec<(u32, C)> = summary.refusals.iter().map(|r| (r.row, r.code)).collect();
+            assert_eq!(found, rows.to_vec(), "{name}");
             assert!(!summary.is_clean(), "{name} must be refused");
         }
         (other, _) => panic!("{name}: unexpected outcome {other:?}"),

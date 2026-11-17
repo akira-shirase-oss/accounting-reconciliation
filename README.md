@@ -60,9 +60,17 @@ in `docs/DECISIONS.md`.
   R3 review, rules and periods → R4 the model for ambiguous cases → R5
   reports and workspace → R6 evidence battery → R7 pilot and ship gate →
   R8 India → R9 PDF
-- `docs/DECISIONS.md` — D-001 to D-067 and the questions still open
+- `docs/DECISIONS.md` — D-001 to D-069 and the questions still open
+- `docs/OPERATOR_GUIDE.md` — install, first run, importing a first statement,
+  upgrade, backup and restore (with the anchor files), troubleshooting
+- `examples/` — profiles and files to try every import command on
 
 ## Running it (R0, R1)
+
+For a deployment, follow `docs/OPERATOR_GUIDE.md` (`deploy/` has the env
+template, the systemd unit and the Caddy reverse proxy;
+`scripts/production-smoke.sh` tests that path). To try the import checks
+without a server, see `examples/README.md` and `recon help`. For development:
 
 ```sh
 scripts/stack.sh up        # PostgreSQL 18.7 on 127.0.0.1:62432 (compose project accounting-reconciliation)

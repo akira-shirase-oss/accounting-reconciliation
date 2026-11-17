@@ -117,6 +117,8 @@ pub struct StagingImport {
     pub target: Target,
     /// The profile.
     pub profile: ProfileId,
+    /// The name of the file, as the uploader gave it (shown in reports, never logged).
+    pub file_name: Option<String>,
     lease_token: Uuid,
     staged_rows: u32,
 }
@@ -167,6 +169,8 @@ pub struct ImportRecord {
     pub account_id: Option<Uuid>,
     /// `staging`, `complete`, `refused`, `discarded` or `revision`.
     pub status: String,
+    /// The name of the file, when the uploader gave one.
+    pub file_name: Option<String>,
     /// The profile's name.
     pub profile: String,
     /// The profile's version.
@@ -279,7 +283,7 @@ pub async fn begin(
     account: &Account,
     lease: Duration,
 ) -> Result<StagingImport, DbError> {
-    begin_with(pool, account, &ProfileId::r0(), lease).await
+    begin_with(pool, account, &ProfileId::r0(), None, lease).await
 }
 
 /// Starts a `staging` statement import into `account`, read with `profile`.
@@ -287,13 +291,23 @@ pub async fn begin_with(
     pool: &PgPool,
     account: &Account,
     profile: &ProfileId,
+    file_name: Option<&str>,
     lease: Duration,
 ) -> Result<StagingImport, DbError> {
     let target = Target::Statement {
         account: account.id,
         currency: account.currency,
     };
-    insert_import(pool, account.firm, account.client, target, profile, lease).await
+    insert_import(
+        pool,
+        account.firm,
+        account.client,
+        target,
+        profile,
+        file_name,
+        lease,
+    )
+    .await
 }
 
 /// Starts a `staging` document import for `firm`'s `client`, read with `profile`.
@@ -303,9 +317,20 @@ pub async fn begin_documents(
     firm: FirmId,
     client: ClientId,
     profile: &ProfileId,
+    file_name: Option<&str>,
     lease: Duration,
 ) -> Result<StagingImport, DbError> {
-    match insert_import(pool, firm, client, Target::Documents, profile, lease).await {
+    match insert_import(
+        pool,
+        firm,
+        client,
+        Target::Documents,
+        profile,
+        file_name,
+        lease,
+    )
+    .await
+    {
         Err(DbError::Constraint(_)) => Err(DbError::NotFound),
         other => other,
     }
@@ -317,6 +342,7 @@ async fn insert_import(
     client: ClientId,
     target: Target,
     profile: &ProfileId,
+    file_name: Option<&str>,
     lease: Duration,
 ) -> Result<StagingImport, DbError> {
     let id = ImportId::from_uuid(Uuid::now_v7());
@@ -330,9 +356,9 @@ async fn insert_import(
     sqlx::query(
         "INSERT INTO recon.imports
              (firm_id, id, client_id, account_id, currency, kind, profile, profile_version,
-              profile_sha256, lease_token, lease_until)
+              profile_sha256, lease_token, lease_until, file_name)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                 now() + ($11::bigint * interval '1 millisecond'))",
+                 now() + ($11::bigint * interval '1 millisecond'), $12)",
     )
     .bind(firm.as_uuid())
     .bind(id.as_uuid())
@@ -345,6 +371,7 @@ async fn insert_import(
     .bind(profile.sha256.as_slice())
     .bind(token)
     .bind(millis(lease))
+    .bind(file_name)
     .execute(pool)
     .await?;
     Ok(StagingImport {
@@ -353,6 +380,7 @@ async fn insert_import(
         client,
         target,
         profile: profile.clone(),
+        file_name: file_name.map(str::to_owned),
         lease_token: token,
         staged_rows: 0,
     })
@@ -1915,9 +1943,12 @@ async fn flip_documents<H: FlipHook>(
     if let Some((n_conflicts, rows)) = conflicts {
         let refusals: Vec<RowRefusal> = rows
             .into_iter()
-            .map(|r| RowRefusal {
-                row: u32::try_from(r).unwrap_or(0),
-                code: RefusalCode::DocumentNumberConflict,
+            .map(|r| {
+                RowRefusal::new(
+                    u32::try_from(r).unwrap_or(0),
+                    RefusalCode::DocumentNumberConflict,
+                )
+                .at(recon_domain::Field::Number)
             })
             .collect();
         let refusal = Refusal {
@@ -2184,7 +2215,8 @@ pub async fn sweep(pool: &PgPool, max_imports: i64, max_rows: i64) -> Result<Swe
     })
 }
 
-const RECORD_COLUMNS: &str = "id, kind, client_id, account_id, status, profile, profile_version,
+const RECORD_COLUMNS: &str =
+    "id, kind, client_id, account_id, status, file_name, profile, profile_version,
     profile_sha256, file_hash, file_bytes, rows_read, lines_created, duplicates, rows_refused,
     refusal_code, refusals, question, duplicate_of, discard_reason, first_date, last_date,
     overlap_first, overlap_last, overlap_rows, changes";
@@ -2213,6 +2245,7 @@ fn import_record(row: &PgRow) -> Result<ImportRecord, DbError> {
         client_id: row.try_get("client_id")?,
         account_id: row.try_get("account_id")?,
         status: row.try_get("status")?,
+        file_name: row.try_get("file_name")?,
         profile: row.try_get("profile")?,
         profile_version: row.try_get("profile_version")?,
         profile_sha256: profile_sha256.map(hex::encode),

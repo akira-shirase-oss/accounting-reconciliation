@@ -26,6 +26,11 @@ macro_rules! codes {
                     $(Self::$variant => $code,)+
                 }
             }
+
+            /// Parses a stored code.
+            pub fn from_code(code: &str) -> Option<Self> {
+                Self::ALL.iter().copied().find(|c| c.as_str() == code)
+            }
         }
     };
 }
@@ -136,18 +141,284 @@ impl From<DateError> for RefusalCode {
     }
 }
 
-/// One refused row: its 1-based record number in the file (the header is row 1) and why.
+impl RefusalCode {
+    /// What is wrong and how to fix it, in plain words for the person who exported the
+    /// file (D-068). A report adds the row, the column's name in the profile and the
+    /// profile's formats.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "a table: one arm of plain words per refusal code"
+    )]
+    pub const fn explain(self) -> (&'static str, &'static str) {
+        match self {
+            Self::FileTooLarge => (
+                "The file is larger than 50 MiB.",
+                "Export a shorter period (one month at a time) and upload each file.",
+            ),
+            Self::TooManyRows => (
+                "The file has more than 2,000,000 rows.",
+                "Export a shorter period and upload each file.",
+            ),
+            Self::EmptyFile => (
+                "The file has no rows after its header (or no header at all).",
+                "Check that the export covers a period with transactions, and upload the file the bank produced, not a blank template.",
+            ),
+            Self::UnsupportedEncoding => (
+                "The file's text encoding is not one this tool reads (or contradicts the profile).",
+                "Export again as UTF-8 (\"CSV UTF-8\" in a spreadsheet), or declare \"windows1252\" in the profile if the bank exports that.",
+            ),
+            Self::HeaderMismatch => (
+                "The first line is not the header the profile expects.",
+                "Upload the export this profile was written for, unchanged; if the bank changed its layout, create a new profile version with the new header.",
+            ),
+            Self::ParseDeadlineExceeded => (
+                "Reading the file took longer than 60 seconds.",
+                "Upload again; if it repeats, split the file into shorter periods.",
+            ),
+            Self::AmbiguousDateFormat => (
+                "The profile does not say whether dates are day-month or month-day, and the tool never guesses.",
+                "Create a new version of the profile with \"order\" set in date_format to one of the options given, then upload the file again.",
+            ),
+            Self::DeclarationRefused => (
+                "The OFX file contains a DTD, entity declaration or comment, which this tool never reads.",
+                "Download the statement from the bank again; if it repeats, export it as CSV.",
+            ),
+            Self::EntityRefused => (
+                "The OFX file uses an entity other than &amp; &lt; &gt; &quot; &apos; or a bare &.",
+                "Download the statement again; if it repeats, export it as CSV.",
+            ),
+            Self::MalformedOfx => (
+                "The OFX file is not a complete, well-formed statement (header, tags or nesting).",
+                "Download the statement from the bank again; a file cut short or edited by hand cannot be read.",
+            ),
+            Self::MultipleStatements => (
+                "The OFX file holds statements for more than one account.",
+                "Download one account's statement per file and upload each into its own account.",
+            ),
+            Self::InvalidUtf8 => (
+                "This line contains bytes that are not valid text in the file's encoding.",
+                "Export again as UTF-8, or declare \"windows1252\" in the profile if the bank exports that.",
+            ),
+            Self::ForbiddenCharacter => (
+                "This line contains an invisible or control character (a tab, a line break inside a field, a zero-width or text-direction mark).",
+                "Remove the character in the spreadsheet or export again; these characters can make two identical narrations look different or reorder text on screen.",
+            ),
+            Self::LineTooLong => (
+                "This line is longer than 64 KiB.",
+                "Check the line for a field that runs into the next one (a missing quote or delimiter).",
+            ),
+            Self::FieldTooLong => (
+                "A field on this line is longer than 8 KiB.",
+                "Check for a missing closing quote, or shorten the text.",
+            ),
+            Self::TooManyFields => (
+                "This line has more than 256 fields.",
+                "Check the delimiter: the profile's delimiter may not be the one the file uses.",
+            ),
+            Self::FieldCountMismatch => (
+                "This line has a different number of fields from the header.",
+                "Check for an unquoted delimiter inside a narration or a missing field; quote fields that contain the delimiter.",
+            ),
+            Self::UnterminatedQuote => (
+                "A quoted field on this line is never closed: the file ends inside it.",
+                "Close the quote or export the file again; it may have been cut short.",
+            ),
+            Self::StrayQuote => (
+                "A quote mark appears inside an unquoted field, or text follows a closing quote.",
+                "Quote the whole field and write a quote inside it as two quotes (\"\").",
+            ),
+            Self::BareCarriageReturn => (
+                "A carriage return appears on its own inside this line.",
+                "Export again with standard line endings, or remove the stray character.",
+            ),
+            Self::EmptyRow => ("This line is empty.", "Remove blank lines between rows."),
+            Self::MissingRequiredField => (
+                "A field this profile requires is empty.",
+                "Fill in the field; a row without it cannot be reconciled.",
+            ),
+            Self::InvalidDate => (
+                "The date is not a real day written in the profile's date format.",
+                "Correct the date in the file, or the profile's date_format if the bank writes dates differently.",
+            ),
+            Self::DateOutOfRange => (
+                "The date is before 1990 or after 2100.",
+                "Correct the date; a year typed short (26 for 2026) is a common cause.",
+            ),
+            Self::InvalidAmount => (
+                "The amount is not a number in the profile's number format.",
+                "Remove currency symbols and words, and check the decimal and grouping marks and the negative style against the profile's number_format.",
+            ),
+            Self::TooManyDecimalPlaces => (
+                "The amount has more decimal places than the currency allows.",
+                "Write the amount with the currency's places (2 for most, 0 for JPY, 3 for KWD); amounts are never rounded.",
+            ),
+            Self::AmountOutOfRange => (
+                "The amount is larger than 10^12 minor units (10 billion in a 2-place currency).",
+                "Check the amount; a number pasted twice or a reference in the amount column is a common cause.",
+            ),
+            Self::ZeroAmount => (
+                "The amount is zero.",
+                "Remove the row; a zero-value line has nothing to reconcile.",
+            ),
+            Self::UnknownCurrency => (
+                "The currency code is not one this tool supports.",
+                "Use an ISO code in upper case: INR, USD, EUR, GBP, AED, SGD, AUD, CAD, JPY or KWD.",
+            ),
+            Self::CurrencyMismatch => (
+                "The row's currency is not the account's (or the statement's currency is not the account's).",
+                "Upload the statement into the account in its currency; foreign-currency rows are not matched in this version.",
+            ),
+            Self::InvalidBalance => (
+                "The running balance is not a number in the profile's number format.",
+                "Correct the balance, or check the profile's number_format.",
+            ),
+            Self::BalanceDiscontinuity => (
+                "The running balance does not follow from the previous balance and the amounts between them.",
+                "Check for a missing, extra or edited row just above this one; if the bank lists newest first, set row_order to newest_first in the profile.",
+            ),
+            Self::FormulaCell => (
+                "A text field starts with = or @, which a spreadsheet would run as a formula.",
+                "Remove the leading = or @ (a bank export never needs it), then upload again.",
+            ),
+            Self::DebitAndCredit => (
+                "Both the money-out and the money-in column have an amount on this row.",
+                "Keep the amount in one column only; a row is either a payment or a receipt.",
+            ),
+            Self::UnexpectedSign => (
+                "A sign appears where the profile expects a plain amount (money-out, money-in, or an amount signed by document kind).",
+                "Write the amount without a sign; the column (or the document kind) already says which way the money went.",
+            ),
+            Self::InvalidDocumentKind => (
+                "The document kind is not one of sales_invoice, purchase_bill, receipt, credit_note or book_entry (or a book entry is in a profile that signs amounts by kind).",
+                "Use one of the five codes, or import book entries with a signed profile.",
+            ),
+            Self::DocumentNumberConflict => (
+                "This document number is already used by another document of the same kind and counterparty, in this file or already imported.",
+                "If this is a corrected copy, keep only one version in the file; if it is a different document, give it its own number.",
+            ),
+        }
+    }
+}
+
+/// Which field of a row a refusal concerns; a report names it by the profile's column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Field {
+    /// The booking date.
+    BookingDate,
+    /// The value date.
+    ValueDate,
+    /// The signed amount.
+    Amount,
+    /// The money-out column.
+    MoneyOut,
+    /// The money-in column.
+    MoneyIn,
+    /// The currency.
+    Currency,
+    /// The narration.
+    Narration,
+    /// The bank's reference.
+    Reference,
+    /// The counterparty.
+    Counterparty,
+    /// The running balance.
+    BalanceAfter,
+    /// A document's kind.
+    Kind,
+    /// A document's number.
+    Number,
+    /// A document's issue date.
+    IssueDate,
+    /// A document's due date.
+    DueDate,
+    /// A document's description.
+    Description,
+}
+
+impl Field {
+    /// Plain words for the field.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::BookingDate => "booking date",
+            Self::ValueDate => "value date",
+            Self::Amount => "amount",
+            Self::MoneyOut => "money out",
+            Self::MoneyIn => "money in",
+            Self::Currency => "currency",
+            Self::Narration => "narration",
+            Self::Reference => "reference",
+            Self::Counterparty => "counterparty",
+            Self::BalanceAfter => "running balance",
+            Self::Kind => "document kind",
+            Self::Number => "document number",
+            Self::IssueDate => "issue date",
+            Self::DueDate => "due date",
+            Self::Description => "description",
+        }
+    }
+}
+
+/// One refused row: its 1-based record number in the file (the header is row 1; every
+/// record is one line, since line breaks inside fields are refused), why, and the field
+/// when one field is at fault.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RowRefusal {
     /// The record number.
     pub row: u32,
     /// The reason.
     pub code: RefusalCode,
+    /// The field at fault, when one is (absent for a problem with the whole line).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field: Option<Field>,
+}
+
+impl RowRefusal {
+    /// A refusal of the whole line.
+    pub const fn new(row: u32, code: RefusalCode) -> Self {
+        Self {
+            row,
+            code,
+            field: None,
+        }
+    }
+
+    /// The same refusal, naming the field at fault.
+    #[must_use]
+    pub const fn at(self, field: Field) -> Self {
+        Self {
+            field: Some(field),
+            ..self
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, reason = "tests: a panic is the failure report")]
+
     use super::*;
+
+    #[test]
+    fn every_code_says_what_is_wrong_and_how_to_fix_it() {
+        for code in RefusalCode::ALL {
+            let (problem, fix) = code.explain();
+            for text in [problem, fix] {
+                assert!(text.len() > 15 && text.ends_with('.'), "{code:?}: {text:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_row_refusal_without_a_field_reads_as_before() {
+        let old: RowRefusal = serde_json::from_str(r#"{"row":3,"code":"invalid_date"}"#).unwrap();
+        assert_eq!(old, RowRefusal::new(3, RefusalCode::InvalidDate));
+        let at = old.at(Field::ValueDate);
+        assert_eq!(
+            serde_json::to_string(&at).unwrap(),
+            r#"{"row":3,"code":"invalid_date","field":"value_date"}"#
+        );
+    }
 
     #[test]
     fn codes_are_unique_snake_case_and_match_serde() {

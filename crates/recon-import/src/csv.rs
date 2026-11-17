@@ -307,7 +307,7 @@ impl CsvReader {
         }
         self.end_field();
         let outcome = match self.error {
-            Some(code) => Err(RowRefusal { row, code }),
+            Some(code) => Err(RowRefusal::new(row, code)),
             None => self.validate(),
         };
         let result = match outcome {
@@ -324,25 +324,17 @@ impl CsvReader {
     /// valid and every field boundary a character boundary, so each field is valid.
     fn validate(&self) -> Result<(&str, &[Range<usize>]), RowRefusal> {
         let row = self.record_no;
-        let text = std::str::from_utf8(&self.buf).map_err(|_| RowRefusal {
-            row,
-            code: RefusalCode::InvalidUtf8,
-        })?;
+        let text = std::str::from_utf8(&self.buf)
+            .map_err(|_| RowRefusal::new(row, RefusalCode::InvalidUtf8))?;
         let boundaries_ok = self
             .bounds
             .iter()
             .all(|r| text.is_char_boundary(r.start) && text.is_char_boundary(r.end));
         if !boundaries_ok {
-            return Err(RowRefusal {
-                row,
-                code: RefusalCode::InvalidUtf8,
-            });
+            return Err(RowRefusal::new(row, RefusalCode::InvalidUtf8));
         }
         if text.chars().any(is_forbidden) {
-            return Err(RowRefusal {
-                row,
-                code: RefusalCode::ForbiddenCharacter,
-            });
+            return Err(RowRefusal::new(row, RefusalCode::ForbiddenCharacter));
         }
         Ok((text, &self.bounds))
     }
@@ -425,7 +417,7 @@ mod tests {
     }
 
     fn bad(row: u32, code: RefusalCode) -> Outcome {
-        Err(RowRefusal { row, code })
+        Err(RowRefusal::new(row, code))
     }
 
     #[test]

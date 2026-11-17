@@ -1,6 +1,6 @@
 [package]
 name = "recon-cli"
-description = "Operator and verification commands for Accounting Reconciliation: database setup and migration, audit verify and replay, the seeded data generator."
+description = "The Accounting Reconciliation command line: import and profile checks before an upload, database setup and migration, audit verify, anchor and replay, the seeded data generator."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -16,6 +16,7 @@ anyhow.workspace = true
 hex.workspace = true
 recon-db.workspace = true
 recon-domain.workspace = true
+recon-import.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
 tokio.workspace = true
@@ -23,7 +24,6 @@ uuid.workspace = true
 
 [dev-dependencies]
 recon-db = { workspace = true, features = ["test-support"] }
-recon-import.workspace = true
 
 [lints]
 workspace = true

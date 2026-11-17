@@ -25,4 +25,4 @@ pub mod text;
 pub use date::Date;
 pub use ids::{AccountId, ClientId, DecisionId, DocumentId, FirmId, ImportId, LineId, UserId};
 pub use money::{Currency, Money, MoneyError, MoneySum};
-pub use refusal::{RefusalCode, RowRefusal};
+pub use refusal::{Field, RefusalCode, RowRefusal};

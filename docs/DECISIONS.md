@@ -739,6 +739,42 @@ conservative side.
   rows or 1 MiB. Ordinary rows (5,000 of them are under 1 MiB) are unaffected. The full
   run has not been made (the development machine was running other load tests); it is owed.
 
+- **D-068 — An interface an accountant can act on (R1 has no screens).** Until R3's
+  workspace, the interface is the API's refusal reports and the command line, held to the
+  same standard as the engine. Every row refusal names its field; the report built from
+  it gives, for each refused line (the first 1,000; the rest counted), its location
+  (`line 14`, or `transaction 3` in OFX), the profile's own column name, the stable code,
+  what is wrong and how to fix it in plain words, with the profile's date and number
+  formats spelled out (`DD/MM/YYYY`, `like 12,34,567.89; negatives as (1.00)`); a refused
+  file gets the same, and an undeclared date order gets its question with the answer
+  when only one order fits. The API returns it with every refusal and on `GET` of a
+  refused import, with the file's name when the upload sends `X-File-Name` (stored, shown
+  back, never logged, never part of the file's identity; a name with a path or control
+  characters is refused). `recon import check` reads a file exactly as the server would,
+  with no server or database, and prints what would be imported — rows, dates, money in
+  and out exactly, with the currency — or the report; `recon profile check` lists every
+  problem in a profile or how it reads; every command has `--help` and `recon help
+  COMMAND`, with examples. `examples/` holds profiles and files for every command, and a
+  test runs each documented command against the real binary so the examples stay true.
+  Exit status: 0 success, 1 the command could not run, 3 a check found problems. Cost:
+  plain-words texts are a second contract to keep in step with the codes (a test holds
+  every code to having both).
+- **D-069 — A tested production path and an operator guide.** `deploy/recon.env.example`
+  (every setting, the two that must change marked), `deploy/recon-server.service` (a
+  hardened systemd unit: its own user, a read-only system, no capabilities, no restart
+  on exit status 78) and `deploy/Caddyfile` (TLS, 51 MB bodies, uploads streamed
+  unbuffered, bounded timeouts, an access log without the token or the file name) are
+  what `docs/OPERATOR_GUIDE.md` installs: install, database setup, first run, importing a
+  first statement, upgrade, backup and restore with the anchor file and its key, and
+  troubleshooting by response code. `scripts/production-smoke.sh` runs that path on every
+  push (CI job *production path*): a release build, the server started with only a
+  recon.env made from the template, a first statement imported and a refused one
+  reported, the chains verified and anchored, a `pg_dump` restored into a new database
+  and verified against the anchors and replayed, an upgrade (migrate, SIGTERM, start), a
+  wrong setting refused with 78, the same requests through the Caddy example with its log
+  checked, and `systemd-analyze verify` on the unit. Cost: one more CI job and one more
+  pinned image (Caddy) to keep current.
+
 ## Open questions (blocked on the maintainer or an outside party)
 
 Each is in the README's *Blocked on* table. None blocks R0–R6.

@@ -1,0 +1,20 @@
+{
+  "name": "sales-register",
+  "kind": "documents_csv",
+  "definition": {
+    "delimiter": ",",
+    "header": ["Invoice No", "Invoice Date", "Due Date", "Customer", "Total"],
+    "columns": {
+      "number": "Invoice No",
+      "issue_date": "Invoice Date",
+      "due_date": "Due Date",
+      "counterparty": "Customer",
+      "amount": {"signed": "Total"}
+    },
+    "fixed_kind": "sales_invoice",
+    "fixed_currency": "INR",
+    "amount_sign": "by_kind",
+    "date_format": {"order": "dmy", "separator": "-", "month_names": true},
+    "number_format": {"decimal": ".", "grouping": ",", "group_style": "indian"}
+  }
+}

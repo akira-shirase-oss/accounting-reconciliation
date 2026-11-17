@@ -322,8 +322,9 @@ async fn documents_import_through_their_route() {
     assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
     assert_eq!(
         body["error"]["import"]["refusals"],
-        json!([{"row": 2, "code": "document_number_conflict"}])
+        json!([{"row": 2, "code": "document_number_conflict", "field": "number"}])
     );
+    assert_eq!(body["error"]["report"]["problems"][0]["column"], "number");
     // Another firm's client is not found; a statement profile cannot read documents.
     let other = tenant(&state, "INR").await;
     let (s, _) = call(
@@ -441,6 +442,81 @@ async fn a_revision_is_held_listed_and_decided_through_the_api() {
         .await
         .unwrap()
         .unwrap();
+    db.cleanup().await;
+}
+
+/// A refusal names the file, the line, the profile's column, what is wrong and how to fix
+/// it, in the response and later on the import (D-068).
+#[tokio::test]
+async fn a_refusal_report_names_file_line_column_problem_and_fix() {
+    let db = TestDb::new().await;
+    let state = checked(&db);
+    let t = tenant(&state, "INR").await;
+    let (s, _) = call(
+        &state,
+        post_json(
+            &format!("/v1/firms/{}/profiles", t.firm),
+            &json!({"name": "hdfc", "kind": "statement_csv", "definition": indian_profile(json!("dmy"))}),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED);
+    let bad = INDIAN
+        .replace("03/03/2026,UPI/RENT", "31/02/2026,UPI/RENT")
+        .replace("500.00,,", "500.00,12.00,");
+    let path = format!(
+        "/v1/firms/{}/accounts/{}/imports?profile=hdfc",
+        t.firm, t.account
+    );
+    let request = authed(Request::post(&path))
+        .header(header::CONTENT_TYPE, "text/csv")
+        .header("x-file-name", "HDFC March 2026.csv")
+        .body(Body::from(bad))
+        .unwrap();
+    let (s, body) = call(&state, request).await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    let report = &body["error"]["report"];
+    assert_eq!(report["file"]["name"], "HDFC March 2026.csv");
+    assert_eq!(report["file"]["profile"], "hdfc v1");
+    let problems = report["problems"].as_array().unwrap();
+    assert_eq!(problems.len(), 2, "{report}");
+    assert_eq!(
+        (
+            problems[0]["location"].as_str(),
+            problems[0]["column"].as_str()
+        ),
+        (Some("line 3"), Some("Date"))
+    );
+    assert!(
+        problems[0]["problem"]
+            .as_str()
+            .unwrap()
+            .contains("DD/MM/YYYY")
+    );
+    assert_eq!(problems[1]["code"], "debit_and_credit");
+    assert_eq!(
+        problems[1]["column"], "Withdrawal Amt. / Deposit Amt.",
+        "a split amount names both columns"
+    );
+    // The same report later, from the import.
+    let id = body["error"]["import"]["id"].as_str().unwrap();
+    let (s, later) = call(&state, get(&format!("/v1/firms/{}/imports/{id}", t.firm))).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(later["report"]["problems"], report["problems"]);
+    // A file name with a path, or control characters, is refused before anything is read.
+    for name in ["../etc/passwd", "a\\b.csv"] {
+        let request = authed(Request::post(&path))
+            .header(header::CONTENT_TYPE, "text/csv")
+            .header("x-file-name", name)
+            .body(Body::from(INDIAN))
+            .unwrap();
+        let (s, body) = call(&state, request).await;
+        assert_eq!(
+            (s, body["error"]["code"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("invalid_file_name")),
+            "{name}"
+        );
+    }
     db.cleanup().await;
 }
 

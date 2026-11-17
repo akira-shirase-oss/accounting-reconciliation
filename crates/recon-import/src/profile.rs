@@ -27,7 +27,7 @@ use sha2::{Digest, Sha256};
 use recon_domain::fingerprint::{LineTuple, tuple_hash};
 use recon_domain::import::{FileHash, NewLine};
 use recon_domain::limits::{MAX_FIELDS, MAX_REPORTED_ROW_ERRORS};
-use recon_domain::refusal::{RefusalCode, RowRefusal};
+use recon_domain::refusal::{Field, RefusalCode, RowRefusal};
 use recon_domain::text::{is_forbidden, normalize};
 use recon_domain::{AccountId, Currency, Date, Money};
 
@@ -488,14 +488,12 @@ pub(crate) fn read_date(
     format: DateFormat,
     text: &str,
     row: u32,
+    field: Field,
     open: &mut Undeclared,
 ) -> Result<Option<Date>, RowRefusal> {
     match format.parse(text) {
         Parsed::Date(d) => Ok(Some(d)),
-        Parsed::Invalid(e) => Err(RowRefusal {
-            row,
-            code: e.into(),
-        }),
+        Parsed::Invalid(e) => Err(RowRefusal::new(row, e.into()).at(field)),
         Parsed::Undeclared { dmy, mdy } => {
             open.first_row.get_or_insert(row);
             open.question.dmy &= dmy;
@@ -515,58 +513,63 @@ pub(crate) fn optional(field: &str) -> Option<&str> {
 }
 
 /// A text field: refused as a formula, otherwise as written.
-pub(crate) fn text(field: &str, row: u32) -> Result<Option<&str>, RowRefusal> {
-    match optional(field) {
-        Some(t) if is_formula(t) => Err(RowRefusal {
-            row,
-            code: RefusalCode::FormulaCell,
-        }),
+pub(crate) fn text(value: &str, row: u32, field: Field) -> Result<Option<&str>, RowRefusal> {
+    match optional(value) {
+        Some(t) if is_formula(t) => Err(RowRefusal::new(row, RefusalCode::FormulaCell).at(field)),
         other => Ok(other),
     }
 }
 
-/// Reads the amount of a row (`Signed` or `Split`), refusing zero.
+/// Reads the amount of a row (`Signed` or `Split`), refusing zero; a refusal names the
+/// column at fault.
 pub(crate) fn read_amount(
     at: AmountAt,
     format: &NumberFormat,
     record: &Record<'_>,
     currency: Currency,
-) -> Result<Money, RefusalCode> {
+) -> Result<Money, (RefusalCode, Field)> {
     let amount = match at {
         AmountAt::Signed(i) => {
-            let text = optional(record.field(i)).ok_or(RefusalCode::MissingRequiredField)?;
-            format.parse(text, currency)?
+            let at = |code| (code, Field::Amount);
+            let text =
+                optional(record.field(i)).ok_or_else(|| at(RefusalCode::MissingRequiredField))?;
+            let amount = format.parse(text, currency).map_err(at)?;
+            if amount.is_zero() {
+                return Err(at(RefusalCode::ZeroAmount));
+            }
+            amount
         }
         AmountAt::Split {
             money_out,
             money_in,
         } => {
-            let magnitude = |i: usize| -> Result<Option<Money>, RefusalCode> {
-                let Some(text) = optional(record.field(i)) else {
-                    return Ok(None);
+            let magnitude =
+                |i: usize, field: Field| -> Result<Option<Money>, (RefusalCode, Field)> {
+                    let Some(text) = optional(record.field(i)) else {
+                        return Ok(None);
+                    };
+                    let m = format.parse(text, currency).map_err(|c| (c, field))?;
+                    if m.minor() < 0 {
+                        return Err((RefusalCode::UnexpectedSign, field));
+                    }
+                    Ok((!m.is_zero()).then_some(m))
                 };
-                let m = format.parse(text, currency)?;
-                if m.minor() < 0 {
-                    return Err(RefusalCode::UnexpectedSign);
-                }
-                Ok((!m.is_zero()).then_some(m))
-            };
             let out_text = optional(record.field(money_out));
             let in_text = optional(record.field(money_in));
             if out_text.is_none() && in_text.is_none() {
-                return Err(RefusalCode::MissingRequiredField);
+                return Err((RefusalCode::MissingRequiredField, Field::Amount));
             }
-            match (magnitude(money_out)?, magnitude(money_in)?) {
-                (Some(_), Some(_)) => return Err(RefusalCode::DebitAndCredit),
-                (Some(out), None) => out.checked_neg()?,
+            match (
+                magnitude(money_out, Field::MoneyOut)?,
+                magnitude(money_in, Field::MoneyIn)?,
+            ) {
+                (Some(_), Some(_)) => return Err((RefusalCode::DebitAndCredit, Field::Amount)),
+                (Some(out), None) => out.checked_neg().map_err(|e| (e.into(), Field::MoneyOut))?,
                 (None, Some(into)) => into,
-                (None, None) => return Err(RefusalCode::ZeroAmount),
+                (None, None) => return Err((RefusalCode::ZeroAmount, Field::Amount)),
             }
         }
     };
-    if amount.is_zero() {
-        return Err(RefusalCode::ZeroAmount);
-    }
     Ok(amount)
 }
 
@@ -691,10 +694,10 @@ impl StatementRows {
                     .continuity
                     .observe(line.amount.minor(), line.balance_after.map(Money::minor));
                 if !continues {
-                    self.tally.refuse(RowRefusal {
-                        row: line.row,
-                        code: RefusalCode::BalanceDiscontinuity,
-                    });
+                    self.tally.refuse(
+                        RowRefusal::new(line.row, RefusalCode::BalanceDiscontinuity)
+                            .at(Field::BalanceAfter),
+                    );
                 } else if self.tally.rows_refused == 0 {
                     on_line(line);
                 }
@@ -714,43 +717,51 @@ impl StatementRows {
     fn parse_row(&mut self, record: &Record<'_>) -> Result<Option<NewLine>, RowRefusal> {
         let p = &*self.profile;
         let row = record.row;
-        let refuse = |code: RefusalCode| RowRefusal { row, code };
+        let refuse = |code: RefusalCode, field: Field| RowRefusal::new(row, code).at(field);
         if record.len() != p.profile.header.len() {
-            return Err(refuse(RefusalCode::FieldCountMismatch));
+            return Err(RowRefusal::new(row, RefusalCode::FieldCountMismatch));
         }
         let format = p.profile.date_format;
-        let booking = optional(record.field(p.booking_date))
-            .ok_or(refuse(RefusalCode::MissingRequiredField))?;
-        let booking_date = read_date(format, booking, row, &mut self.undeclared)?;
+        let booking = optional(record.field(p.booking_date)).ok_or(refuse(
+            RefusalCode::MissingRequiredField,
+            Field::BookingDate,
+        ))?;
+        let booking_date = read_date(
+            format,
+            booking,
+            row,
+            Field::BookingDate,
+            &mut self.undeclared,
+        )?;
         let value_date = match p.value_date.and_then(|i| optional(record.field(i))) {
-            Some(t) => read_date(format, t, row, &mut self.undeclared)?,
+            Some(t) => read_date(format, t, row, Field::ValueDate, &mut self.undeclared)?,
             None => None,
         };
         let currency = match p.currency {
             Some(i) => {
-                let code =
-                    optional(record.field(i)).ok_or(refuse(RefusalCode::MissingRequiredField))?;
-                Currency::from_code(code).map_err(|e| refuse(e.into()))?
+                let code = optional(record.field(i))
+                    .ok_or(refuse(RefusalCode::MissingRequiredField, Field::Currency))?;
+                Currency::from_code(code).map_err(|e| refuse(e.into(), Field::Currency))?
             }
             None => self.context.currency,
         };
         if currency != self.context.currency {
-            return Err(refuse(RefusalCode::CurrencyMismatch));
+            return Err(refuse(RefusalCode::CurrencyMismatch, Field::Currency));
         }
-        let amount =
-            read_amount(p.amount, &p.profile.number_format, record, currency).map_err(refuse)?;
-        let narration_raw = text(record.field(p.narration), row)?
-            .ok_or(refuse(RefusalCode::MissingRequiredField))?;
+        let amount = read_amount(p.amount, &p.profile.number_format, record, currency)
+            .map_err(|(code, field)| refuse(code, field))?;
+        let narration_raw = text(record.field(p.narration), row, Field::Narration)?
+            .ok_or(refuse(RefusalCode::MissingRequiredField, Field::Narration))?;
         let narration_norm = normalize(narration_raw);
         if narration_norm.is_empty() {
-            return Err(refuse(RefusalCode::MissingRequiredField));
+            return Err(refuse(RefusalCode::MissingRequiredField, Field::Narration));
         }
         let reference = match p.reference {
-            Some(i) => text(record.field(i), row)?,
+            Some(i) => text(record.field(i), row, Field::Reference)?,
             None => None,
         };
         let counterparty_raw = match p.counterparty {
-            Some(i) => text(record.field(i), row)?,
+            Some(i) => text(record.field(i), row, Field::Counterparty)?,
             None => None,
         };
         let balance_after = p
@@ -758,7 +769,7 @@ impl StatementRows {
             .and_then(|i| optional(record.field(i)))
             .map(|b| p.profile.number_format.parse(b, currency))
             .transpose()
-            .map_err(|_| refuse(RefusalCode::InvalidBalance))?;
+            .map_err(|_| refuse(RefusalCode::InvalidBalance, Field::BalanceAfter))?;
         // With the order undeclared every date reads as `None`: no line, only the question.
         let Some(booking_date) = booking_date else {
             return Ok(None);
@@ -1032,10 +1043,7 @@ mod tests {
         let summary = summary.unwrap();
         assert_eq!(
             summary.refusals,
-            [RowRefusal {
-                row: 3,
-                code: C::BalanceDiscontinuity
-            }]
+            [RowRefusal::new(3, C::BalanceDiscontinuity).at(Field::BalanceAfter)]
         );
         // Newest first (the Indian layout): each older row's balance is the newer one less
         // the newer row's amount (2,30,450.50 - 1,25,000.00 = 1,05,450.50, and so on).

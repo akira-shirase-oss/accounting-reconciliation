@@ -133,6 +133,18 @@ pub enum Resolved {
     Documents(ProfileId, Arc<CompiledDocuments>),
 }
 
+impl Resolved {
+    /// The profile as a refusal report reads it.
+    pub fn report(&self) -> recon_import::report::ProfileRef {
+        use recon_import::report::ProfileRef;
+        match self {
+            Self::Statement(_, StatementFormat::Csv(p), _) => ProfileRef::Statement(p.clone()),
+            Self::Statement(_, StatementFormat::Ofx, _) => ProfileRef::Ofx,
+            Self::Documents(_, p) => ProfileRef::Documents(p.clone()),
+        }
+    }
+}
+
 fn mismatch() -> ApiError {
     ApiError::new(
         StatusCode::UNPROCESSABLE_ENTITY,

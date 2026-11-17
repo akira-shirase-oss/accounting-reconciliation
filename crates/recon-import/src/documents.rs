@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use recon_domain::document::{DocumentKind, DocumentTuple, NewDocument, document_tuple_hash};
-use recon_domain::refusal::{RefusalCode, RowRefusal};
+use recon_domain::refusal::{Field, RefusalCode, RowRefusal};
 use recon_domain::text::normalize;
 use recon_domain::{ClientId, Currency};
 
@@ -364,64 +364,67 @@ impl DocumentRows {
     fn parse_row(&mut self, record: &Record<'_>) -> Result<Option<NewDocument>, RowRefusal> {
         let p = &*self.profile;
         let row = record.row;
-        let refuse = |code: RefusalCode| RowRefusal { row, code };
+        let refuse = |code: RefusalCode, field: Field| RowRefusal::new(row, code).at(field);
         if record.len() != p.profile.header.len() {
-            return Err(refuse(RefusalCode::FieldCountMismatch));
+            return Err(RowRefusal::new(row, RefusalCode::FieldCountMismatch));
         }
         let kind = match p.kind {
             Source::Fixed(kind) => kind,
             Source::Column(i) => {
-                let code =
-                    optional(record.field(i)).ok_or(refuse(RefusalCode::MissingRequiredField))?;
-                DocumentKind::from_code(code).ok_or(refuse(RefusalCode::InvalidDocumentKind))?
+                let code = optional(record.field(i))
+                    .ok_or(refuse(RefusalCode::MissingRequiredField, Field::Kind))?;
+                DocumentKind::from_code(code)
+                    .ok_or(refuse(RefusalCode::InvalidDocumentKind, Field::Kind))?
             }
         };
         let number_raw = match p.number {
-            Some(i) => text(record.field(i), row)?,
+            Some(i) => text(record.field(i), row, Field::Number)?,
             None => None,
         };
         let number_norm = number_raw.map(normalize).filter(|n| !n.is_empty());
         if kind.requires_number() && number_norm.is_none() {
-            return Err(refuse(RefusalCode::MissingRequiredField));
+            return Err(refuse(RefusalCode::MissingRequiredField, Field::Number));
         }
         let format = p.profile.date_format;
         let issue = optional(record.field(p.issue_date))
-            .ok_or(refuse(RefusalCode::MissingRequiredField))?;
-        let issue_date = read_date(format, issue, row, &mut self.undeclared)?;
+            .ok_or(refuse(RefusalCode::MissingRequiredField, Field::IssueDate))?;
+        let issue_date = read_date(format, issue, row, Field::IssueDate, &mut self.undeclared)?;
         let due_date = match p.due_date.and_then(|i| optional(record.field(i))) {
-            Some(t) => read_date(format, t, row, &mut self.undeclared)?,
+            Some(t) => read_date(format, t, row, Field::DueDate, &mut self.undeclared)?,
             None => None,
         };
         let currency = match p.currency {
             Source::Fixed(c) => c,
             Source::Column(i) => {
-                let code =
-                    optional(record.field(i)).ok_or(refuse(RefusalCode::MissingRequiredField))?;
-                Currency::from_code(code).map_err(|e| refuse(e.into()))?
+                let code = optional(record.field(i))
+                    .ok_or(refuse(RefusalCode::MissingRequiredField, Field::Currency))?;
+                Currency::from_code(code).map_err(|e| refuse(e.into(), Field::Currency))?
             }
         };
-        let amount =
-            read_amount(p.amount, &p.profile.number_format, record, currency).map_err(refuse)?;
+        let amount = read_amount(p.amount, &p.profile.number_format, record, currency)
+            .map_err(|(code, field)| refuse(code, field))?;
         let amount = match p.profile.amount_sign {
             AmountSign::Signed => amount,
             AmountSign::ByKind => {
                 if amount.minor() < 0 {
-                    return Err(refuse(RefusalCode::UnexpectedSign));
+                    return Err(refuse(RefusalCode::UnexpectedSign, Field::Amount));
                 }
                 match kind.sign() {
                     Some(1) => amount,
-                    Some(_) => amount.checked_neg().map_err(|e| refuse(e.into()))?,
+                    Some(_) => amount
+                        .checked_neg()
+                        .map_err(|e| refuse(e.into(), Field::Amount))?,
                     // A book entry has no fixed direction: it needs a signed profile.
-                    None => return Err(refuse(RefusalCode::InvalidDocumentKind)),
+                    None => return Err(refuse(RefusalCode::InvalidDocumentKind, Field::Kind)),
                 }
             }
         };
         let counterparty_raw = match p.counterparty {
-            Some(i) => text(record.field(i), row)?,
+            Some(i) => text(record.field(i), row, Field::Counterparty)?,
             None => None,
         };
         let description = match p.description {
-            Some(i) => text(record.field(i), row)?,
+            Some(i) => text(record.field(i), row, Field::Description)?,
             None => None,
         };
         let Some(issue_date) = issue_date else {

@@ -18,7 +18,7 @@ stack, ports and database roles are D-036, D-037 and D-049.
    test and pass condition), the ship gate.
 2. `docs/ARCHITECTURE.md` — sources of truth, components, data model,
    paths, egress and keys, consistency, layout.
-3. `docs/DECISIONS.md` — D-001 to D-067 and the open questions; do not
+3. `docs/DECISIONS.md` — D-001 to D-069 and the open questions; do not
    silently resolve an open question — record a new D-NNN when one is
    decided.
 4. `docs/ROADMAP.md` — R0–R9; each milestone's gate is its proof, and the
@@ -102,7 +102,9 @@ checks (no I/O in `recon-domain`, `recon-import` or `recon-match`; an HTTP
 client only in `recon-model`; the workspace app imports no database
 client); `svelte-check` and a workspace build once the app exists; the
 drills of every finished milestone. CI's fuzz job runs `scripts/fuzz.sh` (every
-`cargo-fuzz` target, 60 s). Full load runs are ≥1,000,000 lines
+`cargo-fuzz` target, 60 s); its production job runs `scripts/production-smoke.sh` (the
+path `docs/OPERATOR_GUIDE.md` describes). Refusal reports, `recon --help` and
+`examples/` are interface and are tested like it (D-068). Full load runs are ≥1,000,000 lines
 per the workspace standard; results are committed under `perf/results/`
 with machine + commit.
 

@@ -1,0 +1,41 @@
+{
+  "name": "indian-bank-draft",
+  "kind": "statement_csv",
+  "definition": {
+    "encoding": "utf8",
+    "delimiter": ",",
+    "header": [
+      "Date",
+      "Narration",
+      "Chq./Ref.No.",
+      "Value Dt",
+      "Withdrawal Amt.",
+      "Deposit Amt.",
+      "Closing Balance"
+    ],
+    "columns": {
+      "booking_date": "Date",
+      "value_date": "Value Dt",
+      "narration": "Narration",
+      "reference": "Chq./Ref.No.",
+      "balance_after": "Closing Balance",
+      "amount": {
+        "split": {
+          "money_out": "Withdrawal Amt.",
+          "money_in": "Deposit Amt."
+        }
+      }
+    },
+    "date_format": {
+      "separator": "/",
+      "padded": true
+    },
+    "number_format": {
+      "decimal": ".",
+      "grouping": ",",
+      "group_style": "indian",
+      "negatives": []
+    },
+    "row_order": "newest_first"
+  }
+}

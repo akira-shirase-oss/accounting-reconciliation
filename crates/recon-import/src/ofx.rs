@@ -752,10 +752,7 @@ impl OfxParser {
                     on_line(line);
                 }
             }
-            Err(code) => self.tally.refuse(RowRefusal {
-                row: self.ordinal,
-                code,
-            }),
+            Err(code) => self.tally.refuse(RowRefusal::new(self.ordinal, code)),
         }
     }
 

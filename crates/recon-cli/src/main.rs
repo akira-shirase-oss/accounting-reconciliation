@@ -1,20 +1,5 @@
-//! `recon`: operator and verification commands.
-//!
-//! ```text
-//! recon db setup [--database NAME]   roles and database (RECON_ADMIN_DATABASE_URL,
-//!                                    RECON_APP_PASSWORD)
-//! recon db migrate [--database NAME] migrations, as the administrator acting as the
-//!                                    NOLOGIN owner (RECON_ADMIN_DATABASE_URL)
-//! recon audit anchor FIRM --out FILE verify every chain (and against FILE), then append
-//!                                    each verified head, signed and dated, to FILE
-//!                                    (RECON_DATABASE_URL, RECON_ANCHOR_KEY_FILE)
-//! recon audit verify FIRM [--anchors FILE] [--allow-empty]
-//!                                    verify every client's chain, and against the anchors;
-//!                                    a firm with no chains fails unless --allow-empty
-//! recon audit replay FIRM            replay the log against the stored state
-//! recon gen statement --seed N --lines N [--currency USD] [--start YYYY-MM-DD] [--days N]
-//!                                    a seeded statement on stdout
-//! ```
+//! `recon`: the command line for accountants and operators. `recon help` lists every
+//! command and `recon help COMMAND` explains one, with examples; the texts are in [`HELP`].
 
 use std::io::Write as _;
 use std::process::ExitCode;
@@ -52,19 +37,231 @@ async fn main() -> ExitCode {
     }
 }
 
+/// Every command's help, by its two words (`""` for the overview).
+const HELP: &[(&str, &str)] = &[
+    (
+        "",
+        r"recon: the command line for Accounting Reconciliation.
+
+Before you upload (no server or database needed):
+  recon import check FILE --profile PROFILE [--currency CODE] [--json]
+                     Read a statement or document file exactly as the server would and
+                     say what it would import, or, for every refused line, where it is,
+                     which column, what is wrong and how to fix it.
+  recon profile check PROFILE.json [--json]
+                     Check a profile you wrote: every problem at once, or how it reads.
+
+Operating the server:
+  recon db setup [--database NAME]      create the roles and the database
+  recon db migrate [--database NAME]    apply the migrations
+  recon audit verify FIRM [--anchors FILE] [--allow-empty]
+                                        verify every client's decision chain
+  recon audit anchor FIRM --out FILE    sign and append every verified chain head
+  recon audit replay FIRM               replay the decision log against the stored state
+  recon gen statement --seed N --lines N [--currency CODE] [--start YYYY-MM-DD] [--days N]
+                                        a seeded test statement on stdout
+
+Run `recon help COMMAND` for details and examples, for example `recon help import check`.
+The examples/ folder of the repository has profiles and files to try them on.
+
+Exit status: 0 success; 1 the command could not run (usage, a missing file, the
+database); 3 a check found problems (a refused file, an unusable profile, a broken
+chain); 4 nothing to verify.
+",
+    ),
+    (
+        "import check",
+        r#"recon import check FILE --profile PROFILE [--currency CODE] [--json]
+
+Reads FILE exactly as the server would on upload, with the same profile and the same
+rules, without uploading it. Nothing is stored and nothing is sent anywhere.
+
+  --profile PROFILE  a built-in profile (r0-generic-csv, ofx, r1-generic-documents) or a
+                     profile file: the JSON you POST to /v1/firms/{firm}/profiles,
+                     {"name": ..., "kind": "statement_csv" | "documents_csv",
+                     "definition": {...}}
+  --currency CODE    the account's currency, for a statement (INR, USD, EUR, GBP, AED,
+                     SGD, AUD, CAD, JPY, KWD); documents carry their own
+  --json             print the result as JSON (the same report the server returns)
+
+If the file would import, it prints the rows, the dates and the money in and out per
+currency, exactly. If not, it prints every refused line (the first 1,000): the line, the
+profile's column, what is wrong and how to fix it. A file is imported whole or not at
+all, so fix every line and check again. Rows already imported (duplicates) and changes to
+lines already imported (revisions) can only be found by the server, on upload.
+
+Examples:
+  recon import check examples/statements/hdfc-march-2026.csv       --profile examples/profiles/hdfc-savings.json --currency INR
+  recon import check examples/statements/hdfc-march-2026-with-errors.csv       --profile examples/profiles/hdfc-savings.json --currency INR
+  recon import check examples/documents/sales-register-march-2026.csv       --profile examples/profiles/sales-register.json
+
+Exit status: 0 the file would import; 3 it would be refused; 1 the check could not run.
+"#,
+    ),
+    (
+        "profile check",
+        r"recon profile check PROFILE.json [--json]
+
+Checks a profile file (the JSON you POST to /v1/firms/{firm}/profiles) and lists every
+problem at once, or shows how it will read files: the header it expects, its dates and
+amounts in words, and the SHA-256 recorded on every import read with it.
+
+Example:
+  recon profile check examples/profiles/hdfc-savings.json
+
+Exit status: 0 the profile can be used; 3 it cannot; 1 the file could not be read.
+",
+    ),
+    (
+        "db setup",
+        r"recon db setup [--database NAME]
+
+Creates the roles (recon_owner, which cannot log in; recon_runtime; recon_app, the
+server's login) and the database (default recon), owned by recon_owner with PUBLIC locked
+out. Run once per database as the cluster administrator.
+
+Environment: RECON_ADMIN_DATABASE_URL (the administrator), RECON_APP_PASSWORD (the
+password the server logs in with; sent only as a SCRAM verifier).
+",
+    ),
+    (
+        "db migrate",
+        r"recon db migrate [--database NAME]
+
+Applies the migrations as the administrator acting as recon_owner. Safe to run again;
+run it before starting a new release of the server (which refuses to start on an older
+or newer schema).
+
+Environment: RECON_ADMIN_DATABASE_URL.
+",
+    ),
+    (
+        "audit verify",
+        r"recon audit verify FIRM [--anchors FILE] [--allow-empty]
+
+Verifies every client's decision chain of FIRM record by record, and, with --anchors,
+against the heads signed into FILE by `recon audit anchor`: it names the first broken link.
+A firm with no chains fails unless --allow-empty.
+
+Environment: RECON_DATABASE_URL; with --anchors, RECON_ANCHOR_KEY_FILE.
+Exit status: 0 every chain verifies; 3 one is broken; 4 nothing to verify.
+",
+    ),
+    (
+        "audit anchor",
+        r"recon audit anchor FIRM --out FILE
+
+Verifies every chain of FIRM (inside the database and against FILE), then appends each
+verified head, signed with HMAC-SHA256 and dated by the database clock, to FILE. Keep FILE
+where neither the server nor the database owner can write (another host, write-once
+storage), and anchor after every period close and before every backup.
+
+Environment: RECON_DATABASE_URL, RECON_ANCHOR_KEY_FILE (at least 32 bytes, mode 0600).
+Exit status: 0 anchored; 3 a chain did not verify and nothing was written.
+",
+    ),
+    (
+        "audit replay",
+        r"recon audit replay FIRM
+
+Replays FIRM's decision log against its stored state: imports, lines, documents, held
+revisions. Run after a restore or an incident.
+
+Environment: RECON_DATABASE_URL. Exit status: 0 equal; 3 a mismatch, named.
+",
+    ),
+    (
+        "gen statement",
+        r"recon gen statement --seed N --lines N [--currency CODE] [--start YYYY-MM-DD] [--days N]
+
+Writes a seeded statement in the r0-generic-csv layout to stdout (gen-v2): the same seed
+always writes the same bytes. For tests, drills and load runs; never real data.
+",
+    ),
+];
+
+fn help(topic: &str) -> ExitCode {
+    if let Some((_, text)) = HELP.iter().find(|(t, _)| *t == topic) {
+        print!("{text}");
+        return ExitCode::SUCCESS;
+    }
+    eprintln!("no such command: {topic}\n");
+    eprint!("{}", HELP.first().map_or("", |(_, t)| *t));
+    ExitCode::FAILURE
+}
+
 async fn run(args: &[String]) -> anyhow::Result<ExitCode> {
-    let words: Vec<&str> = args.iter().map(String::as_str).take(2).collect();
+    let words: Vec<&str> = args.iter().map(String::as_str).collect();
+    let wants_help = words.iter().any(|w| matches!(*w, "--help" | "-h"));
     match words.as_slice() {
+        [] | ["help"] | ["--help" | "-h", ..] => return Ok(help("")),
+        ["help", topic @ ..] => return Ok(help(&topic.join(" "))),
+        [a, b, ..] if wants_help => return Ok(help(&format!("{a} {b}"))),
+        _ => {}
+    }
+    match words.get(..2).unwrap_or(&words) {
         ["db", "setup"] => setup(args).await,
         ["db", "migrate"] => migrate(args).await,
         ["audit", "verify"] => verify(args).await,
         ["audit", "anchor"] => anchor(args).await,
         ["audit", "replay"] => replay(args).await,
         ["gen", "statement"] => gen_statement(args),
-        _ => bail!(
-            "usage: recon db setup|db migrate|audit anchor FIRM --out FILE|audit verify FIRM [--anchors FILE]|audit replay FIRM|gen statement"
-        ),
+        ["import", "check"] => import_check(args),
+        ["profile", "check"] => profile_check(args),
+        _ => {
+            eprint!("{}", HELP.first().map_or("", |(_, t)| *t));
+            bail!("unknown command: {}", words.join(" "))
+        }
     }
+}
+
+fn print_outcome(outcome: &recon_cli::check::Outcome, json: bool) -> anyhow::Result<ExitCode> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(&outcome.json)?);
+    } else {
+        print!("{}", outcome.text);
+    }
+    Ok(if outcome.ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(3)
+    })
+}
+
+fn import_check(args: &[String]) -> anyhow::Result<ExitCode> {
+    let file = args.get(2).filter(|a| !a.starts_with("--")).context(
+        "which file? usage: recon import check FILE --profile PROFILE [--currency CODE]",
+    )?;
+    let spec = flag(args, "--profile").context(
+        "--profile is required: a built-in (r0-generic-csv, ofx, r1-generic-documents) or a profile file",
+    )?;
+    let currency = flag(args, "--currency")
+        .map(|c| {
+            Currency::from_code(&c)
+                .map_err(|_| anyhow::anyhow!("--currency {c:?} is not a supported ISO code"))
+        })
+        .transpose()?;
+    let loaded = match recon_cli::check::load_profile(&spec)? {
+        Ok(l) => l,
+        Err(problems) => {
+            println!("{spec}: this profile cannot be used:");
+            for p in problems {
+                println!("  - {p}");
+            }
+            return Ok(ExitCode::from(3));
+        }
+    };
+    let outcome = recon_cli::check::check_file(file, &loaded, currency)?;
+    print_outcome(&outcome, args.iter().any(|a| a == "--json"))
+}
+
+fn profile_check(args: &[String]) -> anyhow::Result<ExitCode> {
+    let file = args
+        .get(2)
+        .filter(|a| !a.starts_with("--"))
+        .context("which profile? usage: recon profile check PROFILE.json")?;
+    let outcome = recon_cli::check::check_profile(file)?;
+    print_outcome(&outcome, args.iter().any(|a| a == "--json"))
 }
 
 async fn setup(args: &[String]) -> anyhow::Result<ExitCode> {

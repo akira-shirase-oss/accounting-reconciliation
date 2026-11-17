@@ -235,9 +235,38 @@ async fn a_malformed_file_is_refused_whole_with_row_numbers() {
     assert_eq!(
         import["refusals"],
         json!([
-            {"row": 9_002, "code": "too_many_decimal_places"},
-            {"row": 9_003, "code": "invalid_date"},
+            {"row": 9_002, "code": "too_many_decimal_places", "field": "amount"},
+            {"row": 9_003, "code": "invalid_date", "field": "booking_date"},
         ])
+    );
+    // The report says where, which column, what is wrong and how to fix it (D-068).
+    let report = &body["error"]["report"];
+    assert_eq!(
+        report["summary"].as_str().unwrap().split(". ").next(),
+        Some("Nothing was imported: 2 of 9,002 rows have a problem")
+    );
+    let first = &report["problems"][0];
+    assert_eq!(first["location"], "line 9002");
+    assert_eq!(first["column"], "amount");
+    assert!(
+        first["problem"]
+            .as_str()
+            .unwrap()
+            .contains("decimal places")
+    );
+    assert!(
+        first["problem"]
+            .as_str()
+            .unwrap()
+            .contains("like 1234567.89")
+    );
+    assert!(first["fix"].as_str().unwrap().len() > 15);
+    assert_eq!(report["problems"][1]["column"], "booking_date");
+    assert!(
+        report["problems"][1]["problem"]
+            .as_str()
+            .unwrap()
+            .contains("YYYY-MM-DD")
     );
     let lines: i64 = sqlx::query_scalar("SELECT count(*) FROM recon.statement_lines")
         .fetch_one(&db.pool)

@@ -4,7 +4,7 @@ R0 (the spine) and R1 (imports) are built: `recon-domain`, `recon-import`,
 `recon-db`, `recon-server` and `recon-cli` exist with the behaviour described
 here for imports and revisions; matching, review, the model, reports and the
 workspace are the plan for later milestones. `DECISIONS.md` D-036 to D-059
-record what R0 decided while building, D-060 to D-067 what R1 decided.
+record what R0 decided while building, D-060 to D-069 what R1 decided.
 
 ## Sources of truth
 
@@ -192,8 +192,10 @@ docs/        END_GOAL, ARCHITECTURE, ROADMAP, DECISIONS
 fixtures/    generator seeds, labelled sets, hostile-files, injection,
              model-wrong-match, recorded model responses, import profiles
 fuzz/        cargo-fuzz targets, one per parser (its own workspace, nightly)
+examples/    profiles and files for every import command (tested by recon-cli)
+deploy/      compose.yaml (development), recon.env.example, recon-server.service, Caddyfile
 perf/        loadgen (the load driver), results (machine + commit on every run)
-scripts/     check.sh (what CI runs), stack.sh, load.sh, fuzz.sh
+scripts/     check.sh (what CI runs), stack.sh, load.sh, fuzz.sh, production-smoke.sh
 ```
 
 ## Failure cases

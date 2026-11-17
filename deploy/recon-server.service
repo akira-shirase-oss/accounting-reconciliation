@@ -1,0 +1,56 @@
+# systemd unit for the Accounting Reconciliation API server. Install:
+#   install -m 0644 deploy/recon-server.service /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now recon-server
+# See docs/OPERATOR_GUIDE.md. The server writes nothing to disk: its state is PostgreSQL,
+# its logs go to the journal.
+[Unit]
+Description=Accounting Reconciliation API server
+Documentation=https://github.com/akira-shirase-oss/accounting-reconciliation/blob/main/docs/OPERATOR_GUIDE.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=recon
+Group=recon
+EnvironmentFile=/etc/recon/recon.env
+ExecStart=/usr/local/bin/recon-server
+Restart=on-failure
+RestartSec=2s
+# 78 (EX_CONFIG): the configuration, the database role or the schema is wrong (it says
+# which in the journal). Restarting cannot fix that, so systemd does not try.
+RestartPreventExitStatus=78
+# SIGTERM: stop accepting, drain requests in flight (RECON_DRAIN_MS, 30 s), exit 0.
+KillSignal=SIGTERM
+TimeoutStopSec=45s
+
+# Hardening: no privileges, no writable filesystem, no devices, network only.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitecture=native
+SystemCallFilter=@system-service
+UMask=0077
+LimitNOFILE=8192
+# Measured peak in the load runs is under 64 MiB; this is a ceiling, not a target.
+MemoryMax=1G
+
+[Install]
+WantedBy=multi-user.target

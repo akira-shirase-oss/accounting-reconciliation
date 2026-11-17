@@ -105,6 +105,7 @@ async fn logs_carry_no_secrets_or_financial_content() {
             "DOC-DESC-NARWHAL",
             "PROFILE-COLUMN-YAK",
             "7777.77",
+            "FILE-NAME-WALRUS",
         ],
     );
     // The log is not empty of useful facts: the import's id and outcome are there.
@@ -162,13 +163,18 @@ async fn r1_paths(base: &str, firm: &str, client: &str, account: &str) {
     // Documents.
     let docs = "kind,number,issue_date,due_date,amount,currency,counterparty,description\n\
         sales_invoice,INV-KOALA-1,2026-06-01,,7777.77,USD,CPTY-LEMUR,DOC-DESC-NARWHAL\n";
-    let (s, body) = send(
-        format!("/v1/firms/{firm}/clients/{client}/document-imports"),
-        "text/csv",
-        docs.into(),
-    )
-    .await;
-    assert_eq!(s, 201, "{body}");
+    let r = http()
+        .post(format!(
+            "{base}/v1/firms/{firm}/clients/{client}/document-imports"
+        ))
+        .bearer_auth(TOKEN)
+        .header("content-type", "text/csv")
+        .header("x-file-name", "FILE-NAME-WALRUS.csv")
+        .body(docs)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 201);
     // A held revision: the earlier statement's May rows again, one amount changed.
     let header =
         "booking_date,value_date,amount,currency,narration,reference,counterparty,balance_after\n";

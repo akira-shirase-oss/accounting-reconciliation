@@ -17,6 +17,7 @@ pub mod documents;
 pub mod number;
 pub mod ofx;
 pub mod profile;
+pub mod report;
 
 pub use csv::{CsvLimits, FileRefusal};
 pub use documents::{CompiledDocuments, DocumentContext, DocumentParser, DocumentProfile};

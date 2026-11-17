@@ -214,7 +214,7 @@ pub async fn import_documents(
         .finish(&mut |d| docs.push(d))
         .expect("file-level refusal in a db test");
     let mut staging =
-        imports::begin_documents(pool, account.firm, account.client, &id, LEASE).await?;
+        imports::begin_documents(pool, account.firm, account.client, &id, None, LEASE).await?;
     if !summary.is_clean() {
         let record = imports::refuse(
             pool,

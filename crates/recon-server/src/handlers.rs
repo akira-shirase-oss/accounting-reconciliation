@@ -176,6 +176,26 @@ fn query<T>(q: Result<Query<T>, QueryRejection>) -> Result<T, ApiError> {
     })
 }
 
+/// The file's name from `X-File-Name` (optional): shown in reports, never logged (D-068).
+fn file_name(headers: &HeaderMap) -> Result<Option<String>, ApiError> {
+    let Some(value) = headers.get("x-file-name") else {
+        return Ok(None);
+    };
+    let invalid = || {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_file_name",
+            "X-File-Name is 1 to 255 characters of printable text, without a path",
+        )
+    };
+    let text = value.to_str().map_err(|_| invalid())?.trim();
+    let len = text.chars().count();
+    if !(1..=255).contains(&len) || text.chars().any(is_forbidden) || text.contains(['/', '\\']) {
+        return Err(invalid());
+    }
+    Ok(Some(text.to_owned()))
+}
+
 fn import_capacity(state: &AppState) -> Result<tokio::sync::OwnedSemaphorePermit, ApiError> {
     if !state.startup_checked() {
         return Err(ApiError::database_unavailable());
@@ -214,8 +234,18 @@ pub async fn upload_statement(
     let (profile, format, media) =
         profiles::statement(&state.pool, firm, name, params.version).await?;
     upload::precheck(&headers, media)?;
+    let name = file_name(&headers)?;
     let _permit = import_capacity(&state)?;
-    upload::import_statement(&state, firm, account, profile, format, payload).await
+    upload::import_statement(
+        &state,
+        firm,
+        account,
+        profile,
+        format,
+        name.as_deref(),
+        payload,
+    )
+    .await
 }
 
 /// `POST /v1/firms/{firm}/clients/{client}/document-imports[?profile=&version=]`: invoices,
@@ -234,11 +264,22 @@ pub async fn upload_documents(
     let name = params.profile.as_deref().unwrap_or(PROFILE_DOCUMENTS);
     let (profile, compiled) = profiles::documents(&state.pool, firm, name, params.version).await?;
     upload::precheck(&headers, upload::Media::Csv)?;
+    let name = file_name(&headers)?;
     let _permit = import_capacity(&state)?;
-    upload::import_documents(&state, firm, client, profile, compiled, payload).await
+    upload::import_documents(
+        &state,
+        firm,
+        client,
+        profile,
+        compiled,
+        name.as_deref(),
+        payload,
+    )
+    .await
 }
 
-/// `GET /v1/firms/{firm}/imports/{import}`.
+/// `GET /v1/firms/{firm}/imports/{import}`: the import, and for a refused one its report
+/// (D-068).
 pub async fn get_import(
     State(state): State<AppState>,
     Path((firm, import)): Path<(String, String)>,
@@ -246,7 +287,23 @@ pub async fn get_import(
     let firm = FirmId::from_uuid(id(&firm)?);
     let import = ImportId::from_uuid(id(&import)?);
     let record = imports::get(&state.pool, firm, import).await?;
-    Ok((StatusCode::OK, Json(json!({ "import": record }))))
+    let report = if record.status == "refused" {
+        let profile = profiles::resolve(
+            &state.pool,
+            firm,
+            &record.profile,
+            Some(record.profile_version),
+        )
+        .await
+        .map_or(recon_import::report::ProfileRef::Unknown, |r| r.report());
+        upload::report_for(&record, &profile)
+    } else {
+        None
+    };
+    Ok((
+        StatusCode::OK,
+        Json(json!({ "import": record, "report": report })),
+    ))
 }
 
 /// A page of a revision's changes.

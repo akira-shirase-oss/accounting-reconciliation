@@ -71,6 +71,30 @@ jobs:
           eval "$(scripts/stack.sh env)"
           MODE=full scripts/load.sh r0-import
 
+  production:
+    # The production path (D-069): release build, recon.env from its template, the server
+    # as the systemd unit runs it (and systemd-analyze on the unit), a first import, verify
+    # and anchor, backup and restore verified against the anchors, an upgrade, the Caddy
+    # reverse proxy with its access log checked.
+    name: production path (release, service, proxy, backup and restore)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned toolchain
+        run: |
+          channel=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$channel" --profile minimal
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Start PostgreSQL (deploy/compose.yaml)
+        run: scripts/stack.sh up
+      - name: The production path
+        run: |
+          eval "$(scripts/stack.sh env)"
+          scripts/production-smoke.sh
+
   fuzz:
     # Failure case 6 (D-066): every cargo-fuzz target, 60 s each, on the pinned nightly.
     # A crash leaves its input under fuzz/artifacts/, uploaded for a fixture.
