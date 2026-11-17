@@ -19,6 +19,10 @@ pub enum DbError {
     /// discarded it, or the token is wrong (fencing).
     #[error("the import's lease was lost")]
     LeaseLost,
+    /// Another flip holds the account: the import was discarded; upload the file again
+    /// (D-053).
+    #[error("another import into this account is being published")]
+    AccountBusy,
     /// The staging table does not hold every row this import staged (an unlogged table
     /// emptied by a crash): the flip refuses rather than publish a partial import.
     #[error("staged rows are missing; the import was not published")]

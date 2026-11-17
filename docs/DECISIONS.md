@@ -521,6 +521,17 @@ conservative side.
   Tests: `deserializing_is_range_checked_like_construction`,
   `deserialized_allocations_and_scores_are_checked`.
 
+- **D-053 — A busy account refuses a flip at once.** A flip into an account
+  another flip holds waited on the advisory lock until the session's 5 s
+  lock timeout and surfaced as `503 database_unavailable`, leaving its
+  staging import to the sweeper. The flip now takes the lock with
+  `pg_try_advisory_xact_lock`: when the account is held, the import is
+  discarded (reason `account_busy`, with its decision) and the client gets
+  `409 account_busy` with `Retry-After`. The flip's lease check uses
+  `clock_timestamp()`, like staging and renewal. Test:
+  `a_flip_into_a_busy_account_is_refused_at_once` (5.02 s before, immediate
+  now).
+
 ## Open questions (blocked on the maintainer or an outside party)
 
 Each is in the README's *Blocked on* table. None blocks R0–R6.

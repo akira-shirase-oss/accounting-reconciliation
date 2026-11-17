@@ -362,7 +362,7 @@ pub async fn renew(pool: &PgPool, import: &StagingImport, lease: Duration) -> Re
 /// Locks the staging import (fencing): `Ok(staged_rows)` while the lease is live.
 async fn lock_staging(conn: &mut PgConnection, import: &StagingImport) -> Result<i32, DbError> {
     let row = sqlx::query(
-        "SELECT staged_rows, lease_until > now() AS live
+        "SELECT staged_rows, lease_until > pg_catalog.clock_timestamp() AS live
            FROM recon.imports
           WHERE firm_id = $1 AND id = $2 AND lease_token = $3 AND status = 'staging'
             FOR UPDATE",
@@ -425,13 +425,20 @@ pub async fn flip<H: FlipHook>(
     sqlx::query("SET LOCAL enable_nestloop = off")
         .execute(&mut *tx)
         .await?;
-    // Imports into one account are serialized, so duplicate detection never races.
-    sqlx::query(
-        "SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended($1::text, 7262))",
+    // Imports into one account are serialized, so duplicate detection never races. A flip
+    // that finds the account held is refused at once and discarded (D-053), rather than
+    // waiting out the lock timeout behind a large flip.
+    let acquired: bool = sqlx::query_scalar(
+        "SELECT pg_catalog.pg_try_advisory_xact_lock(pg_catalog.hashtextextended($1::text, 7262))",
     )
     .bind(import.account.as_uuid())
-    .execute(&mut *tx)
+    .fetch_one(&mut *tx)
     .await?;
+    if !acquired {
+        drop(tx);
+        discard_for(pool, import, DiscardReason::AccountBusy, actor).await?;
+        return Err(DbError::AccountBusy);
+    }
     let staged = lock_staging(&mut tx, &import).await?;
     let present: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM recon.import_staging WHERE firm_id = $1 AND import_id = $2",
@@ -732,6 +739,17 @@ pub async fn discard(
     import: StagingImport,
     actor: Actor<'_>,
 ) -> Result<bool, DbError> {
+    discard_for(pool, import, DiscardReason::UploadFailed, actor).await
+}
+
+/// Discards a staging import for `reason`, with its decision; `false` when the lease was
+/// already lost.
+async fn discard_for(
+    pool: &PgPool,
+    import: StagingImport,
+    reason: DiscardReason,
+    actor: Actor<'_>,
+) -> Result<bool, DbError> {
     let mut tx = pool.begin().await?;
     match lock_staging(&mut tx, &import).await {
         Ok(_) => {}
@@ -751,17 +769,18 @@ pub async fn discard(
             to_state: ImportStatus::Discarded.code(),
             actor_kind: actor.kind,
             actor_ref: actor.reference,
-            reason_code: DiscardReason::UploadFailed.code(),
+            reason_code: reason.code(),
             evidence: &evidence,
         },
     )
     .await?;
     sqlx::query(
-        "UPDATE recon.imports SET status = 'discarded', discard_reason = 'upload_failed'
+        "UPDATE recon.imports SET status = 'discarded', discard_reason = $3
           WHERE firm_id = $1 AND id = $2",
     )
     .bind(import.firm.as_uuid())
     .bind(import.id.as_uuid())
+    .bind(reason.code())
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;

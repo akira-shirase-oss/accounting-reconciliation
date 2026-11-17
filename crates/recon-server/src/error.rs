@@ -109,6 +109,12 @@ impl ApiError {
                 )
                 .retry_after(1)
             }
+            DbError::AccountBusy => Self::new(
+                StatusCode::CONFLICT,
+                "account_busy",
+                "another statement is being published into this account; nothing was imported, upload again shortly",
+            )
+            .retry_after(2),
             DbError::Constraint(name) => {
                 tracing::warn!(constraint = %name, "constraint refused a write");
                 Self::new(

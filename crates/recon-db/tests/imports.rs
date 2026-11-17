@@ -331,3 +331,59 @@ async fn a_large_flip_is_linear_not_quadratic() {
     assert_eq!(record.lines_created, Some(30_000));
     db.cleanup().await;
 }
+
+/// L-1 regression: a flip into an account another flip holds waited out the session lock
+/// timeout and failed as an unavailable database. It is now refused at once, by name, and
+/// the import is discarded rather than left for the sweeper.
+#[tokio::test]
+async fn a_flip_into_a_busy_account_is_refused_at_once() {
+    let db = TestDb::new().await;
+    let account = tenant(&db.pool).await;
+    let bytes = format!("{HEADER}{}", rows(0, 50));
+    let mut parser = StatementParser::new(AccountContext {
+        account: account.id,
+        currency: account.currency,
+    });
+    let mut lines = vec![];
+    parser
+        .push(bytes.as_bytes(), &mut |l| lines.push(l))
+        .unwrap();
+    let summary = parser.finish(&mut |l| lines.push(l)).unwrap();
+    let mut staging = imports::begin(&db.pool, &account, LEASE).await.unwrap();
+    imports::stage(&db.pool, &mut staging, &lines, LEASE)
+        .await
+        .unwrap();
+    // Another flip holds the account.
+    let mut holder = db.pool.begin().await.unwrap();
+    sqlx::query(
+        "SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended($1::text, 7262))",
+    )
+    .bind(account.id.as_uuid())
+    .execute(&mut *holder)
+    .await
+    .unwrap();
+    let started = std::time::Instant::now();
+    let flipped = imports::flip(&db.pool, staging, &summary, OPERATOR, &NoHook, FLIP_TIMEOUT).await;
+    let elapsed = started.elapsed();
+    holder.rollback().await.unwrap();
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "the flip waited {elapsed:?} for a busy account"
+    );
+    assert!(matches!(flipped, Err(DbError::AccountBusy)), "{flipped:?}");
+    let all = imports::for_account(&db.pool, account.firm, account.id)
+        .await
+        .unwrap();
+    assert_eq!(all[0].status, "discarded");
+    assert_eq!(all[0].discard_reason.as_deref(), Some("account_busy"));
+    assert_eq!(
+        count(
+            &db.pool,
+            "SELECT count(*) FROM recon.import_staging WHERE firm_id = $1",
+            account.firm
+        )
+        .await,
+        0
+    );
+    db.cleanup().await;
+}

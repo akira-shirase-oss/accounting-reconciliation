@@ -84,6 +84,8 @@ pub enum DiscardReason {
     LeaseExpired,
     /// The upload failed before the file was complete.
     UploadFailed,
+    /// Another flip held the account; the file may be uploaded again (D-053).
+    AccountBusy,
 }
 
 impl DiscardReason {
@@ -93,6 +95,7 @@ impl DiscardReason {
             Self::DuplicateFile => "duplicate_file",
             Self::LeaseExpired => "lease_expired",
             Self::UploadFailed => "upload_failed",
+            Self::AccountBusy => "account_busy",
         }
     }
 }
