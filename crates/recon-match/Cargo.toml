@@ -1,0 +1,19 @@
+[package]
+name = "recon-match"
+description = "The deterministic matching engine: candidates, tiers T1-T4, the bounded combination search, residuals, scores and typed exceptions. Pure: no I/O."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+recon-domain.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

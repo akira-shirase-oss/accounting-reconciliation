@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The architecture rules of AGENTS.md (non-negotiable 10, D-024), checked on every commit:
 #
-#  1. The pure crates (recon-domain, recon-import; recon-match from R2) have no I/O, clock,
+#  1. The pure crates (recon-domain, recon-import, recon-match) have no I/O, clock,
 #     randomness or async runtime anywhere in their dependency tree (normal and build
 #     edges, transitively).
 #  2. Their sources never name the standard library's I/O, process, environment, thread
@@ -13,8 +13,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-pure="${ARCH_PURE:-recon-domain recon-import}"
-production="${ARCH_PRODUCTION:-recon-domain recon-import recon-db recon-server recon-cli}"
+pure="${ARCH_PURE:-recon-domain recon-import recon-match}"
+production="${ARCH_PRODUCTION:-recon-domain recon-import recon-match recon-db recon-server recon-cli}"
 banned="${ARCH_BANNED:-tokio mio socket2 sqlx sqlx-core sqlx-postgres axum axum-core hyper hyper-util tower tower-http reqwest getrandom rand rand_core}"
 src_patterns="${ARCH_SRC_PATTERNS:-std::fs std::net std::process std::env std::thread std::io::stdin std::io::stdout SystemTime Instant::now tokio::}"
 http_clients="${ARCH_HTTP_CLIENTS:-reqwest ureq isahc curl attohttpc surf awc}"

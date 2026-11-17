@@ -777,6 +777,33 @@ conservative side.
   checked, and `systemd-analyze verify` on the unit. Cost: one more CI job and one more
   pinned image (Caddy) to keep current.
 
+## Built in R2 (2026-11-17)
+
+- **D-070 — The matching engine, `match-v1`.** `recon-match` is pure (no I/O, CI's
+  architecture check covers it) and decides each line on its own, against the documents'
+  open amounts: candidates are open documents of the line's currency and direction inside
+  the D-011 window (issue date − 7 days to due date + 90; book entries ± 5 days), nearest
+  by date, then by id. T1: a reference token of the line (its reference, and each word of
+  its narration — and each part of a word split at `/` — with at least three characters
+  and a digit) equals the number of exactly one candidate with exactly the line's amount;
+  it commits only when the firm allows. T2: exactly one candidate with the amount, whose
+  counterparty equals the line's or appears in its narration (a proposal; without that
+  agreement the line is `narration_needed`). T3: the one exact combination of 2 to 5 of the
+  40 nearest candidates of that counterparty, searched in ascending amounts with a budget
+  of 100,000 nodes. T4: the one combination that exceeds the line by no more than a
+  residual tolerance (rounding first, then bank fee, then tax withheld; every tolerance
+  zero until the firm sets it); always four-eyes. Anything else is an exception naming its
+  reason and up to 10 candidates: `multiple_candidates`, `amount_mismatch`,
+  `narration_needed`, `search_budget_exhausted`, `cross_currency`, `no_candidate`. Then,
+  over the whole run, a document more than one line would take makes every such line
+  `multiple_candidates` — so the outcome cannot depend on the order lines or documents
+  arrive in, and a run's digest (SHA-256 over every outcome in line order) is the same for
+  the same inputs; property tests check both, and that every match balances, no document
+  is allocated twice or beyond its open amount, and only T1 commits. The first workspace
+  screens (the exception queue and review) arrive with R3's review API, as the roadmap
+  orders them; R2 has no UI. Cost: lines that compete for one document always reach a
+  person, even when one of them is right.
+
 ## Open questions (blocked on the maintainer or an outside party)
 
 Each is in the README's *Blocked on* table. None blocks R0–R6.

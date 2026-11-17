@@ -13,6 +13,7 @@ publish = false
 [workspace.dependencies]
 recon-domain = { path = "crates/recon-domain" }
 recon-import = { path = "crates/recon-import" }
+recon-match = { path = "crates/recon-match" }
 recon-db = { path = "crates/recon-db" }
 recon-cli = { path = "crates/recon-cli" }
 
@@ -84,4 +85,6 @@ opt-level = 3
 [profile.dev.package.recon-import]
 opt-level = 2
 [profile.dev.package.recon-domain]
+opt-level = 2
+[profile.dev.package.recon-match]
 opt-level = 2

@@ -1233,6 +1233,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "recon-match"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "recon-domain",
+ "sha2 0.11.1",
+ "uuid",
+]
+
+[[package]]
 name = "recon-server"
 version = "0.1.0"
 dependencies = [
