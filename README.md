@@ -1,10 +1,10 @@
 # Accounting Reconciliation
 
-> **Status — in development.** R0, the spine, is built and back in
-> progress after an independent review: CI, the pure domain, the import
-> path through staging with its database guards, the `kill-mid-import` and
-> `db-down` drills and a 1,000,000-line `r0-import` load run exist
-> (`perf/results/`); the review's fixes are landing (`docs/ROADMAP.md`). Nothing here
+> **Status — in development.** R0, the spine, is done, including an
+> independent review's fixes: CI, the pure domain, the import path through
+> staging with its database guards, the `kill-mid-import` and `db-down`
+> drills, and a 1,000,000-line `r0-import` load run (`perf/results/`;
+> `docs/ROADMAP.md` names the tests, the evidence and what is owed). Nothing here
 > matches documents yet (R2). The ship gate needs one or two real
 > accountants, who have not been found yet (see *Blocked on*).
 
@@ -57,7 +57,7 @@ in `docs/DECISIONS.md`.
   R3 review, rules and periods → R4 the model for ambiguous cases → R5
   reports and workspace → R6 evidence battery → R7 pilot and ship gate →
   R8 India → R9 PDF
-- `docs/DECISIONS.md` — D-001 to D-045 and the questions still open
+- `docs/DECISIONS.md` — D-001 to D-057 and the questions still open
 
 ## Running it (R0)
 
