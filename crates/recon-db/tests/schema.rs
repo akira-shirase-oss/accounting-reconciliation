@@ -775,3 +775,59 @@ async fn concurrent_decisions_keep_every_chain_whole() {
     );
     db.cleanup().await;
 }
+
+/// M-1 regression: verifying a chain while decisions are being written must never report a
+/// break. The walk and the head read used separate snapshots, so a decision committed
+/// between the last page and the head read looked like a removed tail.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn verifying_a_live_chain_never_raises_a_false_alarm() {
+    let db = TestDb::new().await;
+    let account = tenant(&db.pool).await;
+    decide(&db, account.firm, account.client, 20).await;
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = {
+        let (pool, stop, firm, client) =
+            (db.pool.clone(), stop.clone(), account.firm, account.client);
+        tokio::spawn(async move {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let mut tx = pool.begin().await.unwrap();
+                decisions::insert(
+                    &mut tx,
+                    firm,
+                    &NewDecision {
+                        client,
+                        subject_kind: SubjectKind::Line,
+                        subject_id: Uuid::now_v7(),
+                        from_state: None,
+                        to_state: "proposed",
+                        actor_kind: ActorKind::Engine,
+                        actor_ref: "engine",
+                        reason_code: "t2_exact_amount",
+                        evidence: b"{}",
+                    },
+                )
+                .await
+                .unwrap();
+                tx.commit().await.unwrap();
+            }
+        })
+    };
+    let mut false_alarms = vec![];
+    for _ in 0..60 {
+        if let Err(broken) =
+            decisions::verify_chain_paged(&db.pool, account.firm, account.client, 3)
+                .await
+                .unwrap()
+        {
+            false_alarms.push(broken);
+        }
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    writer.await.unwrap();
+    assert_eq!(
+        false_alarms,
+        vec![],
+        "an intact chain verified as broken while it grew"
+    );
+    db.cleanup().await;
+}

@@ -457,6 +457,14 @@ conservative side.
   (a trickled header, silent and idle keep-alive sockets, a stalled body,
   the connection cap, shedding). Cost: one more piece of serving code to own.
 
+- **D-048 — `audit verify` reads one snapshot.** The walk and the head read
+  ran as separate statements, so a decision committed between them looked
+  like a removed tail: 27 false `HeadMismatch` alarms in 60 verifications of
+  an intact chain under a live writer. Verification now runs in one
+  `REPEATABLE READ, READ ONLY` transaction and checks the chain as of its
+  snapshot. Test: `verifying_a_live_chain_never_raises_a_false_alarm`. Cost:
+  a long verification holds back vacuum on the log for its duration.
+
 ## Open questions (blocked on the maintainer or an outside party)
 
 Each is in the README's *Blocked on* table. None blocks R0–R6.

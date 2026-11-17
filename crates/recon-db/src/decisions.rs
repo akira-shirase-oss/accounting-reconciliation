@@ -117,6 +117,17 @@ pub async fn page(
     after_seq: i64,
     limit: i64,
 ) -> Result<Vec<DecisionRecord>, DbError> {
+    let mut conn = pool.acquire().await?;
+    page_in(&mut conn, firm, client, after_seq, limit).await
+}
+
+async fn page_in(
+    conn: &mut PgConnection,
+    firm: FirmId,
+    client: ClientId,
+    after_seq: i64,
+    limit: i64,
+) -> Result<Vec<DecisionRecord>, DbError> {
     let sql = format!(
         "SELECT {COLUMNS} FROM recon.decision_log
           WHERE firm_id = $1 AND client_id = $2 AND seq > $3
@@ -127,7 +138,7 @@ pub async fn page(
         .bind(client.as_uuid())
         .bind(after_seq)
         .bind(limit)
-        .fetch_all(pool)
+        .fetch_all(&mut *conn)
         .await?;
     rows.iter().map(record).collect()
 }
@@ -154,16 +165,32 @@ pub async fn for_subject(
 }
 
 /// Walks a client's whole chain in pages of 5,000 (constant memory), then checks the stored
-/// head is its last record. `Ok(Err(..))` names the first broken link.
+/// head is its last record, all in one `REPEATABLE READ` snapshot, so decisions committed
+/// while it runs are simply not part of what it verifies. `Ok(Err(..))` names the first
+/// broken link.
 pub async fn verify_chain(
     pool: &PgPool,
     firm: FirmId,
     client: ClientId,
 ) -> Result<Result<ChainHead, ChainBreak>, DbError> {
+    verify_chain_paged(pool, firm, client, 5_000).await
+}
+
+/// [`verify_chain`] with a page size (tests use small pages to widen race windows).
+pub async fn verify_chain_paged(
+    pool: &PgPool,
+    firm: FirmId,
+    client: ClientId,
+    page_size: i64,
+) -> Result<Result<ChainHead, ChainBreak>, DbError> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut *tx)
+        .await?;
     let mut verifier = ChainVerifier::new(firm, client);
     let mut after = 0;
     loop {
-        let records = page(pool, firm, client, after, 5_000).await?;
+        let records = page_in(&mut tx, firm, client, after, page_size).await?;
         let Some(last) = records.last() else { break };
         after = last.seq;
         for r in &records {
@@ -178,9 +205,10 @@ pub async fn verify_chain(
     )
     .bind(firm.as_uuid())
     .bind(client.as_uuid())
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?
     .ok_or(DbError::NotFound)?;
+    tx.commit().await?;
     let stored_seq: i64 = stored.try_get("seq")?;
     if stored_seq != head.seq || hash32(&stored, "head_hash")? != head.hash {
         return Ok(Err(ChainBreak {
