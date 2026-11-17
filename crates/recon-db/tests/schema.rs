@@ -907,3 +907,106 @@ async fn a_chain_rewritten_by_its_owner_is_caught() {
     );
     db.cleanup().await;
 }
+
+/// L-3 (a): duplicates were insertable for a final import; only lines were guarded.
+#[tokio::test]
+async fn duplicates_cannot_be_added_to_a_final_import() {
+    let db = TestDb::new().await;
+    let account = tenant(&db.pool).await;
+    let done = import(&db.pool, &account, &rows(0, 3))
+        .await
+        .unwrap()
+        .complete();
+    let line: Uuid = sqlx::query_scalar("SELECT id FROM recon.statement_lines LIMIT 1")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    let late = sqlx::query("INSERT INTO recon.import_duplicates (firm_id, import_id, row_no, existing_line_id) VALUES ($1, $2, 999, $3)")
+        .bind(account.firm.as_uuid())
+        .bind(done.id)
+        .bind(line)
+        .execute(&db.pool)
+        .await;
+    assert_eq!(sqlstate(late), "RCI04");
+    db.cleanup().await;
+}
+
+/// L-3 (b): an import could become complete without the decision D-038 requires.
+#[tokio::test]
+async fn an_import_cannot_complete_without_its_decision() {
+    let db = TestDb::new().await;
+    let account = tenant(&db.pool).await;
+    let staging = imports::begin(&db.pool, &account, common::LEASE)
+        .await
+        .unwrap();
+    let mut tx = db.pool.begin().await.unwrap();
+    sqlx::query(
+        "INSERT INTO recon.statement_lines (firm_id, client_id, account_id, import_id, currency, row_no,
+             booking_date, amount_minor, narration_raw, narration_norm, tuple_hash, occurrence, fingerprint)
+         VALUES ($1, $2, $3, $4, 'USD', 2, '2026-03-01', 100, 'x', 'X', $5, 0, $5)",
+    )
+    .bind(account.firm.as_uuid())
+    .bind(account.client.as_uuid())
+    .bind(account.id.as_uuid())
+    .bind(staging.id.as_uuid())
+    .bind(vec![3_u8; 32])
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE recon.imports SET status = 'complete', file_hash = $3, file_bytes = 1, rows_read = 1,
+                lines_created = 1, duplicates = 0, rows_refused = 0
+          WHERE firm_id = $1 AND id = $2",
+    )
+    .bind(account.firm.as_uuid())
+    .bind(staging.id.as_uuid())
+    .bind(vec![4_u8; 32])
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    let commit = tx.commit().await;
+    let code = commit.err().and_then(|e| {
+        e.as_database_error()
+            .and_then(|d| d.code().map(std::borrow::Cow::into_owned))
+    });
+    assert_eq!(
+        code.as_deref(),
+        Some("RCI05"),
+        "an import completed without its decision"
+    );
+    db.cleanup().await;
+}
+
+/// L-3 (c): a decision naming another firm's import was examined by neither firm's replay.
+#[tokio::test]
+async fn replay_flags_a_decision_about_an_import_that_is_not_its_clients() {
+    let db = TestDb::new().await;
+    let a = tenant(&db.pool).await;
+    let b = tenant(&db.pool).await;
+    let foreign = import(&db.pool, &a, &rows(0, 2)).await.unwrap().complete();
+    let mut tx = db.pool.begin().await.unwrap();
+    decisions::insert(
+        &mut tx,
+        b.firm,
+        &NewDecision {
+            client: b.client,
+            subject_kind: SubjectKind::Import,
+            subject_id: foreign.id,
+            from_state: Some("staging"),
+            to_state: "complete",
+            actor_kind: ActorKind::Operator,
+            actor_ref: "operator",
+            reason_code: "import_completed",
+            evidence: b"{}",
+        },
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    let replay = recon_db::replay::check(&db.pool, b.firm).await.unwrap();
+    assert!(
+        replay.is_err(),
+        "a decision about another firm's import passed replay: {replay:?}"
+    );
+    db.cleanup().await;
+}

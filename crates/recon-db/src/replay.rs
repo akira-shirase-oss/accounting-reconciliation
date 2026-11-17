@@ -2,7 +2,7 @@
 //! stored current state. Run after every drill and by `recon audit replay`.
 //!
 //! For one firm it checks that every client's chain verifies to its stored head; that every
-//! import's status is the state its decisions lead to (no decision: still `staging`) and
+//! decision about an import names an import of its own client; that every import's status is the state its decisions lead to (no decision: still `staging`) and
 //! that it has at most one; that every complete import's lines and duplicates are exactly
 //! the counts and the fingerprint digest its completion decision recorded; and that every
 //! line belongs to a complete import and is in the state its own decisions lead to
@@ -78,6 +78,23 @@ async fn check_chains(pool: &PgPool, firm: FirmId, report: &mut ReplayReport) ->
 }
 
 async fn check_imports(pool: &PgPool, firm: FirmId, report: &mut ReplayReport) -> Checked {
+    // A decision about an import that is not an import of its own client (another firm's,
+    // another client's, or none) would otherwise be examined by no one (D-056).
+    let strays: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM recon.decision_log d
+          WHERE d.firm_id = $1 AND d.subject_kind = 'import'
+            AND NOT EXISTS (SELECT 1 FROM recon.imports i
+                             WHERE i.firm_id = d.firm_id AND i.id = d.subject_id
+                               AND i.client_id = d.client_id)",
+    )
+    .bind(firm.as_uuid())
+    .fetch_one(pool)
+    .await?;
+    if strays != 0 {
+        return mismatch(format!(
+            "{strays} decisions name an import that is not their client's"
+        ));
+    }
     let imports = sqlx::query(
         "SELECT i.id, i.status, i.lines_created, i.duplicates,
                 (SELECT count(*) FROM recon.decision_log d

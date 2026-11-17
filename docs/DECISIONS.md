@@ -550,6 +550,18 @@ conservative side.
   `the_server_always_makes_its_own_request_id`. Cost: a caller cannot
   correlate by its own id; it reads the server's from the response.
 
+- **D-056 — Imports reach a final state only with their decision.** Three
+  gaps the invariants forbid but the schema allowed: duplicates could be
+  recorded against a final import (only lines were guarded); an import could
+  become complete without the decision D-038 requires; and a decision naming
+  another firm's import was examined by neither firm's replay. Migration 4
+  adds a guard on duplicates (`RCI04`) and a deferred check that an import's
+  final status has its decision in the same transaction (`RCI05`); replay
+  flags any import decision whose subject is not an import of its own
+  client. Tests: `duplicates_cannot_be_added_to_a_final_import`,
+  `an_import_cannot_complete_without_its_decision`,
+  `replay_flags_a_decision_about_an_import_that_is_not_its_clients`.
+
 ## Open questions (blocked on the maintainer or an outside party)
 
 Each is in the README's *Blocked on* table. None blocks R0–R6.

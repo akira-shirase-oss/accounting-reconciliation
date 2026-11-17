@@ -70,7 +70,7 @@ impl DbError {
 }
 
 /// The schema's custom SQLSTATEs and their names.
-const GUARDS: [(&str, &str); 10] = [
+const GUARDS: [(&str, &str); 12] = [
     ("RCA01", "decision_log_append_only"),
     ("RCA02", "no_decision_chain"),
     ("RCA03", "decision_already_recorded"),
@@ -78,6 +78,8 @@ const GUARDS: [(&str, &str); 10] = [
     ("RCI01", "import_final"),
     ("RCI02", "import_counts_mismatch"),
     ("RCI03", "import_identity_immutable"),
+    ("RCI04", "duplicates_need_staging_import"),
+    ("RCI05", "import_needs_its_decision"),
     ("RCL01", "lines_need_staging_import"),
     ("RCL02", "lines_need_complete_import"),
     ("RCL03", "lines_immutable"),
