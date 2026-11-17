@@ -488,6 +488,19 @@ conservative side.
   after each period close and keep the key and the file off the database
   host.
 
+- **D-050 — Staging is bounded by bytes, per batch and in total.** Batches
+  were capped at 5,000 rows only, so 5,000 wide rows (up to 8 KiB per field,
+  held raw and normalized) could sit in memory per upload, times the import
+  concurrency. A batch now flushes at 5,000 rows or 4 MiB of row text
+  (`NewLine::heap_bytes`), whichever comes first, and every upload reserves
+  its buffered bytes from one staging budget (`RECON_STAGING_BUDGET_MIB`,
+  default 64, at least 8) before reading on: with the budget spent, an upload
+  stops reading its body until another stores a batch, bounded by the parse
+  deadline. Tests: `wide_rows_are_staged_in_byte_bounded_batches` (fails on
+  the row-only cap), `the_staging_budget_is_shared_and_returned`. Owed: an
+  RSS measurement of a 50 MiB wide-row file in the load scenario (R1's
+  failure case 6). Cost: more, smaller batches for wide files.
+
 ## Open questions (blocked on the maintainer or an outside party)
 
 Each is in the README's *Blocked on* table. None blocks R0–R6.

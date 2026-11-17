@@ -60,6 +60,8 @@ pub struct Config {
     pub max_connections: usize,
     /// Most requests in flight; more are shed with `503 overloaded` (D-047).
     pub max_in_flight: usize,
+    /// Bytes of parsed rows all uploads together may hold before staging (D-050).
+    pub staging_budget_bytes: usize,
 }
 
 impl fmt::Debug for Config {
@@ -80,6 +82,7 @@ impl fmt::Debug for Config {
             .field("header_read_timeout", &self.header_read_timeout)
             .field("max_connections", &self.max_connections)
             .field("max_in_flight", &self.max_in_flight)
+            .field("staging_budget_bytes", &self.staging_budget_bytes)
             .finish()
     }
 }
@@ -146,6 +149,11 @@ impl Config {
         let max_connections = count("RECON_DB_MAX_CONNECTIONS", 32, 256, &mut problems);
         let max_open_connections = count("RECON_MAX_CONNECTIONS", 512, 65_536, &mut problems);
         let max_in_flight = count("RECON_MAX_IN_FLIGHT", 256, 4_096, &mut problems);
+        // At least two batches' worth, so one upload can always make progress.
+        let staging_budget_mib = count("RECON_STAGING_BUDGET_MIB", 64, 4_096, &mut problems);
+        if staging_budget_mib < 8 {
+            problems.push("RECON_STAGING_BUDGET_MIB must be at least 8".into());
+        }
         if get("RECON_FAULT").is_some() && !cfg!(feature = "fault-injection") {
             problems.push("RECON_FAULT is set but this build has no fault injection".into());
         }
@@ -173,6 +181,9 @@ impl Config {
             header_read_timeout,
             max_connections: usize::try_from(max_open_connections).unwrap_or(512),
             max_in_flight: usize::try_from(max_in_flight).unwrap_or(256),
+            staging_budget_bytes: usize::try_from(staging_budget_mib)
+                .unwrap_or(64)
+                .saturating_mul(1024 * 1024),
         })
     }
 

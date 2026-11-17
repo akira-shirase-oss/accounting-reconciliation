@@ -37,6 +37,8 @@ use crate::tenancy::Account;
 
 /// Rows per staged batch: one statement, one short transaction.
 pub const STAGING_BATCH_ROWS: usize = 5_000;
+/// Bytes per staged batch ([`NewLine::heap_bytes`]): wide rows flush before 5,000 (D-050).
+pub const STAGING_BATCH_BYTES: usize = 4 * 1024 * 1024;
 
 /// Who is acting: a kind and a reference (never a secret).
 #[derive(Debug, Clone, Copy)]

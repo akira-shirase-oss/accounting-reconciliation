@@ -124,6 +124,23 @@ pub struct NewLine {
     pub tuple_hash: TupleHash,
 }
 
+impl NewLine {
+    /// Bytes this row holds in memory, approximately: its text fields plus a fixed overhead.
+    /// Staging batches and the server's staging budget are counted in these (D-050).
+    pub fn heap_bytes(&self) -> usize {
+        let text = [
+            Some(self.narration_raw.len()),
+            Some(self.narration_norm.len()),
+            self.reference.as_ref().map(String::len),
+            self.counterparty_raw.as_ref().map(String::len),
+            self.counterparty_norm.as_ref().map(String::len),
+        ];
+        text.into_iter()
+            .flatten()
+            .fold(192_usize, usize::saturating_add)
+    }
+}
+
 /// Row accounting for a finished import: every row read is a new line, a duplicate of an
 /// existing line, or refused (invariant 1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]

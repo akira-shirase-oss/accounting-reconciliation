@@ -391,3 +391,118 @@ async fn a_slow_upload_keeps_its_lease_until_the_parse_deadline() {
     sweeper.await.unwrap();
     db.cleanup().await;
 }
+
+fn wide_rows(first: u32, n: u32) -> Vec<u8> {
+    let mut out = Vec::new();
+    for i in first..first + n {
+        let narration = format!("WIDE {i} {}", "N".repeat(7_900));
+        let counterparty = format!("CP {i} {}", "C".repeat(3_900));
+        out.extend_from_slice(
+            format!(
+                "2026-04-01,,-{}.00,USD,{narration},REF-{i},{counterparty},\n",
+                i + 1
+            )
+            .as_bytes(),
+        );
+    }
+    out
+}
+
+/// M-3 regression: staging batches were capped by rows only, so 5,000 wide rows (about
+/// 24 KB of field text each, held raw and normalized) sat in memory before the first batch
+/// was stored. Batches are now also capped by bytes: after 600 wide rows, one must already be
+/// staged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wide_rows_are_staged_in_byte_bounded_batches() {
+    let db = TestDb::new().await;
+    let state = checked(&db, &[]).await;
+    let (firm, _, account) = tenant(&state).await;
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(4);
+    let request = Request::post(format!("/v1/firms/{firm}/accounts/{account}/imports"))
+        .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+        .header(header::CONTENT_TYPE, "text/csv")
+        .body(Body::from_stream(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
+        ))
+        .unwrap();
+    let response = tokio::spawn({
+        let state = state.clone();
+        async move { call(&state, request).await }
+    });
+    let head =
+        b"booking_date,value_date,amount,currency,narration,reference,counterparty,balance_after\n"
+            .to_vec();
+    tx.send(Ok(head.into())).await.unwrap();
+    for chunk in wide_rows(0, 600).chunks(64 * 1024) {
+        tx.send(Ok(axum::body::Bytes::copy_from_slice(chunk)))
+            .await
+            .unwrap();
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let staged = loop {
+        let staged: i32 = sqlx::query_scalar(
+            "SELECT coalesce(max(staged_rows), 0) FROM recon.imports WHERE status = 'staging'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        if staged > 0 || std::time::Instant::now() > deadline {
+            break staged;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    };
+    assert!(
+        staged > 0 && staged < 600,
+        "after 600 wide rows {staged} were staged: batches are not byte-bounded"
+    );
+    for chunk in wide_rows(600, 200).chunks(64 * 1024) {
+        tx.send(Ok(axum::body::Bytes::copy_from_slice(chunk)))
+            .await
+            .unwrap();
+    }
+    drop(tx);
+    let (status, body) = response.await.unwrap();
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["import"]["lines_created"], 800);
+    db.cleanup().await;
+}
+
+/// The staging budget (D-050) is shared: two wide uploads under the smallest budget both
+/// complete (one waits while the other stores its batch), and every permit comes back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_staging_budget_is_shared_and_returned() {
+    let db = TestDb::new().await;
+    let state = checked(&db, &[("RECON_STAGING_BUDGET_MIB", "8")]).await;
+    let total = state.staging_budget.available_permits();
+    let (firm, client, account_a) = tenant(&state).await;
+    let (s, account_b) = call(
+        &state,
+        post(
+            &format!("/v1/firms/{firm}/clients/{client}/accounts"),
+            &json!({"name": "Second", "currency": "USD"}),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED);
+    let account_b = account_b["account"]["id"].as_str().unwrap().to_owned();
+    let header =
+        b"booking_date,value_date,amount,currency,narration,reference,counterparty,balance_after\n"
+            .to_vec();
+    let mut uploads = tokio::task::JoinSet::new();
+    for (account, first) in [(account_a, 0), (account_b, 10_000)] {
+        let (state, firm) = (state.clone(), firm.clone());
+        let mut csv = header.clone();
+        csv.extend(wide_rows(first, 1_200));
+        uploads.spawn(async move { call(&state, upload(&firm, &account, csv)).await });
+    }
+    while let Some(done) = uploads.join_next().await {
+        let (status, body) = done.unwrap();
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+    assert_eq!(
+        state.staging_budget.available_permits(),
+        total,
+        "the budget must be returned in full"
+    );
+    db.cleanup().await;
+}

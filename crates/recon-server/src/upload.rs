@@ -164,6 +164,10 @@ async fn read_and_stage(
     let config = &state.config;
     let deadline = started + config.parse_deadline;
     let mut staged_batches: u32 = 0;
+    // Bytes of parsed rows buffered, and the staging budget reserved for them (D-050).
+    let mut batch_bytes: usize = 0;
+    let mut reserved: Option<tokio::sync::OwnedSemaphorePermit> = None;
+    let budget_kib = u32::try_from(config.staging_budget_bytes / 1024).unwrap_or(u32::MAX);
     // The lease is renewed by every staged batch, and on a timer between them, so a slow
     // but live upload keeps it until the parse deadline.
     let renew_every = config.import_lease / 3;
@@ -192,20 +196,53 @@ async fn read_and_stage(
         let Ok(data) = frame.into_data() else {
             continue;
         };
-        if let Err(refusal) = parser.push(&data, &mut |line| batch.push(line)) {
+        let pushed = parser.push(&data, &mut |line| {
+            batch_bytes = batch_bytes.saturating_add(line.heap_bytes());
+            batch.push(line);
+        });
+        if let Err(refusal) = pushed {
             return Ok(ReadEnd::Refused(refusal));
         }
         if parser.rows_refused() > 0 {
             // The file will be refused; stage nothing more, keep reading for the report.
             batch.clear();
+            batch_bytes = 0;
+            reserved = None;
             continue;
         }
-        while batch.len() >= imports::STAGING_BATCH_ROWS {
-            let rest = batch.split_off(imports::STAGING_BATCH_ROWS);
+        // Reserve budget for what is buffered; with none free, stop reading until another
+        // upload stores its batch (backpressure on the body, bounded by the parse deadline).
+        let held = reserved
+            .as_ref()
+            .map_or(0, |p| u32::try_from(p.num_permits()).unwrap_or(u32::MAX));
+        let need = u32::try_from(batch_bytes.div_ceil(1024))
+            .unwrap_or(u32::MAX)
+            .min(budget_kib);
+        if need > held {
+            let more = tokio::time::timeout_at(
+                deadline,
+                state.staging_budget.clone().acquire_many_owned(need - held),
+            )
+            .await
+            .map_err(|_| ReadFailure::Deadline)?
+            .map_err(|_| ReadFailure::Deadline)?;
+            match reserved.as_mut() {
+                Some(p) => p.merge(more),
+                None => reserved = Some(more),
+            }
+        }
+        // Exact cuts: 5,000 rows, or fewer when 4 MiB comes first (at least one row).
+        while batch.len() >= imports::STAGING_BATCH_ROWS
+            || batch_bytes >= imports::STAGING_BATCH_BYTES
+        {
+            let (cut, cut_bytes) = batch_cut(batch);
+            let rest = batch.split_off(cut);
             let full = std::mem::replace(batch, rest);
             imports::stage(&state.pool, staging, &full, config.import_lease)
                 .await
                 .map_err(ReadFailure::Db)?;
+            drop(full);
+            batch_bytes = batch_bytes.saturating_sub(cut_bytes);
             renewed_at = Instant::now();
             staged_batches = staged_batches.saturating_add(1);
             state
@@ -213,7 +250,32 @@ async fn read_and_stage(
                 .reached(FaultPoint::StagedBatch(staged_batches))
                 .await;
         }
+        // Return the budget beyond what is still buffered.
+        let keep = batch_bytes.div_ceil(1024);
+        if keep == 0 {
+            reserved = None;
+        } else if let Some(p) = reserved.as_mut()
+            && p.num_permits() > keep
+        {
+            drop(p.split(p.num_permits() - keep));
+        }
     }
+}
+
+/// The first batch to stage: up to 5,000 rows and 4 MiB, at least one row. Returns the row
+/// count and its bytes.
+fn batch_cut(batch: &[NewLine]) -> (usize, usize) {
+    let mut cut = 0_usize;
+    let mut bytes = 0_usize;
+    for line in batch.iter().take(imports::STAGING_BATCH_ROWS) {
+        let b = line.heap_bytes();
+        if cut > 0 && bytes.saturating_add(b) > imports::STAGING_BATCH_BYTES {
+            break;
+        }
+        cut = cut.saturating_add(1);
+        bytes = bytes.saturating_add(b);
+    }
+    (cut, bytes)
 }
 
 /// Stages the last rows and flips. Refused files never get here with lines.
