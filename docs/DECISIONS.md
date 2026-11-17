@@ -737,7 +737,9 @@ conservative side.
   buffers the allocator kept resident (`vmmap`: "Malloc Large (empty)"), live heap about
   20 MiB — and by 9 MiB with a 1 MiB cut, in the same time, so batches now flush at 5,000
   rows or 1 MiB. Ordinary rows (5,000 of them are under 1 MiB) are unaffected. The full
-  run has not been made (the development machine was running other load tests); it is owed.
+  run was made on a GitHub-hosted runner (`perf/results/r1-import-full-20261117T142528Z.json`,
+  every check passed); the development machine was running other load tests, so it has
+  no full run of its own.
 
 - **D-068 — An interface an accountant can act on (R1 has no screens).** Until R3's
   workspace, the interface is the API's refusal reports and the command line, held to the

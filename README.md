@@ -4,11 +4,12 @@
 > independent review's fixes: CI, the pure domain, the import path through
 > staging with its database guards, the `kill-mid-import` and `db-down`
 > drills, and a 1,000,000-line `r0-import` load run (`perf/results/`). R1, the
-> imports, is built and its gate met except the full 1,000,000-line `r1-import`
-> run, which is owed: declared CSV profiles, OFX, document imports, overlap
-> detection, statement revisions held for a person, the hostile-file drill and
-> six fuzz targets (`docs/ROADMAP.md` names the tests, the evidence and what is
-> owed). Nothing here matches documents yet (R2). The ship gate needs one or
+> imports, is done: declared CSV profiles, OFX, document imports, overlap
+> detection, statement revisions held for a person, refusal reports that say
+> which line, which column and how to fix it, `recon import check`, the
+> hostile-file drill, six fuzz targets, a tested production path with an
+> operator guide, and a 1,000,000-line `r1-import` run (`docs/ROADMAP.md` names
+> the tests and the evidence). Nothing here matches documents yet (R2). The ship gate needs one or
 > two real accountants, who have not been found yet (see *Blocked on*).
 
 Bank statements and invoices in; every bank line out as matched, excluded

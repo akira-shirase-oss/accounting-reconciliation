@@ -2,8 +2,8 @@
 
 `scripts/load.sh` runs a scenario against a release build of `recon-server`
 on the local stack, with its own fresh database, and writes one JSON result.
-Every result names the machine, the commit (`-dirty` when the tree was not
-clean) and the load average before and after. Laptop numbers are development
+Every result names the machine, the commit (`-dirty` when the tree, result
+files aside, was not clean) and the load average before and after. Laptop numbers are development
 observations, never production capacity; a run on a busy machine says so in
 its load average and is a smoke observation. A threshold miss fails the run
 and is kept as evidence, never rerun until green.
@@ -49,7 +49,7 @@ lines/s, file p99 at most 10,000 ms, peak RSS at most 256 MiB, zero errors.
 `CLIENTS=N` runs fewer accounts as a functional check, never a result.
 
 ```sh
-MODE=full scripts/load.sh r1-import    # owed: not yet run (R1)
+MODE=full scripts/load.sh r1-import    # perf/results/r1-import-full-20261117T142528Z.json
 MODE=smoke scripts/load.sh r1-import
 ```
 

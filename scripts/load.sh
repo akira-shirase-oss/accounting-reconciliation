@@ -49,7 +49,8 @@ else
 fi
 machine="${machine}; PostgreSQL in Docker (deploy/compose.yaml) on the same machine"
 commit="$(git rev-parse HEAD)"
-if [ -n "$(git status --porcelain)" ]; then commit="${commit}-dirty"; fi
+# Result files are not code: an earlier run's result in perf/results/ leaves the tree clean.
+if [ -n "$(git status --porcelain -- . ':!perf/results')" ]; then commit="${commit}-dirty"; fi
 load_before="$(uptime)"
 
 if [ "$mode" = "full" ] || [ "${KEEP:-}" = "1" ]; then outdir="perf/results"; else outdir="target/perf"; fi

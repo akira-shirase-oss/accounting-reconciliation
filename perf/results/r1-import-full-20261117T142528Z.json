@@ -1,0 +1,68 @@
+{
+  "checks": {
+    "decision_log_replays": true,
+    "every_file_complete": true,
+    "every_line_exactly_once": true,
+    "fingerprints_unique_per_account": true,
+    "no_revision_held": true,
+    "nothing_left_in_staging": true,
+    "overlaps_are_duplicates_never_lines": true,
+    "repeats_answered_by_the_earlier_import": true
+  },
+  "checks_pass": true,
+  "commit": "1f062a5dd3363307357e4b85bc7f59de1e55e8cb-dirty",
+  "generator": "gen-v2",
+  "load_average_after": "14:25:59 up 3 min,  0 users,  load average: 4.62, 1.87, 0.70",
+  "load_average_before": " 14:25:28 up 2 min,  0 users,  load average: 4.48, 1.54, 0.55",
+  "machine": "AMD EPYC 9V74 80-Core Processor, 4 cores, 15 GiB, Linux 7.0.0-1019-azure; PostgreSQL in Docker (deploy/compose.yaml) on the same machine",
+  "mode": "full",
+  "pass": true,
+  "results": {
+    "account_busy_retries": 0,
+    "database_growth_bytes": 1017651200,
+    "duplicates": 200000,
+    "errors": 0,
+    "file_latency_ms": {
+      "max": 1265.0,
+      "p50": 143.0,
+      "p95": 379.0,
+      "p99": 620.0
+    },
+    "first_errors": [],
+    "import_seconds": 21.985,
+    "lines_created": 1000000,
+    "lines_in_database": 1000000,
+    "lines_per_s": 45485.0,
+    "repeats": 100,
+    "repeats_ok": 100,
+    "replay": {
+      "clients": 200,
+      "decisions": 1100,
+      "imports": 1100,
+      "lines": 1000000
+    },
+    "revisions_held": 0,
+    "rows_per_s": 54582.0,
+    "rows_read": 1200000,
+    "server_peak_rss_bytes": 30273536
+  },
+  "scenario": "r1-import",
+  "shape": {
+    "accounts": 200,
+    "clients": 200,
+    "files": 1000,
+    "firms": 1,
+    "lines": 1000000,
+    "lines_per_file": 1000,
+    "server_import_concurrency": 8,
+    "workers": 8
+  },
+  "thresholds": {
+    "errors_max": 0,
+    "file_p99_ms_max": 3000.0,
+    "lines_per_s_min": 10000.0,
+    "server_peak_rss_bytes_max": 268435456
+  },
+  "thresholds_pass": true,
+  "unit": "statement line imported and fingerprinted (D-027, import half); r1-import also counts overlap rows read as duplicates"
+}
