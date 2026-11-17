@@ -5,10 +5,12 @@
 //!                                    RECON_APP_PASSWORD)
 //! recon db migrate [--database NAME] migrations, as the administrator acting as the
 //!                                    NOLOGIN owner (RECON_ADMIN_DATABASE_URL)
-//! recon audit anchor FIRM --out FILE append every client's signed, dated head to FILE
+//! recon audit anchor FIRM --out FILE verify every chain (and against FILE), then append
+//!                                    each verified head, signed and dated, to FILE
 //!                                    (RECON_DATABASE_URL, RECON_ANCHOR_KEY_FILE)
-//! recon audit verify FIRM [--anchors FILE]
-//!                                    verify every client's chain, and against the anchors
+//! recon audit verify FIRM [--anchors FILE] [--allow-empty]
+//!                                    verify every client's chain, and against the anchors;
+//!                                    a firm with no chains fails unless --allow-empty
 //! recon audit replay FIRM            replay the log against the stored state
 //! recon gen statement --seed N --lines N [--currency USD] [--start YYYY-MM-DD] [--days N]
 //!                                    a seeded statement on stdout
@@ -141,16 +143,52 @@ async fn anchor(args: &[String]) -> anyhow::Result<ExitCode> {
     let firm = firm_arg(args)?;
     let out = flag(args, "--out").context("--out FILE is required")?;
     let key = anchor_key()?;
+    // Only verified heads are signed: every chain must verify inside the database and
+    // against the anchors already in the file, or nothing is written (D-059).
+    let previous = if std::path::Path::new(&out).exists() {
+        match read_anchors(&out, firm) {
+            Ok(a) => a,
+            Err(e) => {
+                println!("anchors BROKEN: {e:#}; nothing anchored");
+                return Ok(ExitCode::from(3));
+            }
+        }
+    } else {
+        AnchorsByClient::new()
+    };
     let pool = recon_db::connect_lazy(
         &env("RECON_DATABASE_URL")?,
         &recon_db::PoolSettings::default(),
     )?;
+    let heads = recon_db::decisions::heads(&pool, firm).await?;
+    let mut broken = false;
+    for client in previous
+        .keys()
+        .filter(|c| !heads.iter().any(|(h, _, _)| h == *c))
+    {
+        println!("client {client}: BROKEN, anchored but absent from the database");
+        broken = true;
+    }
     let mut lines = String::new();
-    for (client, head, at) in recon_db::decisions::heads(&pool, firm).await? {
-        let signed = Anchor::sign(&key, firm, client, head.seq, head.hash, at)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        lines.push_str(&serde_json::to_string(&signed)?);
-        lines.push('\n');
+    for (client, _, at) in &heads {
+        let anchored = previous.get(client).map_or(&[][..], Vec::as_slice);
+        match recon_db::decisions::verify_chain_paged(&pool, firm, *client, 5_000, anchored).await?
+        {
+            Ok(head) => {
+                let signed = Anchor::sign(&key, firm, *client, head.seq, head.hash, *at)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                lines.push_str(&serde_json::to_string(&signed)?);
+                lines.push('\n');
+            }
+            Err(b) => {
+                println!("client {client}: BROKEN at seq {} ({:?})", b.seq, b.kind);
+                broken = true;
+            }
+        }
+    }
+    if broken {
+        println!("nothing anchored: a chain does not verify");
+        return Ok(ExitCode::from(3));
     }
     let mut file = std::fs::OpenOptions::new()
         .create(true)
@@ -160,7 +198,7 @@ async fn anchor(args: &[String]) -> anyhow::Result<ExitCode> {
     std::io::Write::write_all(&mut file, lines.as_bytes())?;
     file.sync_all()?;
     println!(
-        "anchor ok: {} heads appended to {out}",
+        "anchor ok: {} verified heads appended to {out}",
         lines.lines().count()
     );
     Ok(ExitCode::SUCCESS)
@@ -223,6 +261,7 @@ async fn verify(args: &[String]) -> anyhow::Result<ExitCode> {
         println!("client {client}: BROKEN, anchored but absent from the database");
         broken = true;
     }
+    let checked = clients.len();
     for client in clients {
         let anchored = anchors.get(&client).map_or(&[][..], Vec::as_slice);
         match recon_db::decisions::verify_chain_paged(&pool, firm, client, 5_000, anchored).await? {
@@ -237,6 +276,13 @@ async fn verify(args: &[String]) -> anyhow::Result<ExitCode> {
                 broken = true;
             }
         }
+    }
+    println!("{checked} chains checked");
+    if checked == 0 && !args.iter().any(|a| a == "--allow-empty") {
+        println!(
+            "nothing verified: firm {firm} has no chains (pass --allow-empty if that is expected)"
+        );
+        return Ok(ExitCode::from(4));
     }
     Ok(if broken {
         ExitCode::from(3)

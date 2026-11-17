@@ -587,6 +587,16 @@ conservative side.
   `pipelined_requests_past_the_cap_close_the_connection`,
   `a_busy_connection_is_closed_after_its_lifetime`.
 
+- **D-059 — Only verified heads are anchored; an empty verification fails.**
+  `recon audit anchor` signed whatever head the database held, so it would
+  sign a rewritten one. It now verifies every chain, inside the database and
+  against the anchors already in the file, signs the head it verified, and
+  writes nothing (exit 3) if any chain breaks. `recon audit verify` on a firm
+  with no chains printed nothing and exited 0; it now prints how many chains
+  it checked and exits 4 on none, unless `--allow-empty`. Tests:
+  `anchor_refuses_to_sign_a_chain_that_does_not_verify`,
+  `verify_of_a_firm_with_no_chains_fails_unless_empty_is_expected`.
+
 ## Open questions (blocked on the maintainer or an outside party)
 
 Each is in the README's *Blocked on* table. None blocks R0–R6.
