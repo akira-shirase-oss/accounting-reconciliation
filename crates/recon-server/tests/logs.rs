@@ -86,7 +86,9 @@ async fn logs_carry_no_secrets_or_financial_content() {
             "98765.43",
             "9876543",
             "4321.09",
+            "432109",
             "123456.78",
+            "12345678",
             "55.555",
             "4401-9988-QUAIL",
             "MARMOT-NAME",
@@ -100,4 +102,22 @@ async fn logs_carry_no_secrets_or_financial_content() {
         "{text}"
     );
     db.cleanup().await;
+}
+
+/// The scan's control: a log that does hold a needle must fail it, or a clean result proves
+/// nothing.
+#[test]
+fn the_log_scan_catches_a_planted_leak() {
+    let path = std::env::temp_dir().join(format!("recon-log-control-{}.log", std::process::id()));
+    std::fs::write(
+        &path,
+        "INFO import finished rows=2\nINFO narration=NARR-QUOKKA-77 salary\n",
+    )
+    .unwrap();
+    let caught = std::panic::catch_unwind(|| assert_log_clean(&path, &["NARR-QUOKKA"]));
+    let _ = std::fs::remove_file(&path);
+    assert!(
+        caught.is_err(),
+        "the scan passed a log that holds a narration"
+    );
 }

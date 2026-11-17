@@ -13,7 +13,6 @@
 use std::future::Future;
 use std::net::TcpListener as StdListener;
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::time::{Duration, Instant};
@@ -77,7 +76,8 @@ impl Server {
             .env("RECON_OPERATOR_TOKEN", TOKEN)
             .env("RECON_LOG", "info")
             .env("RECON_DB_ACQUIRE_MS", "1000")
-            .stdout(Stdio::null())
+            // stdout and stderr both: a println! leak must not escape the scan (D-025).
+            .stdout(file.try_clone().unwrap())
             .stderr(file)
             .kill_on_drop(true);
         for (k, v) in extra {
