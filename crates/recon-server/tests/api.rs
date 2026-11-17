@@ -577,3 +577,21 @@ async fn the_server_always_makes_its_own_request_id() {
     );
     db.cleanup().await;
 }
+
+/// L-8 regression: a refusal raised at the end of the file (here `empty_file`) recorded
+/// `file_bytes: 0`, losing the report's byte count.
+#[tokio::test]
+async fn an_end_of_file_refusal_keeps_its_byte_count() {
+    let db = TestDb::new().await;
+    let state = checked(&db, &[]).await;
+    let (firm, _, account) = tenant(&state).await;
+    let header =
+        b"booking_date,value_date,amount,currency,narration,reference,counterparty,balance_after\n"
+            .to_vec();
+    let length = header.len();
+    let (status, body) = call(&state, upload(&firm, &account, header)).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["error"]["import"]["refusal_code"], "empty_file");
+    assert_eq!(body["error"]["import"]["file_bytes"], length, "{body}");
+    db.cleanup().await;
+}

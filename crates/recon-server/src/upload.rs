@@ -117,9 +117,11 @@ pub async fn import(
         }
         Ok(ReadEnd::Finished) => {
             let mut tail = Vec::new();
+            // finish() consumes the parser; keep its counts for a refusal raised at the end.
+            let counts = (parser.file_bytes(), parser.rows_refused());
             match parser.finish(&mut |line| tail.push(line)) {
                 Err(refusal) => {
-                    let record = refuse_file_finished(state, staging, refusal).await?;
+                    let record = refuse_file_finished(state, staging, refusal, counts).await?;
                     return Err(refused_response(refusal.code, &record));
                 }
                 Ok(summary) => {
@@ -380,6 +382,7 @@ async fn refuse_file_finished(
     state: &AppState,
     staging: StagingImport,
     refusal: FileRefusal,
+    (file_bytes, rows_refused): (u64, u32),
 ) -> Result<ImportRecord, ApiError> {
     let refusals: Vec<_> = refusal
         .row
@@ -395,10 +398,10 @@ async fn refuse_file_finished(
         &Refusal {
             code: refusal.code.as_str(),
             rows_read: None,
-            rows_refused: 0,
+            rows_refused,
             refusals: &refusals,
             file_hash: None,
-            file_bytes: 0,
+            file_bytes,
         },
         OPERATOR,
     )
