@@ -8,6 +8,7 @@
 //! time, so every rule here is a cheap, deterministic test.
 #![deny(clippy::arithmetic_side_effects)]
 
+pub mod anchor;
 pub mod date;
 pub mod decision;
 pub mod fingerprint;

@@ -28,8 +28,7 @@ stamp="$(date -u +%Y%m%dT%H%M%SZ)"
 db="recon_load_$(date -u +%Y%m%d%H%M%S)"
 host="$(sed -E 's#^postgres(ql)?://[^@]*@([^/]*)/.*#\2#' <<<"$RECON_ADMIN_DATABASE_URL")"
 ./target/release/recon db setup --database "$db" >/dev/null
-RECON_MIGRATE_DATABASE_URL="postgres://recon_owner:${RECON_OWNER_PASSWORD}@${host}/${db}" \
-  ./target/release/recon db migrate >/dev/null
+./target/release/recon db migrate --database "$db" >/dev/null
 cleanup() {
   docker compose -f deploy/compose.yaml exec -T postgres \
     psql -q -U recon_admin -d recon_admin -c "DROP DATABASE IF EXISTS ${db} WITH (FORCE)" >/dev/null 2>&1 || true

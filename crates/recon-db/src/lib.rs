@@ -22,6 +22,26 @@ pub mod testing;
 pub use error::DbError;
 pub use pool::{PoolSettings, connect_lazy};
 
+/// Applies the migrations as the owner: `options` names the administrator on the target
+/// database; every connection runs `SET ROLE recon_owner` first, so the objects belong to the
+/// owner, which itself cannot log in (D-049).
+pub async fn migrate(options: sqlx::postgres::PgConnectOptions) -> Result<(), DbError> {
+    use sqlx::Executor as _;
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .after_connect(|conn, _meta| {
+            Box::pin(async move {
+                conn.execute("SET ROLE recon_owner").await?;
+                Ok(())
+            })
+        })
+        .connect_with(options)
+        .await?;
+    let result = migrator().run(&pool).await.map_err(DbError::Migrate);
+    pool.close().await;
+    result
+}
+
 /// The embedded migrations. Their table is `public._sqlx_migrations`, named explicitly so
 /// the owner's `search_path` cannot move it.
 pub fn migrator() -> sqlx::migrate::Migrator {

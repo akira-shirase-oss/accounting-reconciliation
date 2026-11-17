@@ -35,6 +35,9 @@ pub enum DbError {
     /// The database's own consistency checks disagree with what was written: a defect.
     #[error("inconsistent: {0}")]
     Inconsistent(String),
+    /// A migration failed.
+    #[error("migration failed")]
+    Migrate(#[source] sqlx::migrate::MigrateError),
     /// Anything else.
     #[error("database error")]
     Other(#[source] sqlx::Error),

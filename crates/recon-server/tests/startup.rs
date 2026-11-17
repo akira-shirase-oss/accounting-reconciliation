@@ -12,7 +12,9 @@ use recon_db::testing::TestDb;
 #[tokio::test]
 async fn the_server_refuses_to_serve_as_the_owner_or_the_superuser() {
     let db = TestDb::new().await;
-    for (who, url) in [("owner", db.owner_url()), ("superuser", db.admin_url())] {
+    // The owner cannot log in (D-049); a superuser acting as it is the way to be it.
+    let as_owner = format!("{}?options=-c%20role%3Drecon_owner", db.admin_url());
+    for (who, url) in [("owner", as_owner), ("superuser", db.admin_url())] {
         let server = Server::spawn(&url, &[]);
         let (code, log) = server.exit_code(Duration::from_secs(30)).await;
         assert_eq!(code, Some(78), "as the {who}: {log}");

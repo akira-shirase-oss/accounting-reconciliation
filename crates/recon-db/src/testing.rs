@@ -20,8 +20,8 @@ use uuid::Uuid;
 
 /// The variable naming the administrator's connection.
 pub const ENV: &str = "RECON_TEST_ADMIN_URL";
-/// The owner's development password (the stack's public value).
-pub const OWNER_PASSWORD: &str = "recon-owner-dev";
+/// A password for the owner's URL: never accepted, the owner cannot log in (D-049).
+pub const OWNER_PASSWORD: &str = "recon-owner-cannot-log-in";
 /// The server's development password.
 pub const APP_PASSWORD: &str = "recon-app-dev";
 
@@ -73,7 +73,7 @@ impl TestDb {
             .expect("connecting as the administrator (RECON_TEST_ADMIN_URL)");
         if ROLES.get().is_none() {
             // Concurrent callers are serialized by ensure_roles' advisory lock.
-            crate::roles::ensure_roles(&mut admin, OWNER_PASSWORD, APP_PASSWORD)
+            crate::roles::ensure_roles(&mut admin, APP_PASSWORD)
                 .await
                 .expect("creating the roles");
             let _ = ROLES.set(());
@@ -83,19 +83,12 @@ impl TestDb {
             .await
             .expect("creating the test database");
         admin.close().await.ok();
-        let owner_url = url_for(&admin_url, &name, crate::roles::OWNER, OWNER_PASSWORD, None);
-        // A pool (not a bare connection): sqlx's `Acquire` for `&mut PgConnection` makes the
-        // future too lifetime-specific to spawn, and drills spawn TestDb in tasks.
-        let owner = PgPoolOptions::new()
-            .max_connections(1)
-            .connect(&owner_url)
-            .await
-            .expect("connecting as recon_owner");
-        crate::migrator()
-            .run(&owner)
+        let on_database = PgConnectOptions::from_str(&admin_url)
+            .expect("invariant: RECON_TEST_ADMIN_URL parses")
+            .database(&name);
+        crate::migrate(on_database)
             .await
             .expect("migrating the test database as its owner");
-        owner.close().await;
         let app_url = url_for(&admin_url, &name, crate::roles::APP, APP_PASSWORD, None);
         let options = crate::pool::connect_options(&app_url, &crate::PoolSettings::default())
             .expect("invariant: the test url parses");
@@ -127,7 +120,7 @@ impl TestDb {
         self.url_as(crate::roles::APP, APP_PASSWORD, None)
     }
 
-    /// The owner's URL (migrations only).
+    /// The owner's URL (refused: the owner cannot log in; tests prove it).
     pub fn owner_url(&self) -> String {
         self.url_as(crate::roles::OWNER, OWNER_PASSWORD, None)
     }
@@ -149,13 +142,20 @@ impl TestDb {
         host_and_query(&self.admin_url).0
     }
 
-    /// A pool as the owner.
+    /// A pool acting as the owner: the administrator with `SET ROLE recon_owner` on every
+    /// connection (the owner itself cannot log in).
     pub async fn owner_pool(&self) -> PgPool {
         PgPoolOptions::new()
             .max_connections(4)
-            .connect(&self.owner_url())
+            .after_connect(|conn, _meta| {
+                Box::pin(async move {
+                    conn.execute("SET ROLE recon_owner").await?;
+                    Ok(())
+                })
+            })
+            .connect(&self.admin_url())
             .await
-            .expect("connecting as recon_owner")
+            .expect("connecting as the administrator acting as recon_owner")
     }
 
     /// A pool as the administrator.

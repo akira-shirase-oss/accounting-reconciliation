@@ -353,7 +353,8 @@ async fn audit_verify_names_a_tampered_row_and_a_removed_tail() {
     decide(&db, account.firm, account.client, 5).await;
     decide(&db, account.firm, second, 5).await;
 
-    // Only a superuser in replica mode gets around the triggers (the limit D-019 states).
+    // A superuser in replica mode gets around the triggers; so can anyone acting as the
+    // owner (D-019, D-049: it can disable them), which is why heads are anchored outside.
     let mut admin = PgConnection::connect(&db.admin_url()).await.unwrap();
     admin
         .execute("SET session_replication_role = replica")
@@ -815,7 +816,7 @@ async fn verifying_a_live_chain_never_raises_a_false_alarm() {
     let mut false_alarms = vec![];
     for _ in 0..60 {
         if let Err(broken) =
-            decisions::verify_chain_paged(&db.pool, account.firm, account.client, 3)
+            decisions::verify_chain_paged(&db.pool, account.firm, account.client, 3, &[])
                 .await
                 .unwrap()
         {
@@ -828,6 +829,81 @@ async fn verifying_a_live_chain_never_raises_a_false_alarm() {
         false_alarms,
         vec![],
         "an intact chain verified as broken while it grew"
+    );
+    db.cleanup().await;
+}
+
+/// M-2: the owner owns the log and its triggers, so whoever holds the owner can disable the
+/// guards and rewrite a chain's tail consistently. The owner therefore cannot log in at all.
+#[tokio::test]
+async fn the_owner_cannot_log_in() {
+    let db = TestDb::new().await;
+    let login = PgConnection::connect(&db.owner_url()).await;
+    let code = login.err().and_then(|e| {
+        e.as_database_error()
+            .and_then(|d| d.code().map(std::borrow::Cow::into_owned))
+    });
+    assert!(
+        code.as_deref().is_some_and(|c| c.starts_with("28")),
+        "recon_owner logged in ({code:?})"
+    );
+    let can_login: bool = sqlx::query_scalar(
+        "SELECT rolcanlogin FROM pg_catalog.pg_roles WHERE rolname = 'recon_owner'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert!(!can_login, "recon_owner must be NOLOGIN");
+    db.cleanup().await;
+}
+
+/// M-2: a chain rewritten by the owner — guards disabled, the tail deleted, the head moved
+/// back to a real record — is consistent inside the database, so only a head anchored outside
+/// it can catch the rewrite.
+#[tokio::test]
+async fn a_chain_rewritten_by_its_owner_is_caught() {
+    let db = TestDb::new().await;
+    let account = tenant(&db.pool).await;
+    decide(&db, account.firm, account.client, 5).await;
+    // The head anchored outside the database before the rewrite (`recon audit anchor`).
+    let heads = decisions::heads(&db.pool, account.firm).await.unwrap();
+    let anchors: Vec<(i64, [u8; 32])> = heads.iter().map(|(_, h, _)| (h.seq, h.hash)).collect();
+    assert_eq!(anchors.len(), 1);
+    let owner = db.owner_pool().await;
+    let mut tx = owner.begin().await.unwrap();
+    for sql in [
+        "ALTER TABLE recon.decision_log DISABLE TRIGGER USER",
+        "ALTER TABLE recon.chain_heads DISABLE TRIGGER USER",
+        "DELETE FROM recon.decision_log WHERE seq > 3",
+        "UPDATE recon.chain_heads h SET seq = 3, head_hash = d.record_hash FROM recon.decision_log d
+          WHERE d.firm_id = h.firm_id AND d.client_id = h.client_id AND d.seq = 3",
+        "ALTER TABLE recon.decision_log ENABLE TRIGGER USER",
+        "ALTER TABLE recon.chain_heads ENABLE TRIGGER USER",
+    ] {
+        tx.execute(sql).await.unwrap();
+    }
+    tx.commit().await.unwrap();
+    owner.close().await;
+    // Consistent inside the database: a check against the database alone cannot see it...
+    let inside = decisions::verify_chain(&db.pool, account.firm, account.client)
+        .await
+        .unwrap();
+    assert_eq!(
+        inside.map(|h| h.seq),
+        Ok(3),
+        "the stated limit: the owner can rewrite consistently"
+    );
+    // ...the anchor can.
+    let anchored =
+        decisions::verify_chain_paged(&db.pool, account.firm, account.client, 5_000, &anchors)
+            .await
+            .unwrap();
+    assert_eq!(
+        anchored,
+        Err(ChainBreak {
+            seq: 5,
+            kind: BreakKind::AnchorMismatch
+        })
     );
     db.cleanup().await;
 }

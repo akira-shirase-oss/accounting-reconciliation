@@ -191,8 +191,11 @@ conservative side.
   chain per client keeps clients' work parallel. A period close records
   the chain head, and the period report prints it. `recon audit verify`
   walks the chain and names the first broken link. Limit, stated plainly:
-  someone with database superuser access can rewrite a whole chain; the
-  printed heads are what exposes that. Evidence fields holding financial
+  a database superuser, or anyone acting as the schema's owner (which can
+  disable, drop or replace the log's own triggers), can rewrite a chain's
+  tail consistently, head included; nothing inside the database can catch
+  that. Heads signed and anchored outside the database (D-049) and the
+  printed period heads are what expose it. Evidence fields holding financial
   content are stored encrypted under the client's data key, and the hashes
   cover the ciphertext, so purging a client (D-023) keeps the chain
   verifiable. Cost: one chain lock per client on every decision write,
@@ -464,6 +467,26 @@ conservative side.
   `REPEATABLE READ, READ ONLY` transaction and checks the chain as of its
   snapshot. Test: `verifying_a_live_chain_never_raises_a_false_alarm`. Cost:
   a long verification holds back vacuum on the log for its duration.
+
+- **D-049 — The owner cannot log in; heads are anchored outside.** The
+  owner of the log owns its triggers: acting as it, anyone can disable them,
+  delete a chain's tail and move the head back to a real record, and the
+  chain then verifies inside the database. So `recon_owner` is `NOLOGIN`;
+  migrations run as the administrator with `SET ROLE recon_owner` (`recon db
+  migrate`), and the server's startup check refuses a cluster whose owner can
+  log in. `recon audit anchor FIRM --out FILE` appends every client's head —
+  sequence, hash and the database clock — signed with HMAC-SHA256 under a key
+  from `RECON_ANCHOR_KEY_FILE` (at least 32 bytes, refused if group or others
+  can read it); `recon audit verify FIRM --anchors FILE` checks every
+  signature and requires the record at every anchored sequence to exist with
+  the anchored hash (`AnchorMismatch` otherwise). The anchor file belongs where
+  the server and the database owner cannot write: another host or write-once
+  storage. Tests: `the_owner_cannot_log_in`,
+  `a_chain_rewritten_by_its_owner_is_caught`,
+  `anchors_verify_and_catch_tampering_and_an_owner_rewrite` (the binary), the
+  anchor signature tests in `recon-domain`. Cost: an operator duty — anchor
+  after each period close and keep the key and the file off the database
+  host.
 
 ## Open questions (blocked on the maintainer or an outside party)
 

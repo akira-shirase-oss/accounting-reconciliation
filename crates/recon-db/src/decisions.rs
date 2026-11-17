@@ -173,16 +173,29 @@ pub async fn verify_chain(
     firm: FirmId,
     client: ClientId,
 ) -> Result<Result<ChainHead, ChainBreak>, DbError> {
-    verify_chain_paged(pool, firm, client, 5_000).await
+    verify_chain_paged(pool, firm, client, 5_000, &[]).await
 }
 
-/// [`verify_chain`] with a page size (tests use small pages to widen race windows).
+/// [`verify_chain`] with a page size (tests use small pages to widen race windows) and
+/// anchors: `(seq, hash)` heads recorded outside the database (D-049). The record at every
+/// anchored sequence must exist with the anchored hash.
 pub async fn verify_chain_paged(
     pool: &PgPool,
     firm: FirmId,
     client: ClientId,
     page_size: i64,
+    anchors: &[(i64, [u8; 32])],
 ) -> Result<Result<ChainHead, ChainBreak>, DbError> {
+    let anchored: std::collections::HashMap<i64, [u8; 32]> = anchors.iter().copied().collect();
+    let anchor_break = |seq| ChainBreak {
+        seq,
+        kind: BreakKind::AnchorMismatch,
+    };
+    if let Some(hash) = anchored.get(&0)
+        && *hash != recon_domain::decision::genesis_hash(firm, client)
+    {
+        return Ok(Err(anchor_break(0)));
+    }
     let mut tx = pool.begin().await?;
     sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
         .execute(&mut *tx)
@@ -197,9 +210,15 @@ pub async fn verify_chain_paged(
             if let Err(broken) = verifier.push(r) {
                 return Ok(Err(broken));
             }
+            if anchored.get(&r.seq).is_some_and(|h| *h != r.record_hash) {
+                return Ok(Err(anchor_break(r.seq)));
+            }
         }
     }
     let head = verifier.head();
+    if let Some(&beyond) = anchored.keys().filter(|&&seq| seq > head.seq).min() {
+        return Ok(Err(anchor_break(beyond)));
+    }
     let stored = sqlx::query(
         "SELECT seq, head_hash FROM recon.chain_heads WHERE firm_id = $1 AND client_id = $2",
     )
@@ -217,6 +236,34 @@ pub async fn verify_chain_paged(
         }));
     }
     Ok(Ok(head))
+}
+
+/// Every client's head for `firm`, read in one snapshot with the database clock (what
+/// `recon audit anchor` signs).
+pub async fn heads(
+    pool: &PgPool,
+    firm: FirmId,
+) -> Result<Vec<(ClientId, ChainHead, i64)>, DbError> {
+    let rows = sqlx::query(
+        "SELECT client_id, seq, head_hash,
+                (EXTRACT(EPOCH FROM pg_catalog.now()) * 1000000)::bigint AS at
+           FROM recon.chain_heads WHERE firm_id = $1 ORDER BY client_id",
+    )
+    .bind(firm.as_uuid())
+    .fetch_all(pool)
+    .await?;
+    rows.iter()
+        .map(|r| {
+            Ok((
+                ClientId::from_uuid(r.try_get("client_id")?),
+                ChainHead {
+                    seq: r.try_get("seq")?,
+                    hash: hash32(r, "head_hash")?,
+                },
+                r.try_get("at")?,
+            ))
+        })
+        .collect()
 }
 
 /// Every client of `firm` (for verifying all chains).

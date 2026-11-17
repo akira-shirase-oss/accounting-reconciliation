@@ -1,9 +1,10 @@
 //! Database roles (D-037). Three of them, and the server is only ever the last:
 //!
-//! * the cluster's administrator creates roles and databases (`recon db setup`) and
-//!   nothing else;
-//! * `recon_owner` owns the database, the schema and every object, and is used only to
-//!   migrate (`recon db migrate`);
+//! * the cluster's administrator creates roles and databases (`recon db setup`) and runs
+//!   migrations as the owner (`recon db migrate`: `SET ROLE recon_owner`);
+//! * `recon_owner` owns the database, the schema and every object, and cannot log in
+//!   (D-049): whoever acts as it can disable the log's guards, so nobody holds it as a
+//!   login;
 //! * `recon_app` logs in for the server, inheriting `recon_runtime`'s grants: no
 //!   superuser, no ownership, no `TRUNCATE`, no DDL, no `TEMP`, no `BYPASSRLS`.
 //!
@@ -55,16 +56,12 @@ async fn execute_formatted(
 /// Creates (or re-asserts) the three roles. Idempotent, serialized by an advisory lock so
 /// parallel test processes can call it. Needs a role with `CREATEROLE` (the stack's
 /// superuser in development).
-pub async fn ensure_roles(
-    admin: &mut PgConnection,
-    owner_password: &str,
-    app_password: &str,
-) -> Result<(), DbError> {
+pub async fn ensure_roles(admin: &mut PgConnection, app_password: &str) -> Result<(), DbError> {
     sqlx::query("SELECT pg_catalog.pg_advisory_lock($1)")
         .bind(SETUP_LOCK)
         .execute(&mut *admin)
         .await?;
-    let result = ensure_roles_locked(admin, owner_password, app_password).await;
+    let result = ensure_roles_locked(admin, app_password).await;
     let unlocked = sqlx::query("SELECT pg_catalog.pg_advisory_unlock($1)")
         .bind(SETUP_LOCK)
         .execute(&mut *admin)
@@ -74,11 +71,7 @@ pub async fn ensure_roles(
     Ok(())
 }
 
-async fn ensure_roles_locked(
-    admin: &mut PgConnection,
-    owner_password: &str,
-    app_password: &str,
-) -> Result<(), DbError> {
+async fn ensure_roles_locked(admin: &mut PgConnection, app_password: &str) -> Result<(), DbError> {
     for role in [OWNER, RUNTIME, APP] {
         let exists: bool = sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = $1)",
@@ -96,20 +89,33 @@ async fn ensure_roles_locked(
         }
     }
     let attributes = "NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS";
-    for (role, password) in [(OWNER, owner_password), (APP, app_password)] {
+    execute_formatted(
+        admin,
+        "SELECT pg_catalog.format('ALTER ROLE %I WITH LOGIN INHERIT %s PASSWORD %L', $1::text, $2::text, $3::text)",
+        &[APP, attributes, app_password],
+    )
+    .await?;
+    for role in [OWNER, RUNTIME] {
         execute_formatted(
             admin,
-            "SELECT pg_catalog.format('ALTER ROLE %I WITH LOGIN INHERIT %s PASSWORD %L', $1::text, $2::text, $3::text)",
-            &[role, attributes, password],
+            "SELECT pg_catalog.format('ALTER ROLE %I WITH NOLOGIN %s PASSWORD NULL', $1::text, $2::text)",
+            &[role, attributes],
         )
         .await?;
     }
-    execute_formatted(
-        admin,
-        "SELECT pg_catalog.format('ALTER ROLE %I WITH NOLOGIN %s', $1::text, $2::text)",
-        &[RUNTIME, attributes],
-    )
-    .await?;
+    // A non-superuser administrator (a managed service's) needs SET on the owner to migrate.
+    let superuser: bool =
+        sqlx::query_scalar("SELECT rolsuper FROM pg_catalog.pg_roles WHERE rolname = current_user")
+            .fetch_one(&mut *admin)
+            .await?;
+    if !superuser {
+        execute_formatted(
+            admin,
+            "SELECT pg_catalog.format('GRANT %I TO CURRENT_USER WITH INHERIT FALSE, SET TRUE', $1::text)",
+            &[OWNER],
+        )
+        .await?;
+    }
     let member: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_auth_members m
                           JOIN pg_catalog.pg_roles g ON g.oid = m.roleid
@@ -178,6 +184,7 @@ pub async fn runtime_problems(pool: &PgPool) -> Result<Vec<RoleProblem>, DbError
                 pg_catalog.has_schema_privilege(current_user, 'recon', 'CREATE') AS create_recon,
                 pg_catalog.has_schema_privilege(current_user, 'public', 'CREATE') AS create_public,
                 pg_catalog.pg_has_role(current_user, 'recon_owner', 'MEMBER') AS owner_member,
+                (SELECT o.rolcanlogin FROM pg_catalog.pg_roles o WHERE o.rolname = 'recon_owner') AS owner_login,
                 EXISTS (SELECT 1 FROM pg_catalog.pg_class c
                           JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
                          WHERE n.nspname = 'recon'
@@ -204,6 +211,10 @@ pub async fn runtime_problems(pool: &PgPool) -> Result<Vec<RoleProblem>, DbError
         ("create_recon", "may create objects in schema recon"),
         ("create_public", "may create objects in schema public"),
         ("owner_member", "is a member of recon_owner"),
+        (
+            "owner_login",
+            "shares a cluster whose recon_owner can log in (D-049)",
+        ),
         ("owns", "owns objects in schema recon"),
         ("truncate", "may TRUNCATE tables"),
         ("log_writable", "may UPDATE or DELETE the decision log"),

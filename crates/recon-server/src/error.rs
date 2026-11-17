@@ -117,7 +117,10 @@ impl ApiError {
                     "the request conflicts with existing data",
                 )
             }
-            DbError::Refused(_) | DbError::Inconsistent(_) | DbError::Other(_) => {
+            DbError::Refused(_)
+            | DbError::Inconsistent(_)
+            | DbError::Migrate(_)
+            | DbError::Other(_) => {
                 tracing::error!(error = %error, sqlstate = ?error.sqlstate(), "storage defect");
                 Self::internal()
             }

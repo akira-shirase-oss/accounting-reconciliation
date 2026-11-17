@@ -149,16 +149,19 @@ with formula escaping; follow-up drafts are text for a person to send.
 | 62490 | `recon-server` during load runs (`scripts/load.sh`) |
 | 62400–62479 | test servers and the `db-down` drill's proxy |
 
-## Database roles (D-037)
+## Database roles (D-037, D-049)
 
-The cluster administrator only creates roles and databases (`recon db
-setup`). `recon_owner` owns the database, schema `recon` and every object,
-and only migrates (`recon db migrate`). The server logs in as `recon_app`
-(member of `recon_runtime`): `SELECT` and `INSERT`, column-level `UPDATE` on
-imports, `DELETE` on the staging table, nothing else — no superuser,
-ownership, `TRUNCATE`, DDL or `TEMP`. Every function pins `search_path =
-pg_catalog, pg_temp`; the server checks its role at startup and refuses to
-serve otherwise.
+The cluster administrator creates roles and databases (`recon db setup`) and
+runs migrations acting as the owner (`recon db migrate`: `SET ROLE
+recon_owner`). `recon_owner` owns the database, schema `recon` and every
+object, and cannot log in. The server logs in as `recon_app` (member of
+`recon_runtime`): `SELECT` and `INSERT`, column-level `UPDATE` on imports,
+`DELETE` on the staging table, nothing else — no superuser, ownership,
+`TRUNCATE`, DDL or `TEMP`. Every function pins `search_path = pg_catalog,
+pg_temp`; the server checks its role at startup and refuses to serve
+otherwise. Chain heads are signed and anchored outside the database (`recon
+audit anchor`), because whoever acts as the owner can rewrite a chain
+consistently inside it.
 
 ## Consistency story
 

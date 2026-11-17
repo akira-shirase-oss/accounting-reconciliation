@@ -174,6 +174,9 @@ pub enum BreakKind {
     /// The chain verifies, but the stored head (sequence or hash) is not its last record:
     /// records were removed from the end, or the head was rewritten.
     HeadMismatch,
+    /// The chain verifies inside the database but disagrees with a head anchored outside
+    /// it (D-049): the record at an anchored sequence is missing or has another hash.
+    AnchorMismatch,
 }
 
 /// The first broken link: `recon audit verify` names it.
