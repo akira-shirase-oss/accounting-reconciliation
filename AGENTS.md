@@ -6,7 +6,7 @@ model only as a proposer for ambiguous cases, approval gates, explicit
 versioned rules and an append-only audit trail. Rust + Axum + Tokio + SQLx
 over PostgreSQL; a SvelteKit workspace. There is no engineering guide:
 `docs/END_GOAL.md` and `docs/DECISIONS.md` are the contract. Status: R0
-(the spine) built — see `docs/ROADMAP.md` for what is proven and owed; the
+(the spine) built, in progress again for review fixes — see `docs/ROADMAP.md`; the
 ship gate is blocked on pilot accountants (README, *Blocked on*). The local
 stack, ports and database roles are D-036 and D-037.
 
