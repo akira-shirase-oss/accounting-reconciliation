@@ -512,6 +512,15 @@ conservative side.
   probes before, immediate now); `drill_db_down`. Cost: readiness lags the
   database by up to 1.5 s.
 
+- **D-052 — Deserialized money is constructed money.** `Money` derived
+  `Deserialize`, which bypassed `Money::new`'s ±10^12 bound: `i64::MIN` minor
+  units deserialized, and negating it lost a unit. `Money` now deserializes
+  through `try_from` into `Money::new`, negation is `checked_neg`, and
+  `ScoreBreakdown` deserializes only with `scoring-v1`'s weights. Allocations
+  and residuals (R3's manual matches, R4's model answers) inherit the check.
+  Tests: `deserializing_is_range_checked_like_construction`,
+  `deserialized_allocations_and_scores_are_checked`.
+
 ## Open questions (blocked on the maintainer or an outside party)
 
 Each is in the README's *Blocked on* table. None blocks R0–R6.

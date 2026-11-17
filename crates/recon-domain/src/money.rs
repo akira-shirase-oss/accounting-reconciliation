@@ -131,11 +131,29 @@ impl MoneyError {
     }
 }
 
-/// An exact amount: signed minor units in one currency, `|minor| <= 10^12`.
+/// An exact amount: signed minor units in one currency, `|minor| <= 10^12`. Deserializing
+/// goes through [`Money::new`], so a request or a model's answer cannot carry an amount the
+/// constructor would refuse (D-052).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "MoneyRepr")]
 pub struct Money {
     minor: i64,
     currency: Currency,
+}
+
+/// The wire form of [`Money`], validated on the way in.
+#[derive(Deserialize)]
+struct MoneyRepr {
+    minor: i64,
+    currency: Currency,
+}
+
+impl TryFrom<MoneyRepr> for Money {
+    type Error = MoneyError;
+
+    fn try_from(repr: MoneyRepr) -> Result<Self, MoneyError> {
+        Self::new(repr.minor, repr.currency)
+    }
 }
 
 impl Money {
@@ -167,13 +185,12 @@ impl Money {
         self.minor == 0
     }
 
-    /// The negated amount (always representable: the range is symmetric).
-    #[must_use]
-    pub const fn negated(self) -> Self {
-        Self {
-            minor: 0_i64.saturating_sub(self.minor),
-            currency: self.currency,
-        }
+    /// The negated amount, refused beyond the range (never the case for a value built by
+    /// [`Money::new`] or deserialized, since the range is symmetric — but checked, not
+    /// assumed).
+    pub fn checked_neg(self) -> Result<Self, MoneyError> {
+        let minor = self.minor.checked_neg().ok_or(MoneyError::OutOfRange)?;
+        Self::new(minor, self.currency)
     }
 
     /// `self + other`, refused across currencies or beyond the range.
@@ -190,7 +207,7 @@ impl Money {
 
     /// `self - other`, refused across currencies or beyond the range.
     pub fn checked_sub(self, other: Self) -> Result<Self, MoneyError> {
-        self.checked_add(other.negated())
+        self.checked_add(other.checked_neg()?)
     }
 
     /// Parses a plain decimal string: an optional leading `-`, at least one digit, and
@@ -415,6 +432,27 @@ mod tests {
             Currency::from_code(" USD"),
             Err(MoneyError::UnknownCurrency)
         );
+    }
+
+    /// M-5 regression: a derived `Deserialize` skipped `Money::new`'s range check, so
+    /// `i64::MIN` minor units deserialized, and negating it lost a unit.
+    #[test]
+    fn deserializing_is_range_checked_like_construction() {
+        for minor in [i64::MIN, i64::MAX, MAX_ABS_MINOR + 1, -MAX_ABS_MINOR - 1] {
+            let json = format!(r#"{{"minor":{minor},"currency":"Usd"}}"#);
+            assert!(
+                serde_json::from_str::<Money>(&json).is_err(),
+                "{minor} deserialized"
+            );
+        }
+        let edge: Money = serde_json::from_str(&format!(
+            r#"{{"minor":{},"currency":"Usd"}}"#,
+            -MAX_ABS_MINOR
+        ))
+        .unwrap();
+        assert_eq!(edge.checked_neg().map(Money::minor), Ok(MAX_ABS_MINOR));
+        let round = serde_json::to_string(&edge).unwrap();
+        assert_eq!(serde_json::from_str::<Money>(&round).unwrap(), edge);
     }
 
     fn any_currency() -> impl Strategy<Value = Currency> {

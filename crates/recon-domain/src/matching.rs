@@ -278,6 +278,7 @@ impl MatchStatus {
 /// The deterministic score's breakdown (D-012, `scoring v1`): weights 40/30/15/10/5. It is
 /// a ranking aid, never a probability, and never combined with a model's claim.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "ScoreRepr")]
 pub struct ScoreBreakdown {
     /// 0 or 40.
     pub exact_amount: u8,
@@ -289,6 +290,41 @@ pub struct ScoreBreakdown {
     pub date_proximity: u8,
     /// 0 or 5.
     pub uniqueness: u8,
+}
+
+/// The wire form of [`ScoreBreakdown`], validated on the way in (D-052).
+#[derive(Deserialize)]
+struct ScoreRepr {
+    exact_amount: u8,
+    exact_reference: u8,
+    counterparty: u8,
+    date_proximity: u8,
+    uniqueness: u8,
+}
+
+/// A score whose components are not `scoring-v1`'s weights.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("invalid_score")]
+pub struct InvalidScore;
+
+impl TryFrom<ScoreRepr> for ScoreBreakdown {
+    type Error = InvalidScore;
+
+    fn try_from(r: ScoreRepr) -> Result<Self, InvalidScore> {
+        let flag = |value: u8, weight: u8| match value {
+            0 => Ok(false),
+            v if v == weight => Ok(true),
+            _ => Err(InvalidScore),
+        };
+        Self::new(
+            flag(r.exact_amount, 40)?,
+            flag(r.exact_reference, 30)?,
+            flag(r.counterparty, 15)?,
+            r.date_proximity,
+            flag(r.uniqueness, 5)?,
+        )
+        .ok_or(InvalidScore)
+    }
 }
 
 impl ScoreBreakdown {
@@ -440,6 +476,33 @@ mod tests {
         );
         assert_eq!(ScoreBreakdown::new(false, false, false, 11, false), None);
         assert!(Tier::T1.may_auto_commit() && !Tier::T2.may_auto_commit());
+    }
+
+    /// M-5: allocations and scores deserialized from a request or a model's answer carry
+    /// the same checks as the constructors.
+    #[test]
+    fn deserialized_allocations_and_scores_are_checked() {
+        let line = format!(
+            r#"{{"line":"{}","amount":{{"minor":{},"currency":"Usd"}}}}"#,
+            Uuid::from_u128(1),
+            i64::MIN
+        );
+        assert!(serde_json::from_str::<LineAllocation>(&line).is_err());
+        let ok = r#"{"exact_amount":40,"exact_reference":0,"counterparty":15,"date_proximity":7,"uniqueness":5}"#;
+        assert_eq!(
+            serde_json::from_str::<ScoreBreakdown>(ok).unwrap().total(),
+            67
+        );
+        for bad in [
+            r#"{"exact_amount":200,"exact_reference":0,"counterparty":0,"date_proximity":0,"uniqueness":0}"#,
+            r#"{"exact_amount":40,"exact_reference":29,"counterparty":0,"date_proximity":0,"uniqueness":0}"#,
+            r#"{"exact_amount":0,"exact_reference":0,"counterparty":0,"date_proximity":11,"uniqueness":0}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<ScoreBreakdown>(bad).is_err(),
+                "{bad}"
+            );
+        }
     }
 
     proptest! {
