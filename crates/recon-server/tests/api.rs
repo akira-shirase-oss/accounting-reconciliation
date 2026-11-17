@@ -134,8 +134,26 @@ async fn liveness_readiness_and_the_operator_token() {
         )
     );
     state.mark_checked();
-    let (s, _) = call(&state, Request::get("/readyz").body(Body::empty()).unwrap()).await;
-    assert_eq!(s, StatusCode::OK);
+    // Green once the background probe has reached the database (D-051).
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let probe = tokio::spawn(recon_server::tasks::readiness_probe(
+        state.clone(),
+        shutdown.clone(),
+    ));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let (s, _) = call(&state, Request::get("/readyz").body(Body::empty()).unwrap()).await;
+        if s == StatusCode::OK {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "readiness never turned green"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    shutdown.cancel();
+    probe.await.unwrap();
 
     let no_token = Request::post("/v1/firms").body(Body::from("{}")).unwrap();
     let (s, body) = call(&state, no_token).await;
@@ -505,4 +523,32 @@ async fn the_staging_budget_is_shared_and_returned() {
         "the budget must be returned in full"
     );
     db.cleanup().await;
+}
+
+/// M-4 regression: unauthenticated `/readyz` ran a database round trip per request with no
+/// cap, so a flood of probes competed with uploads for the pool. Readiness is now a cached
+/// state a background probe refreshes: 20 probes against an unreachable database answer at
+/// once instead of waiting on it each time.
+#[tokio::test]
+async fn readiness_is_served_from_a_cache_not_a_query_per_probe() {
+    let url = "postgres://recon_app:x@127.0.0.1:1/none";
+    let config = Config::from_source(|name| match name {
+        "RECON_DATABASE_URL" => Some(url.to_owned()),
+        "RECON_OPERATOR_TOKEN" => Some(TOKEN.to_owned()),
+        _ => None,
+    })
+    .unwrap();
+    let pool = recon_db::connect_lazy(url, &config.pool).unwrap();
+    let state = AppState::new(pool, config, Faults::default());
+    state.mark_checked();
+    let started = std::time::Instant::now();
+    for _ in 0..20 {
+        let (s, _) = call(&state, Request::get("/readyz").body(Body::empty()).unwrap()).await;
+        assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
+    }
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "20 probes took {elapsed:?}: each one queried the database"
+    );
 }

@@ -44,6 +44,36 @@ pub async fn startup_check(
     }
 }
 
+/// How often the readiness probe reaches for the database, and how long it waits (D-051).
+pub const READINESS_INTERVAL: Duration = Duration::from_millis(500);
+/// The probe's deadline.
+pub const READINESS_TIMEOUT: Duration = Duration::from_millis(800);
+/// `/readyz` is red once the last successful probe is older than this (inside the 2 s the
+/// `db-down` drill requires).
+pub const READINESS_WINDOW: Duration = Duration::from_millis(1_500);
+
+/// Probes the database every [`READINESS_INTERVAL`]: one query per interval however many
+/// `/readyz` requests arrive.
+pub async fn readiness_probe(state: AppState, shutdown: CancellationToken) {
+    loop {
+        let ping = tokio::time::timeout(
+            READINESS_TIMEOUT,
+            sqlx::query("SELECT 1").execute(&state.pool),
+        );
+        let reached = tokio::select! {
+            () = shutdown.cancelled() => return,
+            r = ping => matches!(r, Ok(Ok(_))),
+        };
+        if reached {
+            state.record_db_ok();
+        }
+        tokio::select! {
+            () = shutdown.cancelled() => return,
+            () = tokio::time::sleep(READINESS_INTERVAL) => {}
+        }
+    }
+}
+
 /// Every `sweep_interval`: discard staging imports whose lease expired, delete staged rows
 /// of finished imports. Errors are logged and the next round retries.
 pub async fn sweeper(state: AppState, shutdown: CancellationToken) {

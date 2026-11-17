@@ -82,6 +82,7 @@ async fn run() -> anyhow::Result<ExitCode> {
         shutdown.clone(),
     ));
     tasks.spawn(tasks::sweeper(state.clone(), shutdown.clone()));
+    tasks.spawn(tasks::readiness_probe(state.clone(), shutdown.clone()));
     let app = router(state);
     let mut server = tokio::spawn(serve(listener, app, limits, shutdown.clone()));
 

@@ -1,8 +1,6 @@
 //! Route handlers. The firm comes from the path in R0 (the operator acts for every firm);
 //! from R3 it comes from the signed-in user's session and the path must agree with it.
 
-use std::time::Duration;
-
 use axum::Json;
 use axum::body::Body;
 use axum::extract::rejection::JsonRejection;
@@ -53,8 +51,9 @@ pub async fn healthz() -> Json<Value> {
     Json(json!({ "ok": true }))
 }
 
-/// Readiness: the startup check passed and the database answers within 800 ms. Red within
-/// two seconds of the database going away (drill `db-down`).
+/// Readiness: the startup check passed and the background probe reached the database within
+/// the last 1.5 s (D-051). Served from that cached state, never a query per request; red
+/// within two seconds of the database going away (drill `db-down`).
 pub async fn readyz(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
     if !state.startup_checked() {
         return (
@@ -62,12 +61,7 @@ pub async fn readyz(State(state): State<AppState>) -> (StatusCode, Json<Value>) 
             Json(json!({ "ready": false, "reason": "startup_check_pending" })),
         );
     }
-    let ping = tokio::time::timeout(
-        Duration::from_millis(800),
-        sqlx::query("SELECT 1").execute(&state.pool),
-    )
-    .await;
-    if matches!(ping, Ok(Ok(_))) {
+    if state.db_ok_within(crate::tasks::READINESS_WINDOW) {
         (StatusCode::OK, Json(json!({ "ready": true })))
     } else {
         (

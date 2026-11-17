@@ -1,7 +1,8 @@
 //! Shared state, built once at startup.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use sqlx::PgPool;
 use tokio::sync::Semaphore;
@@ -24,6 +25,10 @@ pub struct AppState {
     /// Fault points (drills only).
     pub faults: Arc<Faults>,
     checked: Arc<AtomicBool>,
+    /// When the readiness probe last reached the database, in milliseconds since `born`
+    /// (0: never). `/readyz` reads this instead of querying (D-051).
+    db_ok_at: Arc<AtomicU64>,
+    born: Instant,
 }
 
 impl AppState {
@@ -36,6 +41,8 @@ impl AppState {
             config: Arc::new(config),
             faults: Arc::new(faults),
             checked: Arc::new(AtomicBool::new(false)),
+            db_ok_at: Arc::new(AtomicU64::new(0)),
+            born: Instant::now(),
         }
     }
 
@@ -47,5 +54,23 @@ impl AppState {
     /// Records that the startup check passed.
     pub fn mark_checked(&self) {
         self.checked.store(true, Ordering::Release);
+    }
+
+    fn since_born(&self) -> u64 {
+        u64::try_from(self.born.elapsed().as_millis())
+            .unwrap_or(u64::MAX)
+            .max(1)
+    }
+
+    /// Records that the database answered the readiness probe now.
+    pub fn record_db_ok(&self) {
+        self.db_ok_at.store(self.since_born(), Ordering::Release);
+    }
+
+    /// True when the probe reached the database within `window`.
+    pub fn db_ok_within(&self, window: Duration) -> bool {
+        let at = self.db_ok_at.load(Ordering::Acquire);
+        let window = u64::try_from(window.as_millis()).unwrap_or(u64::MAX);
+        at != 0 && self.since_born().saturating_sub(at) <= window
     }
 }

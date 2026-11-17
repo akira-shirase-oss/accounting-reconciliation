@@ -501,6 +501,17 @@ conservative side.
   RSS measurement of a 50 MiB wide-row file in the load scenario (R1's
   failure case 6). Cost: more, smaller batches for wide files.
 
+- **D-051 — Readiness is cached, not queried per request.** The
+  unauthenticated `/readyz` ran a database round trip per request with no
+  cap, so a flood of probes competed with uploads for the pool. A background
+  probe now reaches the database every 500 ms (800 ms deadline) and records
+  when it last succeeded; `/readyz` answers from that and is red once the
+  last success is older than 1.5 s, so it still goes red within the 2 s the
+  `db-down` drill requires and green within one interval of recovery. Test:
+  `readiness_is_served_from_a_cache_not_a_query_per_probe` (16 s for 20
+  probes before, immediate now); `drill_db_down`. Cost: readiness lags the
+  database by up to 1.5 s.
+
 ## Open questions (blocked on the maintainer or an outside party)
 
 Each is in the README's *Blocked on* table. None blocks R0–R6.
