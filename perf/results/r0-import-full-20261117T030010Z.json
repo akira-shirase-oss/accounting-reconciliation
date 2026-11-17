@@ -1,0 +1,60 @@
+{
+  "checks": {
+    "decision_log_replays": true,
+    "every_file_complete": true,
+    "every_line_exactly_once": true,
+    "fingerprints_unique_per_account": true,
+    "nothing_left_in_staging": true,
+    "repeats_answered_by_the_earlier_import": true
+  },
+  "checks_pass": true,
+  "commit": "af1dceb50ee9b36aeda89e01f65be54d76346963",
+  "generator": "gen-v1",
+  "load_average_after": "03:00:34 up 3 min,  0 users,  load average: 5.46, 2.44, 0.94",
+  "load_average_before": " 03:00:10 up 2 min,  0 users,  load average: 5.14, 2.11, 0.79",
+  "machine": "AMD EPYC 9V74 80-Core Processor, 4 cores, 15 GiB, Linux 7.0.0-1019-azure; PostgreSQL in Docker (deploy/compose.yaml) on the same machine",
+  "mode": "full",
+  "pass": true,
+  "results": {
+    "database_growth_bytes": 983482368,
+    "errors": 0,
+    "file_latency_ms": {
+      "max": 598.0,
+      "p50": 132.0,
+      "p95": 194.0,
+      "p99": 299.0
+    },
+    "first_errors": [],
+    "import_seconds": 17.709,
+    "lines_in_database": 1000000,
+    "lines_per_s": 56469.0,
+    "repeats": 100,
+    "repeats_ok": 100,
+    "replay": {
+      "clients": 200,
+      "decisions": 1100,
+      "imports": 1100,
+      "lines": 1000000
+    },
+    "server_peak_rss_bytes": 31318016
+  },
+  "scenario": "r0-import",
+  "shape": {
+    "accounts": 200,
+    "clients": 200,
+    "files": 1000,
+    "firms": 1,
+    "lines": 1000000,
+    "lines_per_file": 1000,
+    "server_import_concurrency": 8,
+    "workers": 8
+  },
+  "thresholds": {
+    "errors_max": 0,
+    "file_p99_ms_max": 3000,
+    "lines_per_s_min": 10000,
+    "server_peak_rss_bytes_max": 268435456
+  },
+  "thresholds_pass": true,
+  "unit": "statement line imported and fingerprinted (D-027, import half)"
+}

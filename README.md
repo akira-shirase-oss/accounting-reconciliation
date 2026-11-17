@@ -1,9 +1,10 @@
 # Accounting Reconciliation
 
-> **Status — in development.** R0, the spine, is built: CI, the pure
+> **Status — in development.** R0, the spine, is done: CI, the pure
 > domain, the import path through staging with its database guards, the
-> `kill-mid-import` and `db-down` drills, and the `r0-import` load scenario
-> (see `docs/ROADMAP.md` for what is proven and what is owed). Nothing here
+> `kill-mid-import` and `db-down` drills, and a 1,000,000-line `r0-import`
+> load run (`perf/results/`; `docs/ROADMAP.md` names the tests, the evidence
+> and what is owed). Nothing here
 > matches documents yet (R2). The ship gate needs one or two real
 > accountants, who have not been found yet (see *Blocked on*).
 
