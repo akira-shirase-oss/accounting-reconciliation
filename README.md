@@ -1,10 +1,11 @@
 # Accounting Reconciliation
 
-> **Status — planned.** Contract documents only; no code yet. Milestone R0
-> (CI, the pure domain, the import spine, its load scenario and its failure
-> drills) needs no outside party and can start when it is scheduled. The
-> ship gate needs one or two real accountants, who have not been found yet
-> (see *Blocked on*).
+> **Status — in development.** R0, the spine, is built: CI, the pure
+> domain, the import path through staging with its database guards, the
+> `kill-mid-import` and `db-down` drills, and the `r0-import` load scenario
+> (see `docs/ROADMAP.md` for what is proven and what is owed). Nothing here
+> matches documents yet (R2). The ship gate needs one or two real
+> accountants, who have not been found yet (see *Blocked on*).
 
 Bank statements and invoices in; every bank line out as matched, excluded
 or an exception — each with a decision you can explain. A reconciliation
@@ -55,7 +56,21 @@ in `docs/DECISIONS.md`.
   R3 review, rules and periods → R4 the model for ambiguous cases → R5
   reports and workspace → R6 evidence battery → R7 pilot and ship gate →
   R8 India → R9 PDF
-- `docs/DECISIONS.md` — D-001 to D-035 and the questions still open
+- `docs/DECISIONS.md` — D-001 to D-045 and the questions still open
+
+## Running it (R0)
+
+```sh
+scripts/stack.sh up        # PostgreSQL 18.7 on 127.0.0.1:62432 (compose project accounting-reconciliation)
+scripts/stack.sh setup     # roles recon_owner / recon_runtime / recon_app, database recon, migrations
+eval "$(scripts/stack.sh env)"
+RECON_OPERATOR_TOKEN=$(openssl rand -hex 24) cargo run -p recon-server   # 127.0.0.1:62480
+scripts/check.sh           # what CI runs: fmt, clippy, architecture, tests, drills, cargo-deny
+```
+
+Prefix cargo with `export PATH="$(brew --prefix rustup)/bin:$PATH"` on a
+machine where Homebrew's cargo shadows rustup (the toolchain is pinned to
+1.99.1).
 
 ## Stack
 

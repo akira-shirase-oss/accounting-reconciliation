@@ -1,7 +1,9 @@
 # Architecture
 
-Planned architecture — no code exists yet. Crate and package names are
-fixed at R0.
+R0 (the spine) is built: `recon-domain`, `recon-import`, `recon-db`,
+`recon-server` and `recon-cli` exist with the behaviour described here for
+imports; the rest of this document is the plan for later milestones.
+`DECISIONS.md` D-036 to D-045 record what R0 decided while building.
 
 ## Sources of truth
 
@@ -138,13 +140,25 @@ with formula escaping; follow-up drafts are text for a person to send.
 - The PDF worker (R9) runs in a rootless container: read-only root, no
   network, no credentials, CPU, memory and wall-time limits.
 
-## Ports (all loopback)
+## Ports (all loopback, 62400–62499 only; D-036)
 
 | Port | Process |
 |---|---|
-| 54432 | PostgreSQL (`deploy/compose.yaml`, compose project `accounting-reconciliation`) |
-| 54080 | `recon-server` API and workspace |
-| 54090 | `recon-server` during load runs (`scripts/load.sh`) |
+| 62432 | PostgreSQL (`deploy/compose.yaml`, compose project `accounting-reconciliation`) |
+| 62480 | `recon-server` API (and the workspace, from R3) |
+| 62490 | `recon-server` during load runs (`scripts/load.sh`) |
+| 62400–62479 | test servers and the `db-down` drill's proxy |
+
+## Database roles (D-037)
+
+The cluster administrator only creates roles and databases (`recon db
+setup`). `recon_owner` owns the database, schema `recon` and every object,
+and only migrates (`recon db migrate`). The server logs in as `recon_app`
+(member of `recon_runtime`): `SELECT` and `INSERT`, column-level `UPDATE` on
+imports, `DELETE` on the staging table, nothing else — no superuser,
+ownership, `TRUNCATE`, DDL or `TEMP`. Every function pins `search_path =
+pg_catalog, pg_temp`; the server checks its role at startup and refuses to
+serve otherwise.
 
 ## Consistency story
 
@@ -162,15 +176,15 @@ only by a person.
 ## Layout
 
 ```
-crates/      recon-domain, recon-import, recon-match, recon-db,
-             recon-model, recon-server, recon-cli
+crates/      recon-domain, recon-import, recon-db, recon-server, recon-cli
+             (R0); recon-match (R2), recon-model (R4)
 apps/        workspace          (SvelteKit, static, same-origin served)
 packages/    ui                 (this repository's copy of the Colophon UI)
 workers/     pdf                (R9)
 docs/        END_GOAL, ARCHITECTURE, ROADMAP, DECISIONS
 fixtures/    generator seeds, labelled sets, hostile-files, injection,
              model-wrong-match, recorded model responses, import profiles
-perf/        load scenarios and results (machine + commit on every run)
+perf/        loadgen (the load driver), results (machine + commit on every run)
 scripts/     check.sh (what CI runs), stack.sh, load.sh, drills
 ```
 

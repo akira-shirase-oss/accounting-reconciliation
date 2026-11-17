@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/recon-domain", "crates/recon-import", "crates/recon-db", "crates/recon-cli"]
+members = ["crates/*", "perf/loadgen"]
 resolver = "3"
 
 [workspace.package]
@@ -38,6 +38,8 @@ tower-http = { version = "0.7.1", features = ["request-id", "trace", "timeout", 
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 uuid = { version = "1.29", features = ["serde"] }
+# Test-only: a streamed request body in the db-down drill.
+tokio-stream = "0.1.19"
 # Test and load-driver HTTP client only (dev-dependencies and perf/loadgen); the
 # architecture check keeps it out of every production crate.
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "stream"] }
@@ -65,8 +67,13 @@ allow_attributes_without_reason = "deny"
 [profile.release]
 debug = "line-tables-only"
 
-# Property tests and the generator are hot in debug test builds.
+# The parser, hashing and property tests are hot in debug test builds (the drills stream
+# 200,000-row files through a debug server).
 [profile.dev.package.sha2]
 opt-level = 3
 [profile.dev.package.proptest]
 opt-level = 3
+[profile.dev.package.recon-import]
+opt-level = 2
+[profile.dev.package.recon-domain]
+opt-level = 2

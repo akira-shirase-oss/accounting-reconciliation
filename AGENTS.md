@@ -5,9 +5,10 @@ documents normalized into one schema, deterministic matching first, a
 model only as a proposer for ambiguous cases, approval gates, explicit
 versioned rules and an append-only audit trail. Rust + Axum + Tokio + SQLx
 over PostgreSQL; a SvelteKit workspace. There is no engineering guide:
-`docs/END_GOAL.md` and `docs/DECISIONS.md` are the contract. Status:
-planned — no code; R0 can start when scheduled; the ship gate is blocked on
-pilot accountants (README, *Blocked on*).
+`docs/END_GOAL.md` and `docs/DECISIONS.md` are the contract. Status: R0
+(the spine) built — see `docs/ROADMAP.md` for what is proven and owed; the
+ship gate is blocked on pilot accountants (README, *Blocked on*). The local
+stack, ports and database roles are D-036 and D-037.
 
 ## Read first
 
@@ -16,7 +17,7 @@ pilot accountants (README, *Blocked on*).
    test and pass condition), the ship gate.
 2. `docs/ARCHITECTURE.md` — sources of truth, components, data model,
    paths, egress and keys, consistency, layout.
-3. `docs/DECISIONS.md` — D-001 to D-035 and the open questions; do not
+3. `docs/DECISIONS.md` — D-001 to D-045 and the open questions; do not
    silently resolve an open question — record a new D-NNN when one is
    decided.
 4. `docs/ROADMAP.md` — R0–R9; each milestone's gate is its proof, and the

@@ -287,3 +287,47 @@ async fn a_stale_process_is_fenced_out_and_the_sweeper_discards_its_import() {
     replay_ok(&db, account.firm).await;
     db.cleanup().await;
 }
+
+/// Regression (D-043): the flip was quadratic twice over — an anti-join against its own
+/// `inserted` CTE, then, on a fresh database whose tables have no statistics, nested loops
+/// that walked every index entry the statement itself inserted (over 120 s for 30,000 rows;
+/// 0.46 s as a hash join). This test runs on a fresh, never-analyzed database: 30,000 rows
+/// under a 20 s statement deadline fail either version and pass the linear one with a wide
+/// margin even on a busy machine.
+#[tokio::test]
+async fn a_large_flip_is_linear_not_quadratic() {
+    let db = TestDb::new().await;
+    let account = tenant(&db.pool).await;
+    let bytes = format!("{HEADER}{}", rows(0, 30_000));
+    let mut parser = StatementParser::new(AccountContext {
+        account: account.id,
+        currency: account.currency,
+    });
+    let mut lines = vec![];
+    parser
+        .push(bytes.as_bytes(), &mut |l| lines.push(l))
+        .unwrap();
+    let summary = parser.finish(&mut |l| lines.push(l)).unwrap();
+    let mut staging = imports::begin(&db.pool, &account, LEASE).await.unwrap();
+    for batch in lines.chunks(imports::STAGING_BATCH_ROWS) {
+        imports::stage(&db.pool, &mut staging, batch, LEASE)
+            .await
+            .unwrap();
+    }
+    let started = std::time::Instant::now();
+    let flipped = imports::flip(
+        &db.pool,
+        staging,
+        &summary,
+        OPERATOR,
+        &NoHook,
+        Duration::from_secs(20),
+    )
+    .await;
+    let FlipOutcome::Complete(record) = flipped.unwrap() else {
+        panic!("expected a complete import")
+    };
+    eprintln!("flip of 30,000 rows took {:?}", started.elapsed());
+    assert_eq!(record.lines_created, Some(30_000));
+    db.cleanup().await;
+}

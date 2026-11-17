@@ -309,6 +309,118 @@ conservative side.
   every decision and proposal; a change to any of them is measured on the
   labelled set before release.
 
+## Built in R0 (2026-11-16)
+
+- **D-036 — Local stack and ports.** The project's own compose project
+  `accounting-reconciliation` runs PostgreSQL 18.7 (pinned by digest) on
+  `127.0.0.1:62432`, with TLS on (the image's self-signed certificate) so the
+  rustls path that Neon-style `sslmode=require` URLs use is tested, and bind
+  parameters kept out of PostgreSQL's own log. Every port of this project is
+  in 62400–62499: the server on 62480, load runs on 62490, test servers and
+  the drill proxy on 62400–62479. This replaces the 54xxx ports first planned
+  in `ARCHITECTURE.md`, which other projects' ranges crowd. CI starts the same
+  compose file rather than a service container. Cost: none.
+- **D-037 — Three database roles; the server is never the owner.** The
+  cluster administrator only creates roles and databases (`recon db setup`);
+  `recon_owner` owns the database, schema and every object and only migrates
+  (`recon db migrate`); the server logs in as `recon_app`, a member of
+  `recon_runtime`, which holds only `SELECT`/`INSERT` (plus column-level
+  `UPDATE` on imports and `DELETE` on the staging table) — no superuser,
+  `BYPASSRLS`, ownership, `TRUNCATE`, DDL or `TEMP` (`PUBLIC`'s default
+  `CONNECT` and `TEMP` are revoked on the database). Every function in schema
+  `recon` pins `search_path = pg_catalog, pg_temp` and qualifies what it
+  touches; the chain and flip triggers that need more than the server has
+  are `SECURITY DEFINER` and executable by no one. At startup the server
+  checks its own role, every function's pinned path and the schema version,
+  and exits with `EX_CONFIG` (78) on any problem. Tests: `recon-db`
+  `tests/schema.rs` (`the_runtime_role_has_no_power_beyond_its_grants`,
+  `every_function_pins_search_path_and_the_check_can_fail`,
+  `a_search_path_hijack_cannot_reach_the_chain`) and `recon-server`
+  `tests/startup.rs`. Cost: setup is two commands, and a migration must grant
+  what each new table needs.
+- **D-038 — An import's lines are created by one decision.** Creating a
+  line (none → `unreviewed`) is recorded by the import's completion
+  decision, whose evidence carries the counts and a SHA-256 over every row's
+  fingerprint in row order; per-line decisions begin with the first later
+  transition (R2). Reason: a decision per imported line would double the
+  rows written and serialize a million chain-lock updates per client for no
+  information the import's digest does not already pin. The replay check
+  recomputes each complete import's digest and counts from its lines and
+  duplicates, and derives every line's state from its decisions
+  (`unreviewed` until its first). Refused and discarded imports get their
+  own decisions. Cost: explaining a line starts from its import's decision,
+  not a decision of its own.
+- **D-039 — Staging is unlogged and the flip verifies it; file identity is
+  per account.** `recon.import_staging` is `UNLOGGED` (no WAL for rows that
+  are about to be copied): a database crash may empty it, so the flip
+  refuses (`import_interrupted`) unless every staged row is present, and a
+  lost row can never become a partial import. Flips into one account are
+  serialized by a transaction advisory lock, so duplicate detection never
+  races. A file's identity is (firm, account, SHA-256); the same file again
+  answers with the earlier import. In R0 a row whose fingerprint an earlier
+  line of the account already has is recorded as a duplicate naming that
+  line and not inserted; overlap and revision detection (D-009) remain R1.
+  Cost: a crash during staging means uploading the file again.
+- **D-040 — The R0 profile and the identity definitions, v1.**
+  `r0-generic-csv` v1: UTF-8, the header exactly `booking_date, value_date,
+  amount, currency, narration, reference, counterparty, balance_after`, ISO
+  dates, plain decimals with at most the currency's places, the account's
+  currency on every row, zero amounts refused, control, byte-order-mark and
+  bidirectional-override characters refused in every field.
+  `normalization v1` collapses runs of space and no-break spaces, trims and
+  upper-cases ASCII only, so no toolchain's Unicode tables can change a
+  fingerprint. `fingerprint v1` is SHA-256 over a length-prefixed tuple, then
+  over the tuple hash and the occurrence index (`recon-domain::fingerprint`,
+  pinned by an independent computation, and equal to the SQL flip's by test).
+  Cost: R1 profiles must translate other layouts into these fields, and any
+  change to a definition is a new version.
+- **D-041 — An operator token until sessions exist.** R0 has no users
+  signing in; `/v1` requires `Authorization: Bearer` with
+  `RECON_OPERATOR_TOKEN` (at least 32 characters, compared in constant time,
+  never logged), and decisions record actor `operator`. The server binds
+  loopback by default. Sessions, TOTP and roles replace it in R3 (D-021).
+  Cost: R0 is not deployable to anyone but the operator.
+- **D-042 — The database computes the chain; Rust verifies it.** A
+  `SECURITY DEFINER` trigger takes the client's chain-head row lock, assigns
+  `seq`, links `prev_hash`, stamps `decided_at` from the database clock and
+  hashes the canonical bytes (v1, documented in `recon-domain::decision`);
+  whatever the caller sent for those columns is ignored. `recon audit verify`
+  recomputes every hash in Rust in constant memory and also checks that the
+  stored head is the chain's last record, so a removed tail is caught.
+  Evidence is `bytea` (canonical JSON now, ciphertext once D-019's
+  per-client encryption lands), so the hash never depends on JSON
+  formatting. Cost: the encoding is defined twice, held equal by a test.
+- **D-043 — The flip's plan does not depend on statistics.** Measured on the
+  development machine: an anti-join against the flip's own `inserted` CTE
+  was quadratic (3.5 s for 2,000 rows, over 60 s for 20,000), and on a fresh
+  database the planner, seeing empty never-analyzed tables, chose nested
+  loops that walked every index entry the statement itself inserted (over
+  120 s for 30,000 rows). The runtime role cannot `ANALYZE` (it owns
+  nothing), so the flip's transaction runs with `enable_nestloop = off`: its
+  joins are hash or merge joins, one pass over the account's lines (0.46 s
+  for 30,000 rows on a fresh database); the `ON CONFLICT` and foreign-key
+  probes use their indexes regardless. The replay check uses joins, not
+  per-line probes, for the same reason. Test:
+  `a_large_flip_is_linear_not_quadratic`. Cost: a flip into an account with
+  many lines scans them once (linear in the account's size).
+- **D-044 — Leases outlive the work that renews them.** A staged batch runs
+  under a lock on its import (the sweeper skips locked rows) and extends the
+  lease from the clock *after* the insert; between batches the server renews
+  every third of the lease, waking from the body wait to do so. Found by the
+  kill drill on a loaded machine: a 5,000-row batch took 13.6 s, longer than
+  the lease, and a lease computed from the statement's start was already
+  over when it committed. Test: `a_slow_upload_keeps_its_lease_until_the_
+  parse_deadline` (fails without the fix). Defaults: lease 30 s, body idle
+  15 s, parse deadline 60 s; the drills use 5 s.
+- **D-045 — The load driver is Rust.** `perf/loadgen` streams generated
+  statements as files, verifies the database afterwards (exact line count,
+  unique fingerprints, nothing staged, the replay check) and reads the
+  server's peak RSS from `/usr/bin/time`. A request-rate tool like k6 fits
+  the review API's 1,000,000-request run (R3), not a line-import run whose
+  unit is a statement line. It is a workspace member but not a production
+  crate: the HTTP-client architecture rule exempts it. Cost: one more binary
+  to build for a load run.
+
 ## Open questions (blocked on the maintainer or an outside party)
 
 Each is in the README's *Blocked on* table. None blocks R0–R6.

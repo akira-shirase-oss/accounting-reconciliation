@@ -195,8 +195,62 @@ pub async fn begin(
     })
 }
 
+/// One batch as column arrays for `unnest`.
+struct Columns<'a> {
+    row_no: Vec<i32>,
+    booking: Vec<time::Date>,
+    value: Vec<Option<time::Date>>,
+    amount: Vec<i64>,
+    narration_raw: Vec<&'a str>,
+    narration_norm: Vec<&'a str>,
+    reference: Vec<Option<&'a str>>,
+    counterparty_raw: Vec<Option<&'a str>>,
+    counterparty_norm: Vec<Option<&'a str>>,
+    balance: Vec<Option<i64>>,
+    tuple: Vec<&'a [u8]>,
+}
+
+impl<'a> Columns<'a> {
+    fn from_rows(rows: &'a [NewLine], currency: Currency) -> Result<Self, DbError> {
+        let n = rows.len();
+        let mut c = Self {
+            row_no: Vec::with_capacity(n),
+            booking: Vec::with_capacity(n),
+            value: Vec::with_capacity(n),
+            amount: Vec::with_capacity(n),
+            narration_raw: Vec::with_capacity(n),
+            narration_norm: Vec::with_capacity(n),
+            reference: Vec::with_capacity(n),
+            counterparty_raw: Vec::with_capacity(n),
+            counterparty_norm: Vec::with_capacity(n),
+            balance: Vec::with_capacity(n),
+            tuple: Vec::with_capacity(n),
+        };
+        for r in rows {
+            if r.amount.currency() != currency {
+                return Err(DbError::Inconsistent(
+                    "row currency is not the account's".into(),
+                ));
+            }
+            c.row_no.push(count_i32(r.row)?);
+            c.booking.push(date(r.booking_date)?);
+            c.value.push(r.value_date.map(date).transpose()?);
+            c.amount.push(r.amount.minor());
+            c.narration_raw.push(r.narration_raw.as_str());
+            c.narration_norm.push(r.narration_norm.as_str());
+            c.reference.push(r.reference.as_deref());
+            c.counterparty_raw.push(r.counterparty_raw.as_deref());
+            c.counterparty_norm.push(r.counterparty_norm.as_deref());
+            c.balance
+                .push(r.balance_after.map(recon_domain::Money::minor));
+            c.tuple.push(r.tuple_hash.0.as_slice());
+        }
+        Ok(c)
+    }
+}
+
 /// Stages one batch (at most [`STAGING_BATCH_ROWS`] rows) and renews the lease, in one
-/// statement. Refused with [`DbError::LeaseLost`] when the lease is gone.
+/// transaction. Refused with [`DbError::LeaseLost`] when the lease is gone.
 pub async fn stage(
     pool: &PgPool,
     import: &mut StagingImport,
@@ -207,86 +261,99 @@ pub async fn stage(
         return Ok(());
     }
     let n = rows.len();
-    let mut row_no = Vec::with_capacity(n);
-    let mut booking = Vec::with_capacity(n);
-    let mut value = Vec::with_capacity(n);
-    let mut amount = Vec::with_capacity(n);
-    let mut narration_raw = Vec::with_capacity(n);
-    let mut narration_norm = Vec::with_capacity(n);
-    let mut reference = Vec::with_capacity(n);
-    let mut counterparty_raw = Vec::with_capacity(n);
-    let mut counterparty_norm = Vec::with_capacity(n);
-    let mut balance = Vec::with_capacity(n);
-    let mut tuple = Vec::with_capacity(n);
-    for r in rows {
-        if r.amount.currency() != import.currency {
-            return Err(DbError::Inconsistent(
-                "row currency is not the account's".into(),
-            ));
-        }
-        row_no.push(count_i32(r.row)?);
-        booking.push(date(r.booking_date)?);
-        value.push(r.value_date.map(date).transpose()?);
-        amount.push(r.amount.minor());
-        narration_raw.push(r.narration_raw.as_str());
-        narration_norm.push(r.narration_norm.as_str());
-        reference.push(r.reference.as_deref());
-        counterparty_raw.push(r.counterparty_raw.as_deref());
-        counterparty_norm.push(r.counterparty_norm.as_deref());
-        balance.push(r.balance_after.map(recon_domain::Money::minor));
-        tuple.push(r.tuple_hash.0.as_slice());
-    }
+    let c = Columns::from_rows(rows, import.currency)?;
     let batch = u32::try_from(n).map_err(|_| DbError::Inconsistent("batch too large".into()))?;
+    // Fenced and locked first: the sweeper skips a locked import, so a slow batch cannot
+    // be reaped mid-way. The lease is extended from the clock after the insert, so it
+    // always outlives the batch that renewed it (a batch can take longer than a lease on a
+    // loaded machine; a lease computed from the statement's start would already be over).
+    let mut tx = pool.begin().await?;
+    let live: Option<i32> = sqlx::query_scalar(
+        "SELECT 1 FROM recon.imports
+          WHERE firm_id = $1 AND id = $2 AND lease_token = $3
+            AND status = 'staging' AND lease_until > pg_catalog.clock_timestamp()
+            FOR UPDATE",
+    )
+    .bind(import.firm.as_uuid())
+    .bind(import.id.as_uuid())
+    .bind(import.lease_token)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if live.is_none() {
+        return Err(DbError::LeaseLost);
+    }
     let inserted = sqlx::query(
-        "WITH lease AS (
-             UPDATE recon.imports
-                SET lease_until = now() + ($4::bigint * interval '1 millisecond'),
-                    staged_rows = staged_rows + $5
-              WHERE firm_id = $1 AND id = $2 AND lease_token = $3
-                AND status = 'staging' AND lease_until > now()
-             RETURNING 1)
-         INSERT INTO recon.import_staging
+        "INSERT INTO recon.import_staging
              (firm_id, import_id, row_no, booking_date, value_date, amount_minor, narration_raw,
               narration_norm, reference, counterparty_raw, counterparty_norm,
               balance_after_minor, tuple_hash)
          SELECT $1, $2, t.*
            FROM ROWS FROM (
-                    pg_catalog.unnest($6::int4[]), pg_catalog.unnest($7::date[]),
-                    pg_catalog.unnest($8::date[]), pg_catalog.unnest($9::int8[]),
-                    pg_catalog.unnest($10::text[]), pg_catalog.unnest($11::text[]),
-                    pg_catalog.unnest($12::text[]), pg_catalog.unnest($13::text[]),
-                    pg_catalog.unnest($14::text[]), pg_catalog.unnest($15::int8[]),
-                    pg_catalog.unnest($16::bytea[])) AS t
-          WHERE EXISTS (SELECT 1 FROM lease)",
+                    pg_catalog.unnest($3::int4[]), pg_catalog.unnest($4::date[]),
+                    pg_catalog.unnest($5::date[]), pg_catalog.unnest($6::int8[]),
+                    pg_catalog.unnest($7::text[]), pg_catalog.unnest($8::text[]),
+                    pg_catalog.unnest($9::text[]), pg_catalog.unnest($10::text[]),
+                    pg_catalog.unnest($11::text[]), pg_catalog.unnest($12::int8[]),
+                    pg_catalog.unnest($13::bytea[])) AS t",
+    )
+    .bind(import.firm.as_uuid())
+    .bind(import.id.as_uuid())
+    .bind(&c.row_no)
+    .bind(&c.booking)
+    .bind(&c.value)
+    .bind(&c.amount)
+    .bind(&c.narration_raw)
+    .bind(&c.narration_norm)
+    .bind(&c.reference)
+    .bind(&c.counterparty_raw)
+    .bind(&c.counterparty_norm)
+    .bind(&c.balance)
+    .bind(&c.tuple)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if inserted != u64::from(batch) {
+        return Err(DbError::Inconsistent(
+            "a staged batch was partly inserted".into(),
+        ));
+    }
+    sqlx::query(
+        "UPDATE recon.imports
+            SET lease_until = pg_catalog.clock_timestamp() + ($4::bigint * interval '1 millisecond'),
+                staged_rows = staged_rows + $5
+          WHERE firm_id = $1 AND id = $2 AND lease_token = $3",
     )
     .bind(import.firm.as_uuid())
     .bind(import.id.as_uuid())
     .bind(import.lease_token)
     .bind(millis(lease))
     .bind(count_i32(batch)?)
-    .bind(&row_no)
-    .bind(&booking)
-    .bind(&value)
-    .bind(&amount)
-    .bind(&narration_raw)
-    .bind(&narration_norm)
-    .bind(&reference)
-    .bind(&counterparty_raw)
-    .bind(&counterparty_norm)
-    .bind(&balance)
-    .bind(&tuple)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    import.staged_rows = import.staged_rows.saturating_add(batch);
+    Ok(())
+}
+
+/// Renews the lease without staging (an upload slower than a batch per lease period).
+/// Refused with [`DbError::LeaseLost`] when the lease is already gone.
+pub async fn renew(pool: &PgPool, import: &StagingImport, lease: Duration) -> Result<(), DbError> {
+    let renewed = sqlx::query(
+        "UPDATE recon.imports
+            SET lease_until = pg_catalog.clock_timestamp() + ($4::bigint * interval '1 millisecond')
+          WHERE firm_id = $1 AND id = $2 AND lease_token = $3
+            AND status = 'staging' AND lease_until > pg_catalog.clock_timestamp()",
+    )
+    .bind(import.firm.as_uuid())
+    .bind(import.id.as_uuid())
+    .bind(import.lease_token)
+    .bind(millis(lease))
     .execute(pool)
     .await?
     .rows_affected();
-    if inserted == 0 {
+    if renewed == 0 {
         return Err(DbError::LeaseLost);
     }
-    if inserted != u64::from(batch) {
-        return Err(DbError::Inconsistent(
-            "a staged batch was partly inserted".into(),
-        ));
-    }
-    import.staged_rows = import.staged_rows.saturating_add(batch);
     Ok(())
 }
 
@@ -348,6 +415,14 @@ pub async fn flip<H: FlipHook>(
     )))
     .execute(&mut *tx)
     .await?;
+    // No nested loops in the flip (D-043): the staging table is never analyzed (the runtime
+    // role cannot) and a fresh account's lines look empty to the planner, which then picks
+    // nested loops that walk every index entry this statement inserts - quadratic (over
+    // 120 s for 30,000 rows on a fresh database, 0.46 s with a hash join). Its joins are
+    // all bulk joins; the ON CONFLICT and foreign-key probes use their indexes regardless.
+    sqlx::query("SET LOCAL enable_nestloop = off")
+        .execute(&mut *tx)
+        .await?;
     // Imports into one account are serialized, so duplicate detection never races.
     sqlx::query(
         "SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended($1::text, 7262))",
@@ -483,13 +558,16 @@ async fn insert_lines(
              ON CONFLICT (firm_id, account_id, fingerprint) DO NOTHING
              RETURNING row_no
          ),
+         -- Every CTE reads the snapshot from before this statement, so this join sees only
+         -- lines that existed before (never this import's): exactly the rows ON CONFLICT
+         -- skipped. The flip runs with nested loops disabled (see `flip`), so this is a hash
+         -- or merge join: one pass over the account's lines.
          dups AS (
              INSERT INTO recon.import_duplicates (firm_id, import_id, row_no, existing_line_id)
              SELECT $1, $2, fp.row_no, l.id
                FROM fp
                JOIN recon.statement_lines l
                  ON l.firm_id = $1 AND l.account_id = $4 AND l.fingerprint = fp.fingerprint
-              WHERE NOT EXISTS (SELECT 1 FROM inserted i WHERE i.row_no = fp.row_no)
              RETURNING row_no
          )
          SELECT (SELECT count(*) FROM inserted) AS lines_created,

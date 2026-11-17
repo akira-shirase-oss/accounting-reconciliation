@@ -84,14 +84,18 @@ impl TestDb {
             .expect("creating the test database");
         admin.close().await.ok();
         let owner_url = url_for(&admin_url, &name, crate::roles::OWNER, OWNER_PASSWORD, None);
-        let mut owner = PgConnection::connect(&owner_url)
+        // A pool (not a bare connection): sqlx's `Acquire` for `&mut PgConnection` makes the
+        // future too lifetime-specific to spawn, and drills spawn TestDb in tasks.
+        let owner = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&owner_url)
             .await
             .expect("connecting as recon_owner");
         crate::migrator()
-            .run(&mut owner)
+            .run(&owner)
             .await
             .expect("migrating the test database as its owner");
-        owner.close().await.ok();
+        owner.close().await;
         let app_url = url_for(&admin_url, &name, crate::roles::APP, APP_PASSWORD, None);
         let options = crate::pool::connect_options(&app_url, &crate::PoolSettings::default())
             .expect("invariant: the test url parses");

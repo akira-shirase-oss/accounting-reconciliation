@@ -163,15 +163,20 @@ async fn check_imports(pool: &PgPool, firm: FirmId, report: &mut ReplayReport) -
 }
 
 async fn check_lines(pool: &PgPool, firm: FirmId, report: &mut ReplayReport) -> Checked {
+    // One pass each over the firm's lines and its line decisions (a join, not a correlated
+    // probe per line: statistics may be missing, D-043).
     let lines = sqlx::query(
-        "SELECT count(*) AS total,
+        "WITH latest AS (
+             SELECT DISTINCT ON (d.subject_id) d.subject_id, d.to_state
+               FROM recon.decision_log d
+              WHERE d.firm_id = $1 AND d.subject_kind = 'line'
+              ORDER BY d.subject_id, d.seq DESC)
+         SELECT count(*) AS total,
                 count(*) FILTER (WHERE i.status IS DISTINCT FROM 'complete') AS orphaned,
-                count(*) FILTER (WHERE l.status <> coalesce(
-                    (SELECT d.to_state FROM recon.decision_log d
-                      WHERE d.firm_id = l.firm_id AND d.subject_kind = 'line' AND d.subject_id = l.id
-                      ORDER BY d.seq DESC LIMIT 1), 'unreviewed')) AS diverged
+                count(*) FILTER (WHERE l.status <> coalesce(latest.to_state, 'unreviewed')) AS diverged
            FROM recon.statement_lines l
            LEFT JOIN recon.imports i ON i.firm_id = l.firm_id AND i.id = l.import_id
+           LEFT JOIN latest ON latest.subject_id = l.id
           WHERE l.firm_id = $1",
     )
     .bind(firm.as_uuid())
