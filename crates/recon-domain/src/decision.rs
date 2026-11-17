@@ -171,6 +171,9 @@ pub enum BreakKind {
     PreviousHashMismatch,
     /// `record_hash` is not the hash of the record's canonical bytes.
     RecordHashMismatch,
+    /// The chain verifies, but the stored head (sequence or hash) is not its last record:
+    /// records were removed from the end, or the head was rewritten.
+    HeadMismatch,
 }
 
 /// The first broken link: `recon audit verify` names it.
