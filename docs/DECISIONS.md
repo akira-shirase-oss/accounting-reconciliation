@@ -421,6 +421,27 @@ conservative side.
   crate: the HTTP-client architecture rule exempts it. Cost: one more binary
   to build for a load run.
 
+## Fixed after the R0 review (2026-11-16)
+
+- **D-046 — A chain head always names a real record.** The chain trigger
+  must run BEFORE INSERT (it assigns `seq`, `prev_hash`, `decided_at` and
+  `record_hash`, and a multi-row insert needs each row to see the previous
+  row's head), but PostgreSQL fires it before an `ON CONFLICT` check: `INSERT
+  … ON CONFLICT DO NOTHING` with an existing decision id inserted nothing yet
+  moved the head to a record that did not exist, a permanent break the
+  runtime role could cause. Migration 2 makes the trigger refuse an id the
+  firm already recorded (`RCA03`, checked after the head lock), adds a
+  deferred constraint trigger that refuses any commit whose head names no
+  decision with that `seq` and hash (`RCA04`: the cross-client race the
+  first check cannot see, or a head moved by hand), and lets a head only
+  move forward. Idempotent decision writes (D-033, R2) must therefore check
+  for the decision first, never rely on `ON CONFLICT`. Tests:
+  `on_conflict_do_nothing_cannot_move_the_chain_head`,
+  `a_racing_duplicate_id_cannot_commit_a_phantom_head`,
+  `a_head_that_names_no_record_cannot_commit`,
+  `concurrent_decisions_keep_every_chain_whole`. Cost: one index probe per
+  decision at insert and one at commit.
+
 ## Open questions (blocked on the maintainer or an outside party)
 
 Each is in the README's *Blocked on* table. None blocks R0–R6.

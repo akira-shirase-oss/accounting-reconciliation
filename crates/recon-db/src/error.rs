@@ -63,9 +63,11 @@ impl DbError {
 }
 
 /// The schema's custom SQLSTATEs and their names.
-const GUARDS: [(&str, &str); 8] = [
+const GUARDS: [(&str, &str); 10] = [
     ("RCA01", "decision_log_append_only"),
     ("RCA02", "no_decision_chain"),
+    ("RCA03", "decision_already_recorded"),
+    ("RCA04", "chain_head_names_no_record"),
     ("RCI01", "import_final"),
     ("RCI02", "import_counts_mismatch"),
     ("RCI03", "import_identity_immutable"),

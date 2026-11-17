@@ -581,3 +581,197 @@ async fn a_new_account_starts_with_an_empty_verified_chain() {
     let _ = OPERATOR;
     db.cleanup().await;
 }
+
+/// H-1 regression: the chain trigger runs BEFORE INSERT and PostgreSQL fires it before the
+/// ON CONFLICT check, so re-inserting an existing decision's id with DO NOTHING used to
+/// insert nothing yet move the head to a record that does not exist — a permanent break the
+/// runtime role could cause. The head must only ever name a real record.
+#[tokio::test]
+async fn on_conflict_do_nothing_cannot_move_the_chain_head() {
+    let db = TestDb::new().await;
+    let account = tenant(&db.pool).await;
+    decide(&db, account.firm, account.client, 3).await;
+    let repro = sqlx::query(
+        "INSERT INTO recon.decision_log (firm_id, client_id, id, subject_kind, subject_id, to_state,
+                actor_kind, actor_ref, reason_code, evidence, engine_version)
+         SELECT firm_id, client_id, id, 'import', subject_id, 'complete', 'operator', 'operator', 'x', ''::bytea, 'v'
+           FROM recon.decision_log WHERE client_id = $1 AND seq = 1
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(account.client.as_uuid())
+    .execute(&db.pool)
+    .await;
+    let head = decisions::verify_chain(&db.pool, account.firm, account.client)
+        .await
+        .unwrap();
+    assert_eq!(
+        head.map(|h| h.seq),
+        Ok(3),
+        "the chain must still verify at seq 3 (the repro returned {repro:?})"
+    );
+    // Refused by name rather than silently skipped.
+    assert_eq!(sqlstate(repro), "RCA03");
+    decide(&db, account.firm, account.client, 1).await;
+    assert_eq!(
+        decisions::verify_chain(&db.pool, account.firm, account.client)
+            .await
+            .unwrap()
+            .map(|h| h.seq),
+        Ok(4)
+    );
+    db.cleanup().await;
+}
+
+/// The race the existence check cannot see: client B re-uses a decision id that client A
+/// has inserted but not yet committed. B's trigger runs (nothing committed to find), then
+/// B's ON CONFLICT waits for A and skips the row. The deferred head check must refuse B's
+/// commit, so no head ever names a record that is not there.
+#[tokio::test]
+async fn a_racing_duplicate_id_cannot_commit_a_phantom_head() {
+    let db = TestDb::new().await;
+    let account = tenant(&db.pool).await;
+    let other = ClientId::from_uuid(Uuid::now_v7());
+    tenancy::create_client(&db.pool, account.firm, other, "Other")
+        .await
+        .unwrap();
+    let id = Uuid::now_v7();
+    let insert = "INSERT INTO recon.decision_log (firm_id, client_id, id, subject_kind, subject_id, to_state,
+            actor_kind, actor_ref, reason_code, evidence, engine_version)
+         VALUES ($1, $2, $3, 'import', $3, 'complete', 'operator', 'operator', 'x', ''::bytea, 'v')
+         ON CONFLICT DO NOTHING";
+    let mut first = db.pool.begin().await.unwrap();
+    sqlx::query(insert)
+        .bind(account.firm.as_uuid())
+        .bind(account.client.as_uuid())
+        .bind(id)
+        .execute(&mut *first)
+        .await
+        .unwrap();
+    let pool = db.pool.clone();
+    let firm = account.firm;
+    let second = tokio::spawn(async move {
+        let mut tx = pool.begin().await.unwrap();
+        let inserted = sqlx::query(insert)
+            .bind(firm.as_uuid())
+            .bind(other.as_uuid())
+            .bind(id)
+            .execute(&mut *tx)
+            .await;
+        let committed = tx.commit().await;
+        (inserted.map(|r| r.rows_affected()), committed)
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    first.commit().await.unwrap();
+    let (inserted, committed) = second.await.unwrap();
+    assert!(
+        inserted.is_err() || committed.is_err(),
+        "the racing duplicate must not commit: {inserted:?} {committed:?}"
+    );
+    assert_eq!(
+        decisions::verify_chain(&db.pool, account.firm, account.client)
+            .await
+            .unwrap()
+            .map(|h| h.seq),
+        Ok(1)
+    );
+    assert_eq!(
+        decisions::verify_chain(&db.pool, account.firm, other)
+            .await
+            .unwrap()
+            .map(|h| h.seq),
+        Ok(0)
+    );
+    db.cleanup().await;
+}
+
+/// A head moved without its record (any path, here the owner) refuses the commit.
+#[tokio::test]
+async fn a_head_that_names_no_record_cannot_commit() {
+    let db = TestDb::new().await;
+    let account = tenant(&db.pool).await;
+    decide(&db, account.firm, account.client, 2).await;
+    let owner = db.owner_pool().await;
+    let mut tx = owner.begin().await.unwrap();
+    sqlx::query("UPDATE recon.chain_heads SET seq = seq + 1 WHERE client_id = $1")
+        .bind(account.client.as_uuid())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let code = tx
+        .commit()
+        .await
+        .unwrap_err()
+        .as_database_error()
+        .and_then(|d| d.code().map(std::borrow::Cow::into_owned));
+    assert_eq!(code.as_deref(), Some("RCA04"));
+    assert_eq!(
+        decisions::verify_chain(&db.pool, account.firm, account.client)
+            .await
+            .unwrap()
+            .map(|h| h.seq),
+        Ok(2)
+    );
+    owner.close().await;
+    db.cleanup().await;
+}
+
+/// Concurrent writers on one chain and on another: every decision lands exactly once, in
+/// order, and both chains verify.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_decisions_keep_every_chain_whole() {
+    let db = TestDb::new().await;
+    let account = tenant(&db.pool).await;
+    let other = ClientId::from_uuid(Uuid::now_v7());
+    tenancy::create_client(&db.pool, account.firm, other, "Other")
+        .await
+        .unwrap();
+    let mut writers = tokio::task::JoinSet::new();
+    for w in 0..12 {
+        let pool = db.pool.clone();
+        let (firm, client) = (
+            account.firm,
+            if w % 3 == 0 { other } else { account.client },
+        );
+        writers.spawn(async move {
+            for _ in 0..10 {
+                let mut tx = pool.begin().await.unwrap();
+                decisions::insert(
+                    &mut tx,
+                    firm,
+                    &NewDecision {
+                        client,
+                        subject_kind: SubjectKind::Line,
+                        subject_id: Uuid::now_v7(),
+                        from_state: Some("unreviewed"),
+                        to_state: "proposed",
+                        actor_kind: ActorKind::Engine,
+                        actor_ref: "engine",
+                        reason_code: "t2_exact_amount",
+                        evidence: b"{}",
+                    },
+                )
+                .await
+                .unwrap();
+                tx.commit().await.unwrap();
+            }
+        });
+    }
+    while let Some(w) = writers.join_next().await {
+        w.unwrap();
+    }
+    assert_eq!(
+        decisions::verify_chain(&db.pool, account.firm, account.client)
+            .await
+            .unwrap()
+            .map(|h| h.seq),
+        Ok(80)
+    );
+    assert_eq!(
+        decisions::verify_chain(&db.pool, account.firm, other)
+            .await
+            .unwrap()
+            .map(|h| h.seq),
+        Ok(40)
+    );
+    db.cleanup().await;
+}
