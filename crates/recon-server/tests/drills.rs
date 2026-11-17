@@ -127,6 +127,16 @@ const DRILL_ENV: [(&str, &str); 3] = [
     ("RECON_DB_MAX_CONNECTIONS", "8"),
 ];
 
+/// The kill drill's servers: `DRILL_ENV` plus a 5 s window to acquire a database connection.
+/// The harness's 1 s suits `db-down` (a prompt 503 is what it tests) but, on a machine at
+/// load average 30, made a kill-drill re-run fail with a false `database_unavailable`.
+const KILL_ENV: [(&str, &str); 4] = [
+    ("RECON_IMPORT_LEASE_MS", "5000"),
+    ("RECON_SWEEP_INTERVAL_MS", "200"),
+    ("RECON_DB_MAX_CONNECTIONS", "8"),
+    ("RECON_DB_ACQUIRE_MS", "5000"),
+];
+
 fn firm_path() -> (String, String) {
     (FIRM.to_string(), ACCOUNT.to_string())
 }
@@ -135,7 +145,7 @@ fn firm_path() -> (String, String) {
 async fn reference_digest(file: &Arc<Vec<u8>>, rows: i64) -> String {
     let db = TestDb::new().await;
     fixed_tenant(&db).await;
-    let server = Server::start(&db.app_url(), &DRILL_ENV).await;
+    let server = Server::start(&db.app_url(), &KILL_ENV).await;
     let (firm, account) = firm_path();
     let (status, body) = upload(&server.base, &firm, &account, file.to_vec())
         .await
@@ -163,7 +173,7 @@ async fn kill_at(point: String, file: Arc<Vec<u8>>, rows: i64, reference: Arc<St
         std::process::id(),
         Uuid::now_v7()
     ));
-    let mut env = DRILL_ENV.to_vec();
+    let mut env = KILL_ENV.to_vec();
     let marker_text = marker.display().to_string();
     env.push(("RECON_FAULT", point.as_str()));
     env.push(("RECON_FAULT_MARKER", marker_text.as_str()));
@@ -204,7 +214,7 @@ async fn kill_at(point: String, file: Arc<Vec<u8>>, rows: i64, reference: Arc<St
     }
 
     // A fresh process: the re-run completes exactly once.
-    let server = Server::start(&db.app_url(), &DRILL_ENV).await;
+    let server = Server::start(&db.app_url(), &KILL_ENV).await;
     let (firm, account) = firm_path();
     let (status, body) = upload(&server.base, &firm, &account, file.to_vec())
         .await
