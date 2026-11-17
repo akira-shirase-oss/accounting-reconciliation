@@ -553,3 +553,27 @@ async fn readiness_is_served_from_a_cache_not_a_query_per_probe() {
         "20 probes took {elapsed:?}: each one queried the database"
     );
 }
+
+/// L-5 regression: a client's `x-request-id` was kept and written to the log as sent, so
+/// client-chosen text reached the log. The server always makes its own.
+#[tokio::test]
+async fn the_server_always_makes_its_own_request_id() {
+    let db = TestDb::new().await;
+    let state = state(&db, &[]);
+    let request = Request::get("/healthz")
+        .header("x-request-id", "attacker chosen text NARRATIVE-LEAK")
+        .body(Body::empty())
+        .unwrap();
+    let response = router(state.clone()).oneshot(request).await.unwrap();
+    let id = response
+        .headers()
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        id.parse::<Uuid>().is_ok(),
+        "the request id is not the server's: {id:?}"
+    );
+    db.cleanup().await;
+}

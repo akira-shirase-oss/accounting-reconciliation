@@ -67,6 +67,13 @@ fn panic_response(_panic: Box<dyn std::any::Any + Send + 'static>) -> Response {
     ApiError::internal().into_response()
 }
 
+/// Drops any client-supplied `x-request-id`, so the id in the log is always the server's
+/// (D-055).
+async fn strip_request_id(mut request: Request) -> Request {
+    request.headers_mut().remove("x-request-id");
+    request
+}
+
 /// `/v1` requires `Authorization: Bearer <operator token>` (constant-time comparison).
 async fn require_operator(State(state): State<AppState>, request: Request, next: Next) -> Response {
     let presented = request
@@ -83,7 +90,8 @@ async fn require_operator(State(state): State<AppState>, request: Request, next:
     }
 }
 
-/// The application with its middleware, outermost first: request id → propagate it →
+/// The application with its middleware, outermost first: drop the client's request id →
+/// set the server's → propagate it →
 /// trace (method, route, status, latency; never headers or bodies) → catch panics into the
 /// envelope → the overall deadline → shed requests beyond the in-flight limit → body limits.
 pub fn router(state: AppState) -> Router {
@@ -116,6 +124,7 @@ pub fn router(state: AppState) -> Router {
         .layer(DefaultBodyLimit::max(JSON_BODY_LIMIT))
         .layer(
             ServiceBuilder::new()
+                .layer(middleware::map_request(strip_request_id))
                 .layer(SetRequestIdLayer::x_request_id(MakeId))
                 .layer(PropagateRequestIdLayer::x_request_id())
                 .layer(

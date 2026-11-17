@@ -543,6 +543,13 @@ conservative side.
   U+3000) would change fingerprints and waits for a v2 definition. Test:
   `zero_widths_bidi_marks_and_separators_are_forbidden`.
 
+- **D-055 — The request id is always the server's.** The request-id layer
+  kept a client's `x-request-id` and the trace span logged it as sent, so
+  client-chosen text up to the header limit reached the log (D-025). The
+  server now drops any incoming `x-request-id` and always sets a UUIDv7. Test:
+  `the_server_always_makes_its_own_request_id`. Cost: a caller cannot
+  correlate by its own id; it reads the server's from the response.
+
 ## Open questions (blocked on the maintainer or an outside party)
 
 Each is in the README's *Blocked on* table. None blocks R0–R6.
