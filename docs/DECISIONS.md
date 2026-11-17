@@ -641,6 +641,68 @@ conservative side.
   profile's name, version and the SHA-256 of its canonical JSON. Cost: every bank layout
   needs a profile someone writes once; nothing is auto-detected.
 
+- **D-063 — OFX statements, profile `ofx` v1.** OFX 1.x (the `OFXHEADER:100` header,
+  then SGML whose leaves have no end tags) and 2.x (XML) are read by one streaming
+  tokenizer, uploaded as `application/x-ofx` with `profile=ofx`. Nothing is declared,
+  expanded or resolved: any `<!` markup (DTD, entity declaration, comment, CDATA) refuses
+  the file at once as `declaration_refused`; only the five predefined XML entities and
+  numeric character references are decoded, any other `&name;` (or a bare `&`) is
+  `entity_refused`. The 1.x charset comes from the file's own header (`CHARSET:1252` is
+  Windows-1252); 2.x must be UTF-8 or US-ASCII; anything else is `unsupported_encoding`.
+  Exactly one `STMTRS` or `CCSTMTRS` per file (`multiple_statements` otherwise) whose
+  `CURDEF` is the account's currency; broken structure is `malformed_ofx`. Each `STMTTRN`
+  is a row numbered by its position (so statement lines may now start at row 1): booking
+  date `DTPOSTED`'s calendar date, value date `DTAVAIL`'s, amount `TRNAMT`, the bank
+  reference `FITID` (required), narration `NAME` and `MEMO` joined by a space, counterparty
+  `NAME`; no running balance, so continuity does not apply. Bounds: tag names 32 bytes,
+  values 8 KiB, nesting 32, 4 KiB before `<OFX>`, plus the D-010 file and row limits. Cost:
+  a bank that writes a bare `&` in a name has its file refused; it must be fixed or exported
+  as CSV.
+- **D-064 — Document imports.** Sales invoices, purchase bills, receipts, credit notes and
+  book entries are imported per client (`POST …/clients/{c}/document-imports`) through a
+  document profile — the same machinery as statements, plus where the kind comes from (a
+  column of kind codes, or one kind for the file), the currency (a column, or one for the
+  file) and the sign: `signed` (as the bank would see the money) or `by_kind` (magnitudes;
+  invoices and receipts money in, bills and credit notes money out; a book entry has no
+  fixed direction and needs a signed profile). The built-in is `r1-generic-documents` v1.
+  Invoices, bills and credit notes must carry a number. Identity (`document fingerprint
+  v1`): SHA-256 over client, kind, normalized number, issue date, amount, currency and
+  normalized counterparty, plus an occurrence index, so the same export twice, or an
+  overlapping one, adds nothing; the same file answers with the earlier import. A number
+  names one document per (client, kind, counterparty): a later row reusing it in the file,
+  or a row whose number a different stored document has, refuses the file as
+  `document_number_conflict` with its rows (also a unique index, so raw SQL cannot add the
+  second). Documents are immutable in R1; open amounts arrive with matching (R2). Flips of
+  one client's documents are serialized like an account's statements. Cost: a corrected
+  invoice cannot be re-imported until R3 can supersede the old one.
+- **D-065 — Overlap and revisions.** A statement's file is compared at its flip with the
+  live (not superseded) lines of the account in the file's own date range: every stored line
+  there must be in the file by fingerprint. If so, the file completes as before, its rows
+  that existing lines already have recorded as duplicates naming them, and the overlap
+  reported (the dates it shares with earlier imports and how many of its rows fall in
+  them). If not, the file is held as a `revision` (`202`): nothing visible; its rows kept in
+  a logged table (`import_held_rows`, because staging is unlogged and a held revision must
+  survive a crash); every difference listed in order — `removed` (a stored line the file
+  lacks), `added` (a file row in the shared dates no stored line has), `changed` (when
+  exactly one removed line and one added row share a booking date and a reference, or
+  narration when neither has one, with the fields that differ) — and pinned by a digest
+  recorded on the import and in its decision. A person then accepts (`POST …/accept`):
+  the differences are recomputed against the lines as they are now and must match the
+  digest (`409 revision_stale` otherwise); every listed stored line becomes `superseded`,
+  each with its own decision; the file's rows are published as a flip would; the import
+  completes with the count superseded. Or rejects (`POST …/reject`): the held rows are
+  deleted, the import discarded with its decision, the list kept. A line replaced by a
+  revision must still be `unreviewed` in R1 (`409 revision_touches_decided_line`); R3 adds
+  the `source_changed` exception with its match suspended. To make this enforceable for raw
+  SQL too, the runtime role may now update a line's `status` and `row_version` only: a status
+  change must advance the row version (RCL03) and have a decision about that line, to that
+  state, in the same transaction (RCL04, checked at commit); `superseded` is final.
+  Fingerprints are unique among live lines (a partial unique index), so re-importing a
+  superseded version is a new revision, not a silent duplicate. Value date, counterparty
+  and balance are not part of a line's identity: a re-export that changes only them is a
+  duplicate and the stored line keeps the first file's values. Cost: a bank that rewrites
+  narrations between exports produces revisions a person must accept.
+
 ## Open questions (blocked on the maintainer or an outside party)
 
 Each is in the README's *Blocked on* table. None blocks R0–R6.

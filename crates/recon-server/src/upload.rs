@@ -1,27 +1,36 @@
-//! `POST /v1/firms/{firm}/accounts/{account}/imports`: a statement file streamed through the
-//! R0 profile into staging, then published whole by the flip (ARCHITECTURE, *Import*).
+//! Uploads: a statement (CSV through a profile, or OFX) into an account, or a document file
+//! into a client, streamed through its parser into staging, then published whole by the flip
+//! (ARCHITECTURE, *Import*).
 //!
 //! Bounded at every step: one import permit per upload (none free: `503`, never queued);
 //! 50 MiB (by `Content-Length` before reading, and by counting while reading); 60 s to
-//! parse; 15 s of silence between chunks; one staged batch of 5,000 rows in memory, and the
-//! next chunk is not read until it is stored (backpressure). Any refused row refuses the
-//! file and nothing is persisted. A `201` or `200` is sent only after the flip committed;
-//! every other outcome leaves nothing visible.
+//! parse; 15 s of silence between chunks; one staged batch of 5,000 rows or 4 MiB in memory,
+//! under a staging budget shared by every upload, and the next chunk is not read until it is
+//! stored (backpressure). Any refused row refuses the file and nothing is persisted. A `201`
+//! (complete), `200` (the same file again) or `202` (held as a revision, D-065) is sent only
+//! after the flip committed; every other outcome leaves nothing visible.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Json;
 use axum::body::Body;
 use axum::http::{HeaderMap, StatusCode, header};
 use http_body_util::BodyExt as _;
-use recon_db::imports::{self, Actor, FlipOutcome, ImportRecord, Refusal, StagingImport};
+use recon_db::imports::{
+    self, Actor, FlipOutcome, ImportRecord, ProfileId, Refusal, StageRows, StagingImport,
+};
 use recon_db::{DbError, tenancy};
-use recon_domain::import::NewLine;
+use recon_domain::document::NewDocument;
+use recon_domain::import::{NewLine, StagedRow};
 use recon_domain::limits::MAX_UPLOAD_BYTES;
 use recon_domain::line::ActorKind;
 use recon_domain::refusal::RefusalCode;
-use recon_domain::{AccountId, FirmId};
-use recon_import::{AccountContext, FileRefusal, ParseSummary, StatementParser};
+use recon_domain::{AccountId, ClientId, FirmId};
+use recon_import::{
+    AccountContext, CompiledDocuments, CompiledStatement, CsvLimits, DocumentContext,
+    DocumentParser, FileRefusal, OfxParser, ParseSummary, StatementParser,
+};
 use serde_json::{Value, json};
 use tokio::time::Instant;
 
@@ -29,10 +38,121 @@ use crate::error::ApiError;
 use crate::faults::{FaultHook, FaultPoint};
 use crate::state::AppState;
 
-const OPERATOR: Actor<'static> = Actor {
+/// The operator, the only actor until sessions exist (D-041).
+pub const OPERATOR: Actor<'static> = Actor {
     kind: ActorKind::Operator,
     reference: "operator",
 };
+
+/// How a statement file is read.
+#[derive(Debug, Clone)]
+pub enum StatementFormat {
+    /// CSV through a profile.
+    Csv(Arc<CompiledStatement>),
+    /// OFX 1.x or 2.x (profile `ofx` v1).
+    Ofx,
+}
+
+/// The media types an upload of this kind accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Media {
+    /// `text/csv`.
+    Csv,
+    /// `application/x-ofx` or `application/ofx`.
+    Ofx,
+}
+
+impl Media {
+    fn accepts(self, content_type: &str) -> bool {
+        match self {
+            Self::Csv => content_type == "text/csv",
+            Self::Ofx => matches!(content_type, "application/x-ofx" | "application/ofx"),
+        }
+    }
+}
+
+/// A parser the upload loop drives: rows go to `on_row` until one is refused.
+pub trait FileParser: Send {
+    /// The rows it produces.
+    type Row: StageRows;
+    /// Feeds the next chunk.
+    fn push<F: FnMut(Self::Row)>(
+        &mut self,
+        chunk: &[u8],
+        on_row: &mut F,
+    ) -> Result<(), FileRefusal>;
+    /// Ends the file.
+    fn finish<F: FnMut(Self::Row)>(self, on_row: &mut F) -> Result<ParseSummary, FileRefusal>;
+    /// Rows refused so far.
+    fn rows_refused(&self) -> u32;
+    /// Bytes read so far.
+    fn file_bytes(&self) -> u64;
+}
+
+/// A statement parser of either format (boxed: one per upload, and the two differ in size).
+#[derive(Debug)]
+pub enum StatementFile {
+    /// CSV.
+    Csv(Box<StatementParser>),
+    /// OFX.
+    Ofx(Box<OfxParser>),
+}
+
+impl FileParser for StatementFile {
+    type Row = NewLine;
+
+    fn push<F: FnMut(NewLine)>(&mut self, chunk: &[u8], on_row: &mut F) -> Result<(), FileRefusal> {
+        match self {
+            Self::Csv(p) => p.push(chunk, on_row),
+            Self::Ofx(p) => p.push(chunk, on_row),
+        }
+    }
+
+    fn finish<F: FnMut(NewLine)>(self, on_row: &mut F) -> Result<ParseSummary, FileRefusal> {
+        match self {
+            Self::Csv(p) => p.finish(on_row),
+            Self::Ofx(p) => p.finish(on_row),
+        }
+    }
+
+    fn rows_refused(&self) -> u32 {
+        match self {
+            Self::Csv(p) => p.rows_refused(),
+            Self::Ofx(p) => p.rows_refused(),
+        }
+    }
+
+    fn file_bytes(&self) -> u64 {
+        match self {
+            Self::Csv(p) => p.file_bytes(),
+            Self::Ofx(p) => p.file_bytes(),
+        }
+    }
+}
+
+impl FileParser for DocumentParser {
+    type Row = NewDocument;
+
+    fn push<F: FnMut(NewDocument)>(
+        &mut self,
+        chunk: &[u8],
+        on_row: &mut F,
+    ) -> Result<(), FileRefusal> {
+        Self::push(self, chunk, on_row)
+    }
+
+    fn finish<F: FnMut(NewDocument)>(self, on_row: &mut F) -> Result<ParseSummary, FileRefusal> {
+        Self::finish(self, on_row)
+    }
+
+    fn rows_refused(&self) -> u32 {
+        Self::rows_refused(self)
+    }
+
+    fn file_bytes(&self) -> u64 {
+        Self::file_bytes(self)
+    }
+}
 
 /// How reading the body ended.
 enum ReadEnd {
@@ -55,7 +175,7 @@ enum ReadFailure {
 }
 
 /// Checks the request before anything is read: the media type and the declared size.
-pub fn precheck(headers: &HeaderMap) -> Result<(), ApiError> {
+pub fn precheck(headers: &HeaderMap, media: Media) -> Result<(), ApiError> {
     let content_type = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -66,11 +186,11 @@ pub fn precheck(headers: &HeaderMap) -> Result<(), ApiError> {
                 .trim()
                 .to_ascii_lowercase()
         });
-    if content_type.as_deref() != Some("text/csv") {
+    if !content_type.is_some_and(|t| media.accepts(&t)) {
         return Err(ApiError::new(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
             "unsupported_media_type",
-            "statements are uploaded as text/csv",
+            "CSV profiles take text/csv; the ofx profile takes application/x-ofx",
         ));
     }
     let declared = headers
@@ -87,41 +207,83 @@ fn file_too_large() -> ApiError {
     ApiError::new(
         StatusCode::PAYLOAD_TOO_LARGE,
         "file_too_large",
-        "statements are at most 50 MiB",
+        "files are at most 50 MiB",
     )
 }
 
-/// Imports one statement file.
-pub async fn import(
+/// Imports one statement file into `account`.
+pub async fn import_statement(
     state: &AppState,
     firm: FirmId,
     account: AccountId,
+    profile: ProfileId,
+    format: StatementFormat,
+    body: Body,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let account = tenancy::account(&state.pool, firm, account).await?;
+    let context = AccountContext {
+        account: account.id,
+        currency: account.currency,
+    };
+    let parser = match format {
+        StatementFormat::Csv(p) => StatementFile::Csv(Box::new(StatementParser::with_profile(
+            context,
+            p,
+            CsvLimits::default(),
+        ))),
+        StatementFormat::Ofx => StatementFile::Ofx(Box::new(OfxParser::new(context))),
+    };
+    let staging =
+        imports::begin_with(&state.pool, &account, &profile, state.config.import_lease).await?;
+    run(state, staging, parser, body).await
+}
+
+/// Imports one document file for `client`.
+pub async fn import_documents(
+    state: &AppState,
+    firm: FirmId,
+    client: ClientId,
+    profile: ProfileId,
+    compiled: Arc<CompiledDocuments>,
+    body: Body,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let parser =
+        DocumentParser::with_profile(DocumentContext { client }, compiled, CsvLimits::default());
+    let staging = imports::begin_documents(
+        &state.pool,
+        firm,
+        client,
+        &profile,
+        state.config.import_lease,
+    )
+    .await?;
+    run(state, staging, parser, body).await
+}
+
+async fn run<P: FileParser>(
+    state: &AppState,
+    mut staging: StagingImport,
+    mut parser: P,
     body: Body,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let started = Instant::now();
-    let config = &state.config;
-    let account = tenancy::account(&state.pool, firm, account).await?;
-    let mut staging = imports::begin(&state.pool, &account, config.import_lease).await?;
     let import_id = staging.id;
-    let mut parser = StatementParser::new(AccountContext {
-        account: account.id,
-        currency: account.currency,
-    });
-    let mut batch: Vec<NewLine> = Vec::with_capacity(imports::STAGING_BATCH_ROWS);
+    let mut batch: Vec<P::Row> = Vec::with_capacity(imports::STAGING_BATCH_ROWS);
     let read = read_and_stage(state, &mut staging, &mut parser, &mut batch, body, started).await;
     let outcome = match read {
         Err(failure) => return Err(fail(state, staging, &parser, failure).await),
         Ok(ReadEnd::Refused(refusal)) => {
-            let record = refuse_file(state, staging, &parser, refusal).await?;
+            let counts = (parser.file_bytes(), parser.rows_refused());
+            let record = refuse_file(state, staging, refusal, counts).await?;
             return Err(refused_response(refusal.code, &record));
         }
         Ok(ReadEnd::Finished) => {
             let mut tail = Vec::new();
             // finish() consumes the parser; keep its counts for a refusal raised at the end.
             let counts = (parser.file_bytes(), parser.rows_refused());
-            match parser.finish(&mut |line| tail.push(line)) {
+            match parser.finish(&mut |row| tail.push(row)) {
                 Err(refusal) => {
-                    let record = refuse_file_finished(state, staging, refusal, counts).await?;
+                    let record = refuse_file(state, staging, refusal, counts).await?;
                     return Err(refused_response(refusal.code, &record));
                 }
                 Ok(summary) => {
@@ -134,32 +296,48 @@ pub async fn import(
     let (status, record, duplicate) = match outcome {
         Ok(FlipOutcome::Complete(record)) => (StatusCode::CREATED, record, false),
         Ok(FlipOutcome::DuplicateFile(earlier)) => (StatusCode::OK, earlier, true),
+        Ok(FlipOutcome::Revision(record)) => (StatusCode::ACCEPTED, record, false),
+        Ok(FlipOutcome::Refused(record)) => {
+            return Err(refused_response(
+                RefusalCode::DocumentNumberConflict,
+                &record,
+            ));
+        }
         Err(response) => return Err(response),
     };
     state.faults.reached(FaultPoint::AfterCommit).await;
     tracing::info!(
         import = %import_id,
         answered_by = %record.id,
+        status = %record.status,
         duplicate_file = duplicate,
         rows = record.rows_read,
         lines = record.lines_created,
         duplicates = record.duplicates,
+        changes = record.changes,
         bytes = record.file_bytes,
         ms = started.elapsed().as_millis(),
         "import finished"
     );
+    let revision = (status == StatusCode::ACCEPTED).then(|| {
+        json!({
+            "changes": record.changes,
+            "message": "the file disagrees with stored lines in the dates they share; nothing was imported. \
+                        Review GET .../changes, then POST .../accept or .../reject",
+        })
+    });
     Ok((
         status,
-        Json(json!({ "import": record, "duplicate_file": duplicate })),
+        Json(json!({ "import": record, "duplicate_file": duplicate, "revision": revision })),
     ))
 }
 
 /// Reads the body chunk by chunk into the parser and stages full batches as they fill.
-async fn read_and_stage(
+async fn read_and_stage<P: FileParser>(
     state: &AppState,
     staging: &mut StagingImport,
-    parser: &mut StatementParser,
-    batch: &mut Vec<NewLine>,
+    parser: &mut P,
+    batch: &mut Vec<P::Row>,
     mut body: Body,
     started: Instant,
 ) -> Result<ReadEnd, ReadFailure> {
@@ -198,9 +376,9 @@ async fn read_and_stage(
         let Ok(data) = frame.into_data() else {
             continue;
         };
-        let pushed = parser.push(&data, &mut |line| {
-            batch_bytes = batch_bytes.saturating_add(line.heap_bytes());
-            batch.push(line);
+        let pushed = parser.push(&data, &mut |row| {
+            batch_bytes = batch_bytes.saturating_add(row.heap_bytes());
+            batch.push(row);
         });
         if let Err(refusal) = pushed {
             return Ok(ReadEnd::Refused(refusal));
@@ -240,7 +418,7 @@ async fn read_and_stage(
             let (cut, cut_bytes) = batch_cut(batch);
             let rest = batch.split_off(cut);
             let full = std::mem::replace(batch, rest);
-            imports::stage(&state.pool, staging, &full, config.import_lease)
+            P::Row::stage(&state.pool, staging, &full, config.import_lease)
                 .await
                 .map_err(ReadFailure::Db)?;
             drop(full);
@@ -266,11 +444,11 @@ async fn read_and_stage(
 
 /// The first batch to stage: up to 5,000 rows and 4 MiB, at least one row. Returns the row
 /// count and its bytes.
-fn batch_cut(batch: &[NewLine]) -> (usize, usize) {
+fn batch_cut<R: StagedRow>(batch: &[R]) -> (usize, usize) {
     let mut cut = 0_usize;
     let mut bytes = 0_usize;
-    for line in batch.iter().take(imports::STAGING_BATCH_ROWS) {
-        let b = line.heap_bytes();
+    for row in batch.iter().take(imports::STAGING_BATCH_ROWS) {
+        let b = row.heap_bytes();
         if cut > 0 && bytes.saturating_add(b) > imports::STAGING_BATCH_BYTES {
             break;
         }
@@ -280,12 +458,12 @@ fn batch_cut(batch: &[NewLine]) -> (usize, usize) {
     (cut, bytes)
 }
 
-/// Stages the last rows and flips. Refused files never get here with lines.
-async fn publish(
+/// Stages the last rows and flips. Refused files never get here with rows.
+async fn publish<R: StageRows>(
     state: &AppState,
     mut staging: StagingImport,
     summary: &ParseSummary,
-    batch: Vec<NewLine>,
+    batch: Vec<R>,
 ) -> Result<FlipOutcome, ApiError> {
     if !summary.is_clean() {
         let record = imports::refuse(
@@ -298,6 +476,7 @@ async fn publish(
                 refusals: &summary.refusals,
                 file_hash: Some(summary.file_hash),
                 file_bytes: summary.file_bytes,
+                question: None,
             },
             OPERATOR,
         )
@@ -310,8 +489,7 @@ async fn publish(
         .with("import", json!(record)));
     }
     for chunk in batch.chunks(imports::STAGING_BATCH_ROWS) {
-        if let Err(e) =
-            imports::stage(&state.pool, &mut staging, chunk, state.config.import_lease).await
+        if let Err(e) = R::stage(&state.pool, &mut staging, chunk, state.config.import_lease).await
         {
             return Err(discard_after(state, staging, &e).await);
         }
@@ -330,55 +508,41 @@ async fn publish(
 }
 
 fn refused_response(code: RefusalCode, record: &ImportRecord) -> ApiError {
-    let base = if code == RefusalCode::FileTooLarge {
-        file_too_large()
-    } else if code == RefusalCode::ParseDeadlineExceeded {
-        ApiError::new(
+    let base = match code {
+        RefusalCode::FileTooLarge => file_too_large(),
+        RefusalCode::ParseDeadlineExceeded => ApiError::new(
             StatusCode::REQUEST_TIMEOUT,
             "parse_deadline_exceeded",
             "the file took longer than 60 s to read and was refused; nothing was imported",
-        )
-    } else {
-        ApiError::new(
+        ),
+        RefusalCode::AmbiguousDateFormat => ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "ambiguous_date_format",
+            "the profile does not declare whether dates are day-month or month-day; nothing was \
+             imported. Declare the order (one of the options) in a new profile version",
+        ),
+        _ => ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
             "file_refused",
             "the file was refused whole; nothing was imported",
-        )
+        ),
     };
     base.with("import", json!(record))
 }
 
-async fn refuse_file(
-    state: &AppState,
-    staging: StagingImport,
-    parser: &StatementParser,
-    refusal: FileRefusal,
-) -> Result<ImportRecord, ApiError> {
-    let refusals: Vec<_> = refusal
-        .row
-        .map(|row| recon_domain::RowRefusal {
-            row,
-            code: refusal.code,
+/// The question an `ambiguous_date_format` refusal asks (D-062).
+fn question(refusal: &FileRefusal) -> Option<Value> {
+    refusal.question.map(|q| {
+        json!({
+            "kind": "date_order",
+            "fields": "every date column",
+            "options": q.options(),
+            "first_row": refusal.row,
         })
-        .into_iter()
-        .collect();
-    Ok(imports::refuse(
-        &state.pool,
-        staging,
-        &Refusal {
-            code: refusal.code.as_str(),
-            rows_read: None,
-            rows_refused: parser.rows_refused(),
-            refusals: &refusals,
-            file_hash: None,
-            file_bytes: parser.file_bytes(),
-        },
-        OPERATOR,
-    )
-    .await?)
+    })
 }
 
-async fn refuse_file_finished(
+async fn refuse_file(
     state: &AppState,
     staging: StagingImport,
     refusal: FileRefusal,
@@ -402,6 +566,7 @@ async fn refuse_file_finished(
             refusals: &refusals,
             file_hash: None,
             file_bytes,
+            question: question(&refusal),
         },
         OPERATOR,
     )
@@ -410,10 +575,10 @@ async fn refuse_file_finished(
 
 /// Cleans up after a failed read, best effort and bounded: the sweeper discards whatever
 /// this cannot (the lease expires).
-async fn fail(
+async fn fail<P: FileParser>(
     state: &AppState,
     staging: StagingImport,
-    parser: &StatementParser,
+    parser: &P,
     failure: ReadFailure,
 ) -> ApiError {
     match failure {
@@ -422,8 +587,8 @@ async fn fail(
             match refuse_file(
                 state,
                 staging,
-                parser,
                 FileRefusal::new(RefusalCode::ParseDeadlineExceeded, None),
+                (parser.file_bytes(), parser.rows_refused()),
             )
             .await
             {

@@ -13,6 +13,7 @@ pub mod decisions;
 pub mod error;
 pub mod imports;
 pub mod pool;
+pub mod profiles;
 pub mod replay;
 pub mod roles;
 pub mod tenancy;

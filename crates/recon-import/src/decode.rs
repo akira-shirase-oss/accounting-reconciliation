@@ -232,7 +232,7 @@ fn push_scalar(out: &mut Vec<u8>, scalar: u32) {
     }
 }
 
-fn push_cp1252(out: &mut Vec<u8>, b: u8) {
+pub(crate) fn push_cp1252(out: &mut Vec<u8>, b: u8) {
     match b {
         0x00..=0x7F => out.push(b),
         0x80..=0x9F => {

@@ -1,12 +1,14 @@
-//! The Accounting Reconciliation API server (ARCHITECTURE: `recon-server`). R0 serves the
-//! import spine: firms, clients and accounts; streaming statement imports through staging;
-//! liveness and readiness. Sessions, roles and the review API arrive in R3; until then an
-//! operator token guards `/v1` (D-041).
+//! The Accounting Reconciliation API server (ARCHITECTURE: `recon-server`). It serves firms,
+//! clients and accounts; import profiles; streaming statement (CSV and OFX) and document
+//! imports through staging; held revisions and their accept or reject; liveness and
+//! readiness. Sessions, roles and the review API arrive in R3; until then an operator token
+//! guards every `/v1` route (D-041).
 
 pub mod config;
 pub mod error;
 pub mod faults;
 pub mod handlers;
+pub mod profiles;
 pub mod serve;
 pub mod state;
 pub mod tasks;
@@ -109,8 +111,29 @@ pub fn router(state: AppState) -> Router {
             post(handlers::upload_statement).layer(DefaultBodyLimit::disable()),
         )
         .route(
+            "/v1/firms/{firm}/clients/{client}/document-imports",
+            post(handlers::upload_documents).layer(DefaultBodyLimit::disable()),
+        )
+        .route(
             "/v1/firms/{firm}/imports/{import}",
             get(handlers::get_import),
+        )
+        .route(
+            "/v1/firms/{firm}/imports/{import}/changes",
+            get(handlers::revision_changes),
+        )
+        .route(
+            "/v1/firms/{firm}/imports/{import}/accept",
+            post(handlers::accept_revision),
+        )
+        .route(
+            "/v1/firms/{firm}/imports/{import}/reject",
+            post(handlers::reject_revision),
+        )
+        .route("/v1/firms/{firm}/profiles", post(handlers::create_profile))
+        .route(
+            "/v1/firms/{firm}/profiles/{name}",
+            get(handlers::get_profile),
         )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),

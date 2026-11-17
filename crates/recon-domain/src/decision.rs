@@ -251,13 +251,15 @@ impl ChainVerifier {
 }
 
 /// The evidence of an import's completion decision (canonical JSON in field order). It
-/// carries counts and digests only — no narration, amount or file name (D-025).
+/// carries counts, dates and digests only — no narration, amount or file name (D-025). For a
+/// document import, `lines_created` and `duplicates` count documents and `lines_digest` is
+/// over the documents' fingerprints. Fields added in R1 are absent from R0's decisions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImportEvidence {
     /// The import.
     pub import: Uuid,
-    /// The account.
-    pub account: Uuid,
+    /// The account (absent for a document import).
+    pub account: Option<Uuid>,
     /// SHA-256 of the file, hex.
     pub file_hash: String,
     /// The profile.
@@ -268,12 +270,55 @@ pub struct ImportEvidence {
     pub fingerprint_version: String,
     /// Data rows read.
     pub rows_read: u32,
-    /// New lines.
+    /// New lines (or documents).
     pub lines_created: u32,
-    /// Rows already present as lines.
+    /// Rows already present as lines (or documents).
     pub duplicates: u32,
     /// SHA-256 over every row's fingerprint in row order, hex.
     pub lines_digest: String,
+    /// `statement` or `documents` (R1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// SHA-256 of the profile's canonical JSON, hex (R1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_sha256: Option<String>,
+    /// Rows of the file inside the date ranges earlier imports cover (R1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlap_rows: Option<u32>,
+    /// Lines superseded by an accepted revision (R1, D-065).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded: Option<u32>,
+    /// The accepted revision's digest, hex (R1, D-065).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision_digest: Option<String>,
+}
+
+/// The evidence of a statement held as a revision (D-065): what differs, counted and pinned
+/// by digest, never the content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RevisionEvidence {
+    /// The import.
+    pub import: Uuid,
+    /// The account.
+    pub account: Uuid,
+    /// SHA-256 of the file, hex.
+    pub file_hash: String,
+    /// The profile.
+    pub profile: String,
+    /// The profile's version.
+    pub profile_version: i32,
+    /// SHA-256 of the profile's canonical JSON, hex.
+    pub profile_sha256: String,
+    /// Data rows read.
+    pub rows_read: u32,
+    /// Rows no stored line has, in the shared range.
+    pub added: u32,
+    /// Stored lines the file does not have.
+    pub removed: u32,
+    /// Stored lines the file changes.
+    pub changed: u32,
+    /// SHA-256 over the listed changes, hex.
+    pub revision_digest: String,
 }
 
 #[cfg(test)]

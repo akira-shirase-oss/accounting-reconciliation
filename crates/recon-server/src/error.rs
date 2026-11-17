@@ -112,9 +112,29 @@ impl ApiError {
             DbError::AccountBusy => Self::new(
                 StatusCode::CONFLICT,
                 "account_busy",
-                "another statement is being published into this account; nothing was imported, upload again shortly",
+                "another import into this account (or this client's documents) is being published; nothing changed, try again shortly",
             )
             .retry_after(2),
+            DbError::NotARevision => Self::new(
+                StatusCode::CONFLICT,
+                "not_a_revision",
+                "the import is not a held revision (it may already be decided)",
+            ),
+            DbError::RevisionStale => Self::new(
+                StatusCode::CONFLICT,
+                "revision_stale",
+                "the stored lines changed since the revision was listed; nothing changed, upload the file again",
+            ),
+            DbError::RevisionTouchesDecidedLine => Self::new(
+                StatusCode::CONFLICT,
+                "revision_touches_decided_line",
+                "the revision replaces a line that is no longer unreviewed; nothing changed",
+            ),
+            DbError::ProfileLimit => Self::new(
+                StatusCode::CONFLICT,
+                "profile_limit",
+                "the firm holds the most profile names it may",
+            ),
             DbError::Constraint(name) => {
                 tracing::warn!(constraint = %name, "constraint refused a write");
                 Self::new(

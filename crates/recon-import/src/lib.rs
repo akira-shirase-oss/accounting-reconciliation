@@ -13,10 +13,14 @@
 pub mod csv;
 pub mod dates;
 pub mod decode;
+pub mod documents;
 pub mod number;
+pub mod ofx;
 pub mod profile;
 
 pub use csv::{CsvLimits, FileRefusal};
+pub use documents::{CompiledDocuments, DocumentContext, DocumentParser, DocumentProfile};
+pub use ofx::OfxParser;
 pub use profile::{
     AccountContext, CompiledStatement, ParseSummary, StatementParser, StatementProfile,
 };

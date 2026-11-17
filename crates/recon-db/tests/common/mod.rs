@@ -19,7 +19,9 @@ use recon_db::tenancy::{self, Account};
 use recon_db::testing::TestDb;
 use recon_domain::line::ActorKind;
 use recon_domain::{AccountId, ClientId, Currency, FirmId};
-use recon_import::{AccountContext, StatementParser};
+use recon_import::{
+    AccountContext, CompiledDocuments, DocumentContext, DocumentParser, StatementParser,
+};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -69,6 +71,24 @@ pub fn rows(first: u32, n: u32) -> String {
     out
 }
 
+/// `n` distinct rows on consecutive days of March 2026 from day `first + 1` (no wrapping:
+/// `first + n` is at most 31), so two files of them overlap only where their days do.
+pub fn month_rows(first: u32, n: u32) -> String {
+    assert!(first + n <= 31, "March has 31 days");
+    let mut out = String::new();
+    for i in first..first + n {
+        writeln!(
+            out,
+            "2026-03-{:02},,-{}.{:02},USD,PAYMENT {i} ACME,REF-{i},Acme Ltd,",
+            i + 1,
+            i + 1,
+            i % 100
+        )
+        .unwrap();
+    }
+    out
+}
+
 pub enum Imported {
     Flipped(FlipOutcome),
     Refused(ImportRecord),
@@ -82,11 +102,32 @@ impl Imported {
         }
     }
 
+    pub fn revision(self) -> ImportRecord {
+        match self {
+            Self::Flipped(FlipOutcome::Revision(r)) => r,
+            other => panic!("expected a held revision, got {}", other.describe()),
+        }
+    }
+
+    pub fn refused(self) -> ImportRecord {
+        match self {
+            Self::Refused(r) | Self::Flipped(FlipOutcome::Refused(r)) => r,
+            other @ Self::Flipped(_) => {
+                panic!("expected a refused import, got {}", other.describe())
+            }
+        }
+    }
+
     fn describe(&self) -> String {
         match self {
             Self::Flipped(FlipOutcome::Complete(r)) => format!("complete {}", r.id),
             Self::Flipped(FlipOutcome::DuplicateFile(r)) => format!("duplicate of {}", r.id),
-            Self::Refused(r) => format!("refused {:?}", r.refusal_code),
+            Self::Flipped(FlipOutcome::Revision(r)) => {
+                format!("revision {} with {:?} changes", r.id, r.changes)
+            }
+            Self::Flipped(FlipOutcome::Refused(r)) | Self::Refused(r) => {
+                format!("refused {:?} {:?}", r.refusal_code, r.refusals)
+            }
         }
     }
 }
@@ -130,6 +171,7 @@ pub async fn import_bytes(
                 refusals: &summary.refusals,
                 file_hash: Some(summary.file_hash),
                 file_bytes: summary.file_bytes,
+                question: None,
             },
             OPERATOR,
         )
@@ -138,6 +180,61 @@ pub async fn import_bytes(
     }
     for batch in lines.chunks(STAGING_BATCH_ROWS) {
         imports::stage(pool, &mut staging, batch, LEASE).await?;
+    }
+    let outcome = imports::flip(pool, staging, &summary, OPERATOR, &NoHook, FLIP_TIMEOUT).await?;
+    Ok(Imported::Flipped(outcome))
+}
+
+/// Imports a document file with the built-in profile, the way the server does.
+pub async fn import_documents(
+    pool: &PgPool,
+    account: &Account,
+    body: &str,
+) -> Result<Imported, DbError> {
+    let profile = std::sync::Arc::new(CompiledDocuments::builtin());
+    let id = imports::ProfileId {
+        name: recon_domain::import::PROFILE_DOCUMENTS.to_owned(),
+        version: recon_domain::import::PROFILE_DOCUMENTS_VERSION,
+        sha256: profile.sha256(),
+    };
+    let mut parser = DocumentParser::with_profile(
+        DocumentContext {
+            client: account.client,
+        },
+        profile,
+        recon_import::CsvLimits::default(),
+    );
+    let mut docs = vec![];
+    let bytes =
+        format!("kind,number,issue_date,due_date,amount,currency,counterparty,description\n{body}");
+    parser
+        .push(bytes.as_bytes(), &mut |d| docs.push(d))
+        .expect("file-level refusal in a db test");
+    let summary = parser
+        .finish(&mut |d| docs.push(d))
+        .expect("file-level refusal in a db test");
+    let mut staging =
+        imports::begin_documents(pool, account.firm, account.client, &id, LEASE).await?;
+    if !summary.is_clean() {
+        let record = imports::refuse(
+            pool,
+            staging,
+            &Refusal {
+                code: "rows_refused",
+                rows_read: Some(summary.rows_read),
+                rows_refused: summary.rows_refused,
+                refusals: &summary.refusals,
+                file_hash: Some(summary.file_hash),
+                file_bytes: summary.file_bytes,
+                question: None,
+            },
+            OPERATOR,
+        )
+        .await?;
+        return Ok(Imported::Refused(record));
+    }
+    for batch in docs.chunks(STAGING_BATCH_ROWS) {
+        imports::stage_documents(pool, &mut staging, batch, LEASE).await?;
     }
     let outcome = imports::flip(pool, staging, &summary, OPERATOR, &NoHook, FLIP_TIMEOUT).await?;
     Ok(Imported::Flipped(outcome))

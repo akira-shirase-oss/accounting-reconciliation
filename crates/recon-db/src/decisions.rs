@@ -5,7 +5,6 @@
 use recon_domain::decision::{
     BreakKind, ChainBreak, ChainHead, ChainVerifier, DecisionRecord, SubjectKind,
 };
-use recon_domain::import::{PROFILE_R0, PROFILE_R0_VERSION};
 use recon_domain::line::ActorKind;
 use recon_domain::{ClientId, DecisionId, FirmId};
 use sqlx::postgres::PgRow;
@@ -14,12 +13,15 @@ use uuid::Uuid;
 
 use crate::DbError;
 
-/// The versions in force, recorded on every decision (D-035).
+/// The versions in force, recorded on every decision (D-035). The import profile and its
+/// SHA-256 are in each import's own evidence (R1 reads many profiles).
 pub fn engine_version() -> String {
     format!(
-        "recon {} / {PROFILE_R0} v{PROFILE_R0_VERSION} / fingerprint {}",
+        "recon {} / fingerprint {} / {} / normalization v{}",
         env!("CARGO_PKG_VERSION"),
-        recon_domain::fingerprint::FINGERPRINT_VERSION
+        recon_domain::fingerprint::FINGERPRINT_VERSION,
+        crate::imports::DOCUMENT_FINGERPRINT_VERSION,
+        recon_domain::text::NORMALIZATION_VERSION
     )
 }
 

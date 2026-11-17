@@ -11,7 +11,8 @@ mod common;
 use std::time::Duration;
 
 use common::{
-    FLIP_TIMEOUT, HEADER, Imported, LEASE, OPERATOR, count, import, replay_ok, rows, tenant,
+    FLIP_TIMEOUT, HEADER, Imported, LEASE, OPERATOR, count, import, month_rows, replay_ok, rows,
+    tenant,
 };
 use recon_db::DbError;
 use recon_db::imports::{self, FlipOutcome, NoHook};
@@ -110,11 +111,12 @@ async fn identical_twins_in_one_file_are_both_kept() {
 async fn an_overlapping_statement_adds_only_the_new_lines_and_names_the_rest() {
     let db = TestDb::new().await;
     let account = tenant(&db.pool).await;
-    import(&db.pool, &account, &rows(0, 20))
+    // Days 1 to 20, then days 15 to 31: the six shared days' rows are already lines.
+    import(&db.pool, &account, &month_rows(0, 20))
         .await
         .unwrap()
         .complete();
-    let second = import(&db.pool, &account, &rows(14, 17))
+    let second = import(&db.pool, &account, &month_rows(14, 17))
         .await
         .unwrap()
         .complete();

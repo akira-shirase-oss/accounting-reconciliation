@@ -177,7 +177,12 @@ async fn the_runtime_role_has_no_power_beyond_its_grants() {
         "DROP TABLE recon.decision_log",
         "SET ROLE recon_owner",
         "SET session_replication_role = replica",
-        "UPDATE recon.statement_lines SET status = 'matched'",
+        // Status and row version are granted (D-065); the source fields are not.
+        "UPDATE recon.statement_lines SET amount_minor = 1",
+        "UPDATE recon.documents SET amount_minor = 1",
+        "DELETE FROM recon.documents",
+        "UPDATE recon.import_profiles SET version = 2",
+        "TRUNCATE recon.import_held_rows",
         "DELETE FROM recon.imports",
         "DELETE FROM recon.statement_lines",
         "UPDATE recon.chain_heads SET seq = 0",
@@ -483,14 +488,25 @@ async fn lines_become_visible_only_with_their_import_and_never_change() {
         sqlstate(owner.execute("DELETE FROM recon.imports").await),
         "RCI01"
     );
-    // Status may change (from R2), source fields may not.
+    // Status may change, but only advancing the row version and with its decision in the
+    // same transaction (D-065): a bare change is refused, even for the owner.
     assert_eq!(
         sqlstate(
             owner
                 .execute("UPDATE recon.statement_lines SET status = 'proposed'")
                 .await
         ),
-        "ok"
+        "RCL03"
+    );
+    assert_eq!(
+        sqlstate(
+            owner
+                .execute(
+                    "UPDATE recon.statement_lines SET status = 'proposed', row_version = row_version + 1"
+                )
+                .await
+        ),
+        "RCL04"
     );
     owner.close().await;
     db.cleanup().await;
@@ -955,7 +971,8 @@ async fn an_import_cannot_complete_without_its_decision() {
     .unwrap();
     sqlx::query(
         "UPDATE recon.imports SET status = 'complete', file_hash = $3, file_bytes = 1, rows_read = 1,
-                lines_created = 1, duplicates = 0, rows_refused = 0
+                lines_created = 1, duplicates = 0, rows_refused = 0,
+                first_date = '2026-03-01', last_date = '2026-03-01'
           WHERE firm_id = $1 AND id = $2",
     )
     .bind(account.firm.as_uuid())

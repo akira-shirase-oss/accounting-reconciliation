@@ -23,6 +23,20 @@ pub enum DbError {
     /// (D-053).
     #[error("another import into this account is being published")]
     AccountBusy,
+    /// The firm already holds the most profile names it may (D-062).
+    #[error("the firm's profile limit is reached")]
+    ProfileLimit,
+    /// The import is not a held revision (it was never one, or it was already decided).
+    #[error("the import is not a held revision")]
+    NotARevision,
+    /// The stored lines changed since the revision was listed: it no longer says what
+    /// accepting it would do. Nothing changed; upload the file again.
+    #[error("the revision is stale")]
+    RevisionStale,
+    /// A line the revision would replace is no longer `unreviewed` (R3 handles decided
+    /// lines through `source_changed`, D-009).
+    #[error("the revision replaces a decided line")]
+    RevisionTouchesDecidedLine,
     /// The staging table does not hold every row this import staged (an unlogged table
     /// emptied by a crash): the flip refuses rather than publish a partial import.
     #[error("staged rows are missing; the import was not published")]
@@ -70,7 +84,7 @@ impl DbError {
 }
 
 /// The schema's custom SQLSTATEs and their names.
-const GUARDS: [(&str, &str); 12] = [
+const GUARDS: [(&str, &str); 17] = [
     ("RCA01", "decision_log_append_only"),
     ("RCA02", "no_decision_chain"),
     ("RCA03", "decision_already_recorded"),
@@ -80,9 +94,14 @@ const GUARDS: [(&str, &str); 12] = [
     ("RCI03", "import_identity_immutable"),
     ("RCI04", "duplicates_need_staging_import"),
     ("RCI05", "import_needs_its_decision"),
+    ("RCI06", "revision_rows_guarded"),
+    ("RCD01", "documents_need_staging_import"),
+    ("RCD02", "documents_immutable"),
+    ("RCP01", "profiles_immutable"),
     ("RCL01", "lines_need_staging_import"),
     ("RCL02", "lines_need_complete_import"),
     ("RCL03", "lines_immutable"),
+    ("RCL04", "line_needs_its_decision"),
 ];
 
 impl From<sqlx::Error> for DbError {
