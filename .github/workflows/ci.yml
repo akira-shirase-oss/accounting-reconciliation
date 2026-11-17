@@ -48,10 +48,10 @@ jobs:
           MODE=smoke scripts/load.sh r1-import
 
   load-full:
-    # The full r0-import run (1,000,000 lines) on a fresh runner: on demand, or when a
-    # commit message carries [load-full]. Its JSON is printed for committing under
+    # The full runs (1,000,000 lines each) on a fresh runner: on demand, or when a commit
+    # message carries [load-full]. Its JSON is printed for committing under
     # perf/results/ (machine, commit and load average are inside it).
-    name: load (r0-import, full, 1,000,000 lines)
+    name: load (full, 1,000,000 lines; r0-import and r1-import)
     if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[load-full]')
     runs-on: ubuntu-latest
     timeout-minutes: 40
@@ -66,10 +66,14 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Start PostgreSQL (deploy/compose.yaml)
         run: scripts/stack.sh up
-      - name: Full run
+      - name: Full run, r0-import
         run: |
           eval "$(scripts/stack.sh env)"
           MODE=full scripts/load.sh r0-import
+      - name: Full run, r1-import (overlapping files, D-067)
+        run: |
+          eval "$(scripts/stack.sh env)"
+          MODE=full scripts/load.sh r1-import
 
   production:
     # The production path (D-069): release build, recon.env from its template, the server
