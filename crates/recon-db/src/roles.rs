@@ -89,10 +89,12 @@ async fn ensure_roles_locked(admin: &mut PgConnection, app_password: &str) -> Re
         }
     }
     let attributes = "NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS";
+    // The statement carries a SCRAM verifier, never the password itself (D-057).
+    let verifier = scram_verifier(app_password)?;
     execute_formatted(
         admin,
         "SELECT pg_catalog.format('ALTER ROLE %I WITH LOGIN INHERIT %s PASSWORD %L', $1::text, $2::text, $3::text)",
-        &[APP, attributes, app_password],
+        &[APP, attributes, &verifier],
     )
     .await?;
     for role in [OWNER, RUNTIME] {
@@ -274,4 +276,113 @@ pub async fn check_runtime(pool: &PgPool) -> Result<Vec<RoleProblem>, DbError> {
         )));
     }
     Ok(problems)
+}
+
+/// SCRAM-SHA-256 iterations (PostgreSQL's default).
+const SCRAM_ITERATIONS: u32 = 4_096;
+
+/// The SCRAM-SHA-256 verifier PostgreSQL stores for `password`, with a random salt, so the
+/// password never appears in statement text a log or `pg_stat_statements` could record
+/// (D-057). Only printable ASCII passwords are accepted: `SASLprep` leaves them unchanged.
+pub fn scram_verifier(password: &str) -> Result<String, DbError> {
+    if password.is_empty() || !password.bytes().all(|b| b.is_ascii_graphic()) {
+        return Err(DbError::Inconsistent(
+            "a role password must be printable ASCII".into(),
+        ));
+    }
+    let mut salt = [0_u8; 16];
+    getrandom::fill(&mut salt)
+        .map_err(|e| DbError::Inconsistent(format!("no randomness for a salt: {e}")))?;
+    Ok(scram_verifier_with(password, &salt, SCRAM_ITERATIONS))
+}
+
+/// [`scram_verifier`] with a given salt and iteration count (RFC 5802 / RFC 7677).
+pub fn scram_verifier_with(password: &str, salt: &[u8], iterations: u32) -> String {
+    use sha2::{Digest as _, Sha256};
+    let mac = hmac_sha256;
+    // PBKDF2-HMAC-SHA256 with one 32-byte block.
+    let mut block = salt.to_vec();
+    block.extend_from_slice(&1_u32.to_be_bytes());
+    let mut u = mac(password.as_bytes(), &block);
+    let mut salted = u;
+    for _ in 1..iterations {
+        u = mac(password.as_bytes(), &u);
+        for (s, x) in salted.iter_mut().zip(u) {
+            *s ^= x;
+        }
+    }
+    let client_key = mac(&salted, b"Client Key");
+    let stored_key: [u8; 32] = Sha256::digest(client_key).into();
+    let server_key = mac(&salted, b"Server Key");
+    format!(
+        "SCRAM-SHA-256${iterations}:{}${}:{}",
+        base64(salt),
+        base64(&stored_key),
+        base64(&server_key)
+    )
+}
+
+#[expect(
+    clippy::expect_used,
+    reason = "invariant: HMAC accepts a key of any length"
+)]
+fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+    use hmac::{Hmac, KeyInit as _, Mac as _};
+    let mut m =
+        Hmac::<sha2::Sha256>::new_from_slice(key).expect("invariant: HMAC accepts any key length");
+    m.update(data);
+    m.finalize().into_bytes().into()
+}
+
+/// Standard base64 with padding.
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3).saturating_mul(4));
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            chunk.get(1).copied().unwrap_or(0),
+            chunk.get(2).copied().unwrap_or(0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        for (i, shift) in [18_u32, 12, 6, 0].into_iter().enumerate() {
+            if i <= chunk.len() {
+                out.push(char::from(
+                    ALPHABET[usize::try_from((n >> shift) & 63).unwrap_or(0)],
+                ));
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{base64, scram_verifier, scram_verifier_with};
+
+    #[test]
+    fn the_verifier_matches_an_independent_computation() {
+        // Python hashlib: pbkdf2_hmac("sha256", password, bytes(range(16)), 4096) and RFC 5802.
+        assert_eq!(
+            scram_verifier_with("recon-test-password", &(0..16).collect::<Vec<u8>>(), 4_096),
+            "SCRAM-SHA-256$4096:AAECAwQFBgcICQoLDA0ODw==$b4Kx4XlVdxddIef1OVA/heBriEX8reGWugRoYTbWF1U=:l+s6amJ+YZJsnI3pYeLDwxS7E/x9M0/lAzKIpB9SOlM="
+        );
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+    }
+
+    #[test]
+    fn the_password_never_appears_and_salts_differ() {
+        let a = scram_verifier("recon-app-dev").unwrap_or_default();
+        let b = scram_verifier("recon-app-dev").unwrap_or_default();
+        assert!(
+            a.starts_with("SCRAM-SHA-256$4096:") && !a.contains("recon-app-dev"),
+            "{a}"
+        );
+        assert_ne!(a, b, "each verifier has its own salt");
+        assert!(scram_verifier("not ascii é").is_err());
+    }
 }

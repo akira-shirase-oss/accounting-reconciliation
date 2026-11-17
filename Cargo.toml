@@ -24,6 +24,8 @@ axum = { version = "0.8.9", default-features = false, features = ["http1", "toki
 hex = "0.4.3"
 # Head anchors are HMAC-SHA256 signed (D-049).
 hmac = "0.13"
+# Salt for the role password's SCRAM verifier (D-057).
+getrandom = "0.3.4"
 http-body-util = "0.1.5"
 # The server's own accept loop (D-047): header-read and idle timeouts need hyper's timer,
 # which axum::serve does not set. HTTP/1 only; no client half.

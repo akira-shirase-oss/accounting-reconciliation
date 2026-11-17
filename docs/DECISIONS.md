@@ -562,6 +562,16 @@ conservative side.
   `an_import_cannot_complete_without_its_decision`,
   `replay_flags_a_decision_about_an_import_that_is_not_its_clients`.
 
+- **D-057 — Role passwords travel as SCRAM verifiers.** `ALTER ROLE …
+  PASSWORD` carried the cleartext password in statement text, where
+  `log_min_error_statement` or `pg_stat_statements` can record it. `recon db
+  setup` now computes the SCRAM-SHA-256 verifier itself (random 16-byte salt,
+  4,096 iterations) and sends only that; PostgreSQL stores it as given.
+  Passwords must be printable ASCII (SASLprep leaves those unchanged). Tests:
+  `the_verifier_matches_an_independent_computation` (a vector from Python's
+  hashlib), `the_password_never_appears_and_salts_differ`, and every database
+  test logs in through such a verifier.
+
 ## Open questions (blocked on the maintainer or an outside party)
 
 Each is in the README's *Blocked on* table. None blocks R0–R6.
