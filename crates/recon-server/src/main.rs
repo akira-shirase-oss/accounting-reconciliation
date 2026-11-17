@@ -3,6 +3,7 @@
 use std::process::ExitCode;
 
 use anyhow::Context as _;
+use recon_server::serve::{ConnectionLimits, serve};
 use recon_server::{AppState, Config, faults::Faults, router, tasks, telemetry};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
@@ -64,6 +65,11 @@ async fn run() -> anyhow::Result<ExitCode> {
         .await
         .context("binding the listen address")?;
     let drain = config.drain_timeout;
+    let limits = ConnectionLimits {
+        header_read_timeout: config.header_read_timeout,
+        max_connections: config.max_connections,
+        drain_timeout: config.drain_timeout,
+    };
     let state = AppState::new(pool.clone(), config, faults);
     tracing::info!(listen = %listener.local_addr()?, "listening");
 
@@ -76,9 +82,8 @@ async fn run() -> anyhow::Result<ExitCode> {
         shutdown.clone(),
     ));
     tasks.spawn(tasks::sweeper(state.clone(), shutdown.clone()));
-    let server = axum::serve(listener, router(state))
-        .with_graceful_shutdown(shutdown.clone().cancelled_owned());
-    let mut server = tokio::spawn(async move { server.await });
+    let app = router(state);
+    let mut server = tokio::spawn(serve(listener, app, limits, shutdown.clone()));
 
     let mut code = ExitCode::SUCCESS;
     tokio::select! {
@@ -96,7 +101,14 @@ async fn run() -> anyhow::Result<ExitCode> {
         }
     }
     shutdown.cancel();
-    if tokio::time::timeout(drain, &mut server).await.is_err() {
+    // serve() drains connections up to the deadline itself; this bounds it once more.
+    if tokio::time::timeout(
+        drain.saturating_add(std::time::Duration::from_secs(1)),
+        &mut server,
+    )
+    .await
+    .is_err()
+    {
         tracing::warn!("drain deadline passed; closing with requests in flight");
         server.abort();
     }

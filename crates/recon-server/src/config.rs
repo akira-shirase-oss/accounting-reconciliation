@@ -53,6 +53,13 @@ pub struct Config {
     pub sweep_interval: Duration,
     /// How long shutdown waits for requests in flight.
     pub drain_timeout: Duration,
+    /// Longest a connection may take to send a request head, and longest it may sit idle
+    /// between requests (D-047).
+    pub header_read_timeout: Duration,
+    /// Most open connections; more are closed at once (D-047).
+    pub max_connections: usize,
+    /// Most requests in flight; more are shed with `503 overloaded` (D-047).
+    pub max_in_flight: usize,
 }
 
 impl fmt::Debug for Config {
@@ -70,6 +77,9 @@ impl fmt::Debug for Config {
             .field("request_timeout", &self.request_timeout)
             .field("sweep_interval", &self.sweep_interval)
             .field("drain_timeout", &self.drain_timeout)
+            .field("header_read_timeout", &self.header_read_timeout)
+            .field("max_connections", &self.max_connections)
+            .field("max_in_flight", &self.max_in_flight)
             .finish()
     }
 }
@@ -105,6 +115,7 @@ impl Config {
         let drain_timeout = millis("RECON_DRAIN_MS", 30_000, 0, 600_000);
         let statement_timeout = millis("RECON_STATEMENT_TIMEOUT_MS", 10_000, 100, 600_000);
         let acquire_timeout = millis("RECON_DB_ACQUIRE_MS", 1_500, 50, 60_000);
+        let header_read_timeout = millis("RECON_HEADER_READ_TIMEOUT_MS", 10_000, 100, 120_000);
 
         let database_url = get("RECON_DATABASE_URL").unwrap_or_default();
         if database_url.is_empty() {
@@ -133,6 +144,8 @@ impl Config {
         };
         let import_concurrency = count("RECON_IMPORT_CONCURRENCY", 4, 64, &mut problems);
         let max_connections = count("RECON_DB_MAX_CONNECTIONS", 32, 256, &mut problems);
+        let max_open_connections = count("RECON_MAX_CONNECTIONS", 512, 65_536, &mut problems);
+        let max_in_flight = count("RECON_MAX_IN_FLIGHT", 256, 4_096, &mut problems);
         if get("RECON_FAULT").is_some() && !cfg!(feature = "fault-injection") {
             problems.push("RECON_FAULT is set but this build has no fault injection".into());
         }
@@ -157,6 +170,9 @@ impl Config {
             request_timeout,
             sweep_interval,
             drain_timeout,
+            header_read_timeout,
+            max_connections: usize::try_from(max_open_connections).unwrap_or(512),
+            max_in_flight: usize::try_from(max_in_flight).unwrap_or(256),
         })
     }
 

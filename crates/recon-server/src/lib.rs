@@ -7,6 +7,7 @@ pub mod config;
 pub mod error;
 pub mod faults;
 pub mod handlers;
+pub mod serve;
 pub mod state;
 pub mod tasks;
 pub mod telemetry;
@@ -15,6 +16,7 @@ pub mod upload;
 use std::time::Duration;
 
 use axum::Router;
+use axum::error_handling::HandleErrorLayer;
 use axum::extract::{DefaultBodyLimit, MatchedPath, Request, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
@@ -22,6 +24,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use subtle::ConstantTimeEq as _;
 use tower::ServiceBuilder;
+use tower::limit::GlobalConcurrencyLimitLayer;
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::request_id::{
     MakeRequestId, PropagateRequestIdLayer, RequestId, SetRequestIdLayer,
@@ -48,6 +51,17 @@ impl MakeRequestId for MakeId {
     }
 }
 
+/// A request beyond the in-flight limit, shed at once (D-047).
+async fn overloaded(_error: tower::BoxError) -> Response {
+    ApiError::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "overloaded",
+        "the server is at its request limit; nothing was accepted, retry shortly",
+    )
+    .retry_after(1)
+    .into_response()
+}
+
 fn panic_response(_panic: Box<dyn std::any::Any + Send + 'static>) -> Response {
     tracing::error!("a handler panicked");
     ApiError::internal().into_response()
@@ -71,9 +85,10 @@ async fn require_operator(State(state): State<AppState>, request: Request, next:
 
 /// The application with its middleware, outermost first: request id → propagate it →
 /// trace (method, route, status, latency; never headers or bodies) → catch panics into the
-/// envelope → the overall deadline → body limits.
+/// envelope → the overall deadline → shed requests beyond the in-flight limit → body limits.
 pub fn router(state: AppState) -> Router {
     let request_timeout: Duration = state.config.request_timeout;
+    let max_in_flight = state.config.max_in_flight;
     let v1 = Router::new()
         .route("/v1/firms", post(handlers::create_firm))
         .route("/v1/firms/{firm}/clients", post(handlers::create_client))
@@ -128,7 +143,12 @@ pub fn router(state: AppState) -> Router {
                         .on_failure(()),
                 )
                 .layer(CatchPanicLayer::custom(panic_response))
-                .layer(TimeoutLayer::with_status_code(StatusCode::SERVICE_UNAVAILABLE, request_timeout)),
+                .layer(TimeoutLayer::with_status_code(StatusCode::SERVICE_UNAVAILABLE, request_timeout))
+                .layer(HandleErrorLayer::new(overloaded))
+                .load_shed()
+                // One semaphore for the whole router: Router::layer instantiates the layer
+                // per route, and a per-route limit would not bound the server.
+                .layer(GlobalConcurrencyLimitLayer::new(max_in_flight)),
         )
         .with_state(state)
 }

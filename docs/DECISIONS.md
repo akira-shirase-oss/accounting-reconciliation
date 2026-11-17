@@ -442,6 +442,21 @@ conservative side.
   `concurrent_decisions_keep_every_chain_whole`. Cost: one index probe per
   decision at insert and one at commit.
 
+- **D-047 — Connections are bounded before a request exists.** `axum::serve`
+  builds hyper without a timer, so hyper's header-read timeout never runs: a
+  client could hold a connection forever by trickling headers or saying
+  nothing, and nothing capped how many it held. The server now runs its own
+  accept loop on hyper's HTTP/1 builder with a timer and a header-read
+  timeout (`RECON_HEADER_READ_TIMEOUT_MS`, default 10 s), which also bounds
+  the idle time between requests on a keep-alive connection; a connection
+  semaphore (`RECON_MAX_CONNECTIONS`, default 512) closes a new socket at
+  once when full; a global in-flight limit (`RECON_MAX_IN_FLIGHT`, default
+  256) sheds excess requests with `503 overloaded` instead of queueing them;
+  shutdown stops accepting and drains up to its deadline. The request
+  deadline still bounds a stalled body. Tests: `tests/connections.rs`
+  (a trickled header, silent and idle keep-alive sockets, a stalled body,
+  the connection cap, shedding). Cost: one more piece of serving code to own.
+
 ## Open questions (blocked on the maintainer or an outside party)
 
 Each is in the README's *Blocked on* table. None blocks R0–R6.
