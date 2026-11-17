@@ -384,6 +384,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "recon-import"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "recon-domain",
+ "sha2",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
 name = "regex-syntax"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
