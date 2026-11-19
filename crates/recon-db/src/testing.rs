@@ -78,7 +78,15 @@ impl TestDb {
                 .expect("creating the roles");
             let _ = ROLES.set(());
         }
-        let name = format!("recon_test_{}", Uuid::now_v7().simple());
+        // The name carries the test (`recon_test_<test>_<uuid8>`) so a database a failed
+        // test leaves behind names its owner (the Drop impl keeps failed tests' databases).
+        // The uuid tail, not its head: a v7's first bytes are the timestamp — equal for
+        // tests run in the same second.
+        let name = format!(
+            "recon_test_{}_{}",
+            test_tag(),
+            &Uuid::now_v7().simple().to_string()[24..]
+        );
         crate::roles::create_database(&mut admin, &name)
             .await
             .expect("creating the test database");
@@ -168,7 +176,7 @@ impl TestDb {
     }
 
     /// Drops the database (forcing out any connection a test left behind).
-    pub async fn cleanup(self) {
+    pub async fn cleanup(mut self) {
         let _ = tokio::time::timeout(Duration::from_secs(2), self.pool.close()).await;
         if let Ok(mut admin) = PgConnectOptions::from_str(&self.admin_url)
             .expect("invariant: RECON_TEST_ADMIN_URL parses")
@@ -182,6 +190,79 @@ impl TestDb {
                 )))
                 .await;
             admin.close().await.ok();
+        }
+        // The Drop backstop does nothing for a database already dropped.
+        self.name.clear();
+    }
+}
+
+/// The calling test's name, safe for a database identifier: `[a-z0-9_]`, at most 40
+/// bytes (`recon_test_` + tag + `_` + the uuid suffix fits PostgreSQL's 63-byte limit).
+/// A tokio worker's generic name becomes `test`.
+fn test_tag() -> String {
+    let raw = std::thread::current().name().unwrap_or("test").to_owned();
+    let clean: String = raw
+        .chars()
+        .filter_map(|c| {
+            if c.is_ascii_alphanumeric() {
+                Some(c.to_ascii_lowercase())
+            } else if matches!(c, ':' | ' ' | '-' | '.' | '/' | '_') {
+                Some('_')
+            } else {
+                None
+            }
+        })
+        .collect();
+    let clean = clean.trim_matches('_');
+    let keep = if clean.is_empty() || clean.contains("tokio") {
+        "test"
+    } else {
+        clean
+    };
+    keep.chars().take(40).collect()
+}
+
+impl Drop for TestDb {
+    /// The backstop behind `cleanup`: a passed test's database is dropped even when the
+    /// test forgot (or failed before reaching) `cleanup`; a failed test's database is
+    /// kept for diagnosis — its name already names the test.
+    fn drop(&mut self) {
+        let name = std::mem::take(&mut self.name);
+        if name.is_empty() {
+            return;
+        }
+        if std::thread::panicking() {
+            eprintln!("keeping the failed test's database {name} for diagnosis");
+            return;
+        }
+        let admin_url = std::mem::take(&mut self.admin_url);
+        let (done_tx, done) = std::sync::mpsc::channel::<()>();
+        // Its own thread and runtime: Drop runs on whatever thread the test ends on,
+        // inside or outside a tokio runtime. The DROP's FORCE ends the pool's
+        // connections server-side; a stuck drop cannot hang the harness — the join is
+        // bounded.
+        let spawn = std::thread::Builder::new()
+            .name(format!("drop-{name}"))
+            .spawn(move || {
+                let _ = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map(|rt| {
+                        rt.block_on(async move {
+                            if let Ok(mut admin) = PgConnection::connect(&admin_url).await {
+                                let _ = admin
+                                    .execute(AssertSqlSafe(format!(
+                                        "DROP DATABASE IF EXISTS {name} WITH (FORCE)"
+                                    )))
+                                    .await;
+                                let _ = admin.close().await;
+                            }
+                        });
+                    });
+                let _ = done_tx.send(());
+            });
+        if spawn.is_ok() {
+            let _ = done.recv_timeout(Duration::from_secs(10));
         }
     }
 }

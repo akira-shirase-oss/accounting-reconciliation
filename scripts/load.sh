@@ -42,8 +42,9 @@ host="$(sed -E 's#^postgres(ql)?://[^@]*@([^/]*)/.*#\2#' <<<"$RECON_ADMIN_DATABA
 ./target/release/recon db setup --database "$db" >/dev/null
 ./target/release/recon db migrate --database "$db" >/dev/null
 cleanup() {
-  docker compose -f deploy/compose.yaml exec -T postgres \
-    psql -q -U recon_admin -d recon_admin -c "DROP DATABASE IF EXISTS ${db} WITH (FORCE)" >/dev/null 2>&1 || true
+  # The scratch database goes with the run, over TCP on the administrator's URL — no
+  # docker on the path, and `recon db drop` only accepts the harnesses' own prefixes.
+  ./target/release/recon db drop --database "$db" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
