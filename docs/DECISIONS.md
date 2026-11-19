@@ -864,7 +864,11 @@ conservative side.
   `database_unavailable`; see `perf/results/r2-match-full-20261119T142406Z.json`). The
   drive deadline's per-line term stretches by `matching_concurrency / cores`: the
   deadline bounds hung work, and an engine that owns a fraction of a core takes
-  proportionally longer in wall time.
+  proportionally longer in wall time. The result keeps two numbers apart, never
+  conflated: the runner regression tripwire that gates CI (100 decided lines/s,
+  drive p99 — first cursor to complete, queue time excluded — 300 s) and the
+  capacity target (2,000 lines/s, the original bar), recorded as unmet on shared
+  hardware and owed for a dedicated host. The tripwire is not capacity.
 
 ## Open questions (blocked on the maintainer or an outside party)
 

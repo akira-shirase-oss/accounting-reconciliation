@@ -939,23 +939,34 @@ async fn r2_match(
         .saturating_add(exceptions);
     let lines_per_s = decided as f64 / match_seconds;
     let p99 = percentile(&latencies, 99.0);
-    // The latency a job's own drive takes is the bound; its submission-to-completion
-    // time legitimately includes the queue. The full mode's floors are the shared
-    // 4-core runner's honest capacity: the first run's ~173 decided lines/s (starved;
-    // run 44542812913) puts a regression tripwire at 100, and a drive that nears the
-    // job's stretched deadline (~260 s there) is itself the signal — 300 s bounds it.
+    // Two separate numbers, never conflated. The tripwire gates CI on the shared
+    // 4-core runner — a regression detector floored by the first run's starved
+    // ~173 decided lines/s (run 44542812913) and by the drive deadline (~260 s
+    // there). The capacity target is the original bar a dedicated host must
+    // still meet: it is recorded here, never gated on shared hardware, and a
+    // shared runner honestly reports it unmet. The tripwire is not capacity.
     let drive_p99 = percentile(&drive_latencies, 99.0);
-    let (lines_min, p99_max) = if plan.mode == "full" {
-        (100.0, 300_000.0)
+    let (lines_min, p99_max, label) = if plan.mode == "full" {
+        (100.0, 300_000.0, "runner regression tripwire")
     } else {
-        (300.0, 60_000.0)
+        (300.0, 60_000.0, "smoke")
     };
     let thresholds = json!({
+        "label": label,
         "lines_per_s_min": lines_min,
         "job_drive_p99_ms_max": p99_max,
         "server_peak_rss_bytes_max": 536_870_912_u64,
         "errors_max": 0,
     });
+    let capacity_target = if plan.mode == "full" {
+        json!({
+            "lines_per_s_min": 2_000.0,
+            "met": lines_per_s >= 2_000.0,
+            "owed": "a dedicated host; the shared-runner tripwire is not capacity",
+        })
+    } else {
+        Value::Null
+    };
     let checks = json!({
         "every_job_complete_with_digest": usize::try_from(jobs_complete).unwrap_or(0) == truth.len() && jobs_no_digest == 0 && jobs_failed == 0 && pending.is_empty(),
         "line_states_equal_truth_per_client": states_ok,
@@ -1010,6 +1021,12 @@ async fn r2_match(
             "jobs_completed": latencies.len(), "jobs_failed": jobs_failed,
             "errors": errors.len(),
             "first_errors": errors.iter().take(5).collect::<Vec<_>>(),
+            "jobs_never_admitted": truth.len().saturating_sub(
+                usize::try_from(jobs_complete).unwrap_or(0)
+                    + jobs_failed as usize
+                    + pending.len(),
+            ),
+            "jobs_open_at_close": pending.len(),
             "truth": { "t1_matched": m_total, "proposed": p_total, "exception": e_total },
             "database": {
                 "committed_t1": committed_t1, "committed_other_tiers": committed_other,
@@ -1023,6 +1040,7 @@ async fn r2_match(
         },
         "checks": checks,
         "thresholds": thresholds,
+        "capacity_target": capacity_target,
         "checks_pass": checks_pass,
         "thresholds_pass": thresholds_pass,
         "pass": checks_pass && thresholds_pass,
