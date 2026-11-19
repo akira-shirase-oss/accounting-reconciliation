@@ -32,6 +32,8 @@ pub enum FaultPoint {
     MatchBeforeFinish,
     /// The job row is `complete`; the worker has not exited.
     MatchFinished,
+    /// The engine stretch started; it never returns (the deadline drill's hung engine).
+    MatchEngine,
 }
 
 impl FaultPoint {
@@ -45,6 +47,7 @@ impl FaultPoint {
             "match_snapshot" => Self::MatchSnapshot,
             "match_before_finish" => Self::MatchBeforeFinish,
             "match_finished" => Self::MatchFinished,
+            "match_engine" => Self::MatchEngine,
             other => other
                 .strip_prefix("staged_batch:")
                 .and_then(|n| n.parse().ok())
@@ -101,6 +104,27 @@ impl Faults {
             std::future::pending::<()>().await;
         }
         #[cfg(not(feature = "fault-injection"))]
+        let _ = point;
+    }
+
+    /// Called inside `spawn_blocking` where nothing may await: same marker, then the
+    /// thread sleeps forever (the blocking-pool thread leaks until the process ends).
+    #[cfg(feature = "fault-injection")]
+    pub fn reached_blocking(&self, point: FaultPoint) {
+        if let Some((target, marker)) = &self.target
+            && *target == point
+        {
+            tracing::warn!(?point, "fault point reached; pausing for the drill");
+            let _ = std::fs::write(marker, b"reached");
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(3_600));
+            }
+        }
+    }
+
+    /// The no-fault build's `reached_blocking` is a no-op.
+    #[cfg(not(feature = "fault-injection"))]
+    pub fn reached_blocking(&self, point: FaultPoint) {
         let _ = point;
     }
 }

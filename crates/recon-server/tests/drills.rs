@@ -782,3 +782,98 @@ async fn drill_kill_mid_batch() {
         started.elapsed()
     );
 }
+
+/// The deadline's proof: `match_engine` hangs the engine stretch inside
+/// `spawn_blocking`, and the drive's own deadline — not the lease — ends the job
+/// `deadline_exceeded`. After it, nothing holds the lease and the sweeper leaves
+/// the failed job alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn drill_matching_deadline_exceeded() {
+    let db = TestDb::new().await;
+    fixed_tenant(&db).await;
+    let marker = std::env::temp_dir().join(format!(
+        "recon-deadline-{}-{}.marker",
+        std::process::id(),
+        Uuid::now_v7()
+    ));
+    let marker_text = marker.display().to_string();
+    let env: Vec<(&str, &str)> = MATCH_ENV
+        .iter()
+        .copied()
+        .chain([
+            ("RECON_FAULT", "match_engine"),
+            ("RECON_FAULT_MARKER", marker_text.as_str()),
+            ("RECON_MATCHING_DEADLINE_MS", "2000"),
+            ("RECON_MATCHING_DEADLINE_PER_LINE_MS", "0"),
+            ("RECON_MATCHING_DEADLINE_MAX_MS", "2000"),
+        ])
+        .collect();
+    let server = Server::start(&db.app_url(), &env).await;
+    let (firm, account) = firm_path();
+    let client = CLIENT.to_string();
+    let set = match_set(&MatchSpec {
+        seed: SEED,
+        lines: 500,
+        distractors: 50,
+        currency: Currency::Usd,
+        start: Date::new(2026, 3, 1).unwrap(),
+        days: 28,
+    });
+    let (status, body) = upload(&server.base, &firm, &account, set.statement)
+        .await
+        .unwrap();
+    assert_eq!(status, 201, "{body}");
+    upload_documents(&server.base, &firm, &client, set.documents).await;
+    let job = post_job(&server.base, &firm, &client).await;
+    let job_id = Uuid::parse_str(&job).unwrap();
+
+    // The engine stretch is reached — and hangs inside `spawn_blocking`.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !marker.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the engine fault point was never reached"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // The drive deadline (2 s) ends the job `deadline_exceeded`; the heartbeat
+    // cannot hold it forever.
+    let status = wait_job(&db, job_id, Duration::from_secs(60)).await;
+    assert_eq!(
+        status, "failed",
+        "the hung engine held the job past its deadline"
+    );
+    let code: Option<String> = sqlx::query_scalar(
+        "SELECT error_code FROM recon.match_jobs WHERE firm_id = $1 AND id = $2",
+    )
+    .bind(FIRM.as_uuid())
+    .bind(job_id)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(code.as_deref(), Some("deadline_exceeded"));
+
+    // Nothing holds the lease afterwards: two lease windows on, the row's lease is
+    // spent, and across several sweeps the failed job stays failed.
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    let held: bool = sqlx::query_scalar(
+        "SELECT lease_until > pg_catalog.clock_timestamp()
+           FROM recon.match_jobs WHERE firm_id = $1 AND id = $2",
+    )
+    .bind(FIRM.as_uuid())
+    .bind(job_id)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert!(!held, "a dead job still holds a live lease");
+    assert_eq!(
+        wait_job(&db, job_id, Duration::from_secs(1)).await,
+        "failed",
+        "the sweeper resurrected a failed job"
+    );
+    let log = server.stop().await;
+    assert_log_clean(&log, &GENERATED_CONTENT);
+    let _ = std::fs::remove_file(&marker);
+    db.cleanup().await;
+}

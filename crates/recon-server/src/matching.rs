@@ -77,29 +77,54 @@ async fn run(state: AppState, lease: JobLease, shutdown: CancellationToken) {
     // The lease renews on every chunk commit; the snapshot-and-engine stretch in
     // between can run far past one lease window, so a heartbeat keeps it alive.
     // Its cadence is a third of the lease: two missed renewals may pass before the
-    // sweeper could claim the job. A lost lease stops the heart — the drive then
-    // fails fenced at its next write.
+    // sweeper could claim the job. Only a lost lease stops the heart — transient
+    // failures simply retry on the next beat — and losing it cancels the drive at
+    // once, at `drive_cancel`, rather than letting it compute until its next fenced
+    // write. The drive's own deadline (floor + per pinned line, capped) bounds the
+    // whole stretch anyway: a hung engine ends `deadline_exceeded`, never a lease
+    // held forever by a worker that cannot finish.
+    let drive_cancel = shutdown.child_token();
     let heartbeat = CancellationToken::new();
     let beat = {
-        let (pool, token) = (state.pool.clone(), heartbeat.clone());
+        let pool = state.pool.clone();
+        let (stop, cancel) = (heartbeat.clone(), drive_cancel.clone());
         let lease_for = state.config.matching_lease;
         tokio::spawn(async move {
             let every = (lease_for / 3).max(Duration::from_millis(50));
+            // The renew call is bounded well inside the beat.
+            let renew_for = (every / 2).max(Duration::from_millis(10));
             loop {
                 tokio::select! {
                     () = tokio::time::sleep(every) => {
-                        if matching::renew(&pool, &lease, lease_for).await.is_err() {
-                            return;
+                        match tokio::time::timeout(
+                            renew_for,
+                            matching::renew(&pool, &lease, lease_for),
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => {}
+                            Ok(Err(recon_db::DbError::LeaseLost)) => {
+                                cancel.cancel();
+                                return;
+                            }
+                            Ok(Err(e)) => {
+                                tracing::debug!(error = %e, "lease renewal failed; retrying next beat");
+                            }
+                            Err(_) => {
+                                tracing::debug!("lease renewal timed out; retrying next beat");
+                            }
                         }
                     }
-                    () = token.cancelled() => return,
+                    () = stop.cancelled() => return,
                 }
             }
         })
     };
-    let driven = drive(&state, &lease, &shutdown).await;
+    let driven = drive(&state, &lease, &drive_cancel).await;
     heartbeat.cancel();
-    let _ = beat.await;
+    if let Err(e) = beat.await {
+        tracing::error!(error = %e, "the matching heartbeat task died");
+    }
     match driven {
         Ok(()) => {}
         Err(Step::LeaseLost) => tracing::info!("matching job lost its lease; stopping"),
@@ -135,7 +160,7 @@ impl Step {
 async fn drive(
     state: &AppState,
     lease: &JobLease,
-    shutdown: &CancellationToken,
+    drive_cancel: &CancellationToken,
 ) -> Result<(), Step> {
     let pool = &state.pool;
     let lease_for = state.config.matching_lease;
@@ -159,12 +184,55 @@ async fn drive(
     }
     let (seqs, engine_lines, engine_docs) = engine_inputs(lines, documents);
 
-    // The engine is pure CPU: off the async threads, bounded by its own budgets (D-013).
+    // The engine-and-commit stretch runs under the job's deadline — floor plus
+    // per pinned line, capped — computed off the snapshot count. The DB calls
+    // before it carry the pool's own acquire and statement deadlines.
+    let deadline = state.config.matching_deadline(line_count);
+    tokio::select! {
+        () = tokio::time::sleep(deadline) => {
+            drive_cancel.cancel();
+            Err(Step::Failed("deadline_exceeded"))
+        }
+        result = drive_engine_and_commit(
+            state, lease, drive_cancel, lease_for, statement_timeout,
+            settings, seqs, engine_lines, engine_docs,
+        ) => result,
+    }
+}
+
+/// The deadline-bounded stretch: the engine (off the async threads on
+/// `tokio::task::spawn_blocking`) then the 500-line fenced chunk commits.
+/// `drive_cancel` is checked before the engine, before its results are used and
+/// between chunks — a lost lease or a shutdown stops it at once.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one deadline-bounded stretch; the parts share no natural owner"
+)]
+async fn drive_engine_and_commit(
+    state: &AppState,
+    lease: &JobLease,
+    drive_cancel: &CancellationToken,
+    lease_for: Duration,
+    statement_timeout: Duration,
+    settings: recon_match::Settings,
+    seqs: BTreeMap<LineId, i64>,
+    engine_lines: Vec<recon_match::LineInput>,
+    engine_docs: Vec<recon_match::DocumentInput>,
+) -> Result<(), Step> {
+    if drive_cancel.is_cancelled() {
+        return Err(Step::LeaseLost);
+    }
+    let pool = &state.pool;
+    let faults = state.faults.clone();
     let run = tokio::task::spawn_blocking(move || {
+        faults.reached_blocking(crate::faults::FaultPoint::MatchEngine);
         recon_match::run(&engine_lines, &engine_docs, &settings)
     })
     .await
     .map_err(|_| Step::Failed("engine_panicked"))?;
+    if drive_cancel.is_cancelled() {
+        return Err(Step::LeaseLost);
+    }
 
     // Resume starts after the cursor; each chunk commits the outcomes it holds.
     let cursor = matching::get(pool, lease.firm, lease.id)
@@ -197,7 +265,7 @@ async fn drive(
                 .faults
                 .reached(crate::faults::FaultPoint::MatchChunk(chunks))
                 .await;
-            if shutdown.is_cancelled() {
+            if drive_cancel.is_cancelled() {
                 return Err(Step::LeaseLost);
             }
         }
