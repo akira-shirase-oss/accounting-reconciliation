@@ -1,12 +1,13 @@
 //! Route handlers. The firm comes from the path until R3 (the operator acts for every firm);
 //! from R3 it comes from the signed-in user's session and the path must agree with it.
 
-use axum::Json;
 use axum::body::Body;
 use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
+use axum::{Extension, Json};
 use recon_db::{imports, tenancy};
+use recon_domain::auth::Act;
 use recon_domain::import::PROFILE_DOCUMENTS;
 use recon_domain::text::is_forbidden;
 use recon_domain::{AccountId, ClientId, Currency, FirmId, ImportId};
@@ -14,6 +15,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+use crate::auth::{Auth, Session, authorize};
 use crate::error::ApiError;
 use crate::state::AppState;
 use crate::{profiles, upload};
@@ -45,6 +47,19 @@ fn body<T>(payload: Result<Json<T>, JsonRejection>) -> Result<T, ApiError> {
             "the request body is not the expected JSON",
         )
     })
+}
+
+/// The client-assignment half of authorization: the operator passes (D-021
+/// transitional); a person sees only an assigned client (D-018).
+async fn assigned(
+    state: &AppState,
+    session: Option<&Session>,
+    client: ClientId,
+) -> Result<(), ApiError> {
+    if let Some(session) = session {
+        session.client_scope(&state.pool, client).await?;
+    }
+    Ok(())
 }
 
 /// Liveness: the process is up.
@@ -88,10 +103,13 @@ pub struct NewAccount {
 /// `POST /v1/firms`.
 pub async fn create_firm(
     State(state): State<AppState>,
+    Extension(auth): Extension<Auth>,
     payload: Result<Json<NewNamed>, JsonRejection>,
 ) -> ApiResult {
-    let payload = body(payload)?;
     let firm = FirmId::from_uuid(Uuid::now_v7());
+    // A person's session is bound to their own firm, so this is the operator's route.
+    authorize(&auth, firm, Act::FirmSettings)?;
+    let payload = body(payload)?;
     tenancy::create_firm(&state.pool, firm, name(&payload.name)?).await?;
     Ok((
         StatusCode::CREATED,
@@ -102,10 +120,12 @@ pub async fn create_firm(
 /// `POST /v1/firms/{firm}/clients`.
 pub async fn create_client(
     State(state): State<AppState>,
+    Extension(auth): Extension<Auth>,
     Path(firm): Path<String>,
     payload: Result<Json<NewNamed>, JsonRejection>,
 ) -> ApiResult {
     let firm = FirmId::from_uuid(id(&firm)?);
+    authorize(&auth, firm, Act::FirmSettings)?;
     let payload = body(payload)?;
     if !tenancy::firm_exists(&state.pool, firm).await? {
         return Err(ApiError::not_found());
@@ -121,11 +141,14 @@ pub async fn create_client(
 /// `POST /v1/firms/{firm}/clients/{client}/accounts`.
 pub async fn create_account(
     State(state): State<AppState>,
+    Extension(auth): Extension<Auth>,
     Path((firm, client)): Path<(String, String)>,
     payload: Result<Json<NewAccount>, JsonRejection>,
 ) -> ApiResult {
     let firm = FirmId::from_uuid(id(&firm)?);
     let client = ClientId::from_uuid(id(&client)?);
+    let session = authorize(&auth, firm, Act::FirmSettings)?;
+    assigned(&state, session, client).await?;
     let payload = body(payload)?;
     let currency = Currency::from_code(&payload.currency).map_err(|_| {
         ApiError::new(
@@ -219,6 +242,7 @@ fn import_capacity(state: &AppState) -> Result<tokio::sync::OwnedSemaphorePermit
 /// `profile=ofx`.
 pub async fn upload_statement(
     State(state): State<AppState>,
+    Extension(auth): Extension<Auth>,
     Path((firm, account)): Path<(String, String)>,
     params: Result<Query<ProfileQuery>, QueryRejection>,
     headers: HeaderMap,
@@ -226,6 +250,12 @@ pub async fn upload_statement(
 ) -> ApiResult {
     let firm = FirmId::from_uuid(id(&firm)?);
     let account = AccountId::from_uuid(id(&account)?);
+    let session = authorize(&auth, firm, Act::Import)?;
+    if let Some(session) = session {
+        // The path names an account; the assignment check needs its client.
+        let row = tenancy::account(&state.pool, firm, account).await?;
+        session.client_scope(&state.pool, row.client).await?;
+    }
     let params = query(params)?;
     let name = params
         .profile
@@ -253,6 +283,7 @@ pub async fn upload_statement(
 /// `r1-generic-documents`).
 pub async fn upload_documents(
     State(state): State<AppState>,
+    Extension(auth): Extension<Auth>,
     Path((firm, client)): Path<(String, String)>,
     params: Result<Query<ProfileQuery>, QueryRejection>,
     headers: HeaderMap,
@@ -260,6 +291,8 @@ pub async fn upload_documents(
 ) -> ApiResult {
     let firm = FirmId::from_uuid(id(&firm)?);
     let client = ClientId::from_uuid(id(&client)?);
+    let session = authorize(&auth, firm, Act::Import)?;
+    assigned(&state, session, client).await?;
     let params = query(params)?;
     let name = params.profile.as_deref().unwrap_or(PROFILE_DOCUMENTS);
     let (profile, compiled) = profiles::documents(&state.pool, firm, name, params.version).await?;
@@ -282,11 +315,14 @@ pub async fn upload_documents(
 /// (D-068).
 pub async fn get_import(
     State(state): State<AppState>,
+    Extension(auth): Extension<Auth>,
     Path((firm, import)): Path<(String, String)>,
 ) -> ApiResult {
     let firm = FirmId::from_uuid(id(&firm)?);
     let import = ImportId::from_uuid(id(&import)?);
+    let session = authorize(&auth, firm, Act::Read)?;
     let record = imports::get(&state.pool, firm, import).await?;
+    assigned(&state, session, ClientId::from_uuid(record.client_id)).await?;
     let report = if record.status == "refused" {
         let profile = profiles::resolve(
             &state.pool,
@@ -318,13 +354,16 @@ pub struct ChangesQuery {
 /// revision lists (D-065), up to 1,000 per page, in order.
 pub async fn revision_changes(
     State(state): State<AppState>,
+    Extension(auth): Extension<Auth>,
     Path((firm, import)): Path<(String, String)>,
     params: Result<Query<ChangesQuery>, QueryRejection>,
 ) -> ApiResult {
     let firm = FirmId::from_uuid(id(&firm)?);
     let import = ImportId::from_uuid(id(&import)?);
+    let session = authorize(&auth, firm, Act::Read)?;
     let params = query(params)?;
     let record = imports::get(&state.pool, firm, import).await?;
+    assigned(&state, session, ClientId::from_uuid(record.client_id)).await?;
     let limit = params.limit.unwrap_or(imports::MAX_CHANGES_PAGE);
     let changes = imports::revision_changes(
         &state.pool,
@@ -347,10 +386,18 @@ pub async fn revision_changes(
 /// `POST /v1/firms/{firm}/imports/{import}/accept`: accepts a held revision.
 pub async fn accept_revision(
     State(state): State<AppState>,
+    Extension(auth): Extension<Auth>,
     Path((firm, import)): Path<(String, String)>,
 ) -> ApiResult {
     let firm = FirmId::from_uuid(id(&firm)?);
     let import = ImportId::from_uuid(id(&import)?);
+    let session = authorize(&auth, firm, Act::Import)?;
+    assigned(
+        &state,
+        session,
+        ClientId::from_uuid(imports::get(&state.pool, firm, import).await?.client_id),
+    )
+    .await?;
     let record = imports::accept_revision(
         &state.pool,
         firm,
@@ -366,10 +413,18 @@ pub async fn accept_revision(
 /// `POST /v1/firms/{firm}/imports/{import}/reject`: rejects a held revision.
 pub async fn reject_revision(
     State(state): State<AppState>,
+    Extension(auth): Extension<Auth>,
     Path((firm, import)): Path<(String, String)>,
 ) -> ApiResult {
     let firm = FirmId::from_uuid(id(&firm)?);
     let import = ImportId::from_uuid(id(&import)?);
+    let session = authorize(&auth, firm, Act::Import)?;
+    assigned(
+        &state,
+        session,
+        ClientId::from_uuid(imports::get(&state.pool, firm, import).await?.client_id),
+    )
+    .await?;
     let record = imports::reject_revision(&state.pool, firm, import, upload::OPERATOR).await?;
     tracing::info!(import = %import, "revision rejected");
     Ok((StatusCode::OK, Json(json!({ "import": record }))))
@@ -378,10 +433,12 @@ pub async fn reject_revision(
 /// `POST /v1/firms/{firm}/profiles`: stores the next version of a profile.
 pub async fn create_profile(
     State(state): State<AppState>,
+    Extension(auth): Extension<Auth>,
     Path(firm): Path<String>,
     payload: Result<Json<profiles::NewProfile>, JsonRejection>,
 ) -> ApiResult {
     let firm = FirmId::from_uuid(id(&firm)?);
+    authorize(&auth, firm, Act::Import)?;
     let payload = body(payload)?;
     let profile = profiles::create(&state.pool, firm, payload).await?;
     Ok((StatusCode::CREATED, Json(json!({ "profile": profile }))))
@@ -397,10 +454,12 @@ pub struct VersionQuery {
 /// `GET /v1/firms/{firm}/profiles/{name}[?version=]`.
 pub async fn get_profile(
     State(state): State<AppState>,
+    Extension(auth): Extension<Auth>,
     Path((firm, name)): Path<(String, String)>,
     params: Result<Query<VersionQuery>, QueryRejection>,
 ) -> ApiResult {
     let firm = FirmId::from_uuid(id(&firm)?);
+    authorize(&auth, firm, Act::Read)?;
     let params = query(params)?;
     let profile = profiles::describe(&state.pool, firm, &name, params.version).await?;
     Ok((StatusCode::OK, Json(json!({ "profile": profile }))))
@@ -412,10 +471,13 @@ pub async fn get_profile(
 /// naming the running job.
 pub async fn start_matching_job(
     State(state): State<AppState>,
+    Extension(auth): Extension<Auth>,
     Path((firm, client)): Path<(String, String)>,
 ) -> ApiResult {
     let firm = FirmId::from_uuid(id(&firm)?);
     let client = ClientId::from_uuid(id(&client)?);
+    let session = authorize(&auth, firm, Act::Import)?;
+    assigned(&state, session, client).await?;
     if !state.startup_checked() {
         return Err(ApiError::database_unavailable());
     }
@@ -445,10 +507,13 @@ pub async fn start_matching_job(
 /// digest.
 pub async fn get_matching_job(
     State(state): State<AppState>,
+    Extension(auth): Extension<Auth>,
     Path((firm, client, job)): Path<(String, String, String)>,
 ) -> ApiResult {
     let firm = FirmId::from_uuid(id(&firm)?);
     let client = ClientId::from_uuid(id(&client)?);
+    let session = authorize(&auth, firm, Act::Read)?;
+    assigned(&state, session, client).await?;
     let job = id(&job)?;
     let record = recon_db::matching::get(&state.pool, firm, job).await?;
     if record.client_id != client.as_uuid() {

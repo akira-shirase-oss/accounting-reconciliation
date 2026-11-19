@@ -17,6 +17,7 @@ pub mod matching;
 pub mod pool;
 pub mod profiles;
 pub mod replay;
+pub mod review;
 pub mod roles;
 pub mod tenancy;
 #[cfg(feature = "test-support")]

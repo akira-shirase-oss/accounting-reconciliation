@@ -261,12 +261,50 @@ async fn open_session(state: &AppState, token: &[u8; 32]) -> Result<Option<Sessi
     }))
 }
 
-fn forbidden_role() -> ApiError {
+/// The 403 a role refusal answers.
+pub fn forbidden_role() -> ApiError {
     ApiError::new(
         StatusCode::FORBIDDEN,
         "forbidden",
         "this role may not do that",
     )
+}
+
+/// The route-level permission check, enforced server-side on every route (D-018). The
+/// operator token passes (transitional, D-041); a person needs `act` in their role's
+/// matrix entry and the path's firm to be theirs. Returns the session for the
+/// handler's client-assignment and actor needs.
+pub fn authorize(auth: &Auth, firm: FirmId, act: Act) -> Result<Option<&Session>, ApiError> {
+    match auth {
+        Auth::Operator => Ok(None),
+        Auth::Person(session) => {
+            session.firm_scope(firm)?;
+            if may(session.role, act) {
+                Ok(Some(session))
+            } else {
+                Err(forbidden_role())
+            }
+        }
+    }
+}
+
+/// Routes only a person may act on (review decisions need a named person; the operator
+/// cannot approve): the session, authorized for `act`, or a refusal.
+pub fn person_authorized(auth: &Auth, firm: FirmId, act: Act) -> Result<&Session, ApiError> {
+    let Auth::Person(session) = auth else {
+        return Err(session_required());
+    };
+    session.firm_scope(firm)?;
+    if may(session.role, act) {
+        Ok(session)
+    } else {
+        Err(forbidden_role())
+    }
+}
+
+/// Any review act at all — the cheap pre-check before a handler reads the subject.
+pub fn may_review(role: Role) -> bool {
+    may(role, Act::ApproveProposal) || may(role, Act::ApproveFourEyes)
 }
 
 fn csrf_required() -> ApiError {
@@ -277,7 +315,8 @@ fn csrf_required() -> ApiError {
     )
 }
 
-fn session_required() -> ApiError {
+/// The 401 a person-only route answers a non-person credential.
+pub fn session_required() -> ApiError {
     ApiError::new(
         StatusCode::UNAUTHORIZED,
         "session_required",
@@ -330,8 +369,10 @@ pub async fn require_actor(
         request.extensions_mut().insert(Auth::Operator);
         return next.run(request).await;
     }
+    // No credential at all on a route that opens to either: `unauthorized`, the
+    // operator-token contract's answer (`session_required` names a person-only refusal).
     let Some(token) = cookie_token(&request) else {
-        return session_required().into_response();
+        return ApiError::unauthorized().into_response();
     };
     let session = match open_session(&state, &token).await {
         Ok(Some(session)) => session,
