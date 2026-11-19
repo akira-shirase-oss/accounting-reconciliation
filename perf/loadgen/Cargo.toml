@@ -12,10 +12,12 @@ anyhow.workspace = true
 recon-cli.workspace = true
 recon-db.workspace = true
 recon-domain.workspace = true
+recon-server.workspace = true
 reqwest.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
 tokio = { workspace = true, features = ["process", "io-util"] }
+uuid.workspace = true
 
 [lints.rust]
 unsafe_code = "forbid"

@@ -86,9 +86,38 @@ MODE=full scripts/load.sh r2-match    # perf/results/r2-match-full-<stamp>.json 
 MODE=smoke scripts/load.sh r2-match   # target/perf/
 ```
 
-Run the full size only on a quiet machine (`uptime` load average below about
-6 on this 12-core laptop); otherwise run the smoke and record the full run as
-owed. CI runs the smoke on every push.
+## `r3-review` (ROADMAP R3, D-018)
+
+The unit is one review request on the shared queue — a queue read or a
+decision; the full run's bar is at least 1,000,000 such requests (the
+workspace standard restated in the scenario's unit). Each client is seeded
+exactly as `r2-match` (a `gen-v3` month, its matching job drained — full:
+80 clients x 5,000 lines, smoke: 8 x 800), then `RECON_LOAD_REVIEWERS`
+(default 64, smoke included) real reviewers — created by the operator,
+TOTP-enrolled and signed in over the public auth routes — work every
+client's queue concurrently: approve or reject the proposed matches,
+exclude or manually match the exception lines, and decide the rejected
+proposals' orphaned `unreviewed` lines the same way, until every line is
+`matched` or `excluded`. Four-eyes proposals take two distinct people;
+row-version 409s and named 422 refusals under contention are counted,
+never a lost or double decision.
+
+Checks (all must hold): every match terminal (none left `proposed`, no open
+proposal rows); every line decided and no exception rows left; no subject
+decided twice terminally; a committed four-eyes match shows at least two
+distinct persons and never its first approver committing; zero job-committed
+matches outside `t1`; the decision log replays; a full run issues at least
+1,000,000 review requests. Thresholds — full tripwire on the shared runner:
+at least 100 requests/s, decision p99 at most 5,000 ms, conflict rate at most
+95%, server peak RSS at most 512 MiB, zero errors; `capacity_target` records
+the dedicated-host bar (500 requests/s, p99 500 ms) alongside, unmet on
+shared hardware. Smoke (8 clients x 800 lines, 64 reviewers): at least 15
+requests/s, decision p99 at most 10,000 ms.
+
+```sh
+MODE=full scripts/load.sh r3-review   # perf/results/r3-review-full-<stamp>.json (CI)
+MODE=smoke scripts/load.sh r3-review  # target/perf/
+```
 
 The full runs live in `.github/workflows/load-full.yml`: `gh workflow run
 load-full.yml -f scenario=all` (or `-f scenario=r2-match`) runs each scenario

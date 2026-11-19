@@ -16,6 +16,13 @@
 #                                          statement, documents, matching job, outcome
 #                                          checked against the truth file); MODE=smoke:
 #                                          10 clients x 1,000 lines
+#   MODE=full  scripts/load.sh r3-review   1,000,000+ review requests on a shared queue
+#                                          (80 clients seeded as r2-match, then 64 real
+#                                          enrolled reviewers approve/reject/exclude/
+#                                          manual-match every queued item until every
+#                                          line is matched or excluded; 409s and named
+#                                          refusals counted); MODE=smoke: 8 clients x
+#                                          800 lines, 64 reviewers
 #
 # Every result records the machine, the commit (and whether the tree was dirty) and the
 # load average before and after: a run on a busy machine is visibly a busy-machine
@@ -24,9 +31,9 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-scenario="${1:?usage: MODE=full|smoke scripts/load.sh r0-import|r1-import|r2-match}"
+scenario="${1:?usage: MODE=full|smoke scripts/load.sh r0-import|r1-import|r2-match|r3-review}"
 case "$scenario" in
-  r0-import | r1-import | r2-match) ;;
+  r0-import | r1-import | r2-match | r3-review) ;;
   *) echo "error: unknown scenario $scenario" >&2; exit 2 ;;
 esac
 mode="${MODE:-smoke}"

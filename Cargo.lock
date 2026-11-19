@@ -1271,10 +1271,12 @@ dependencies = [
  "recon-cli",
  "recon-db",
  "recon-domain",
+ "recon-server",
  "reqwest",
  "serde_json",
  "sqlx",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

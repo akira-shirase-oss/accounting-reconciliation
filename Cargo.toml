@@ -16,6 +16,7 @@ recon-import = { path = "crates/recon-import" }
 recon-match = { path = "crates/recon-match" }
 recon-db = { path = "crates/recon-db" }
 recon-cli = { path = "crates/recon-cli" }
+recon-server = { path = "crates/recon-server" }
 
 # External crates: versions live here only. Minimal features; one async runtime (Tokio);
 # one TLS stack (rustls with ring and the webpki roots, so `sslmode=require` and

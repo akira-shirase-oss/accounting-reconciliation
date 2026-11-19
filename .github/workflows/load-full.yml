@@ -14,16 +14,19 @@ name: load-full
 #   gh workflow run load-full.yml -f scenario=r2-match
 #
 # Expected durations on a 4-core hosted runner (build aside): r0-import a few
-# minutes (its last run did 1M lines in ~19 s), r1-import under ten minutes, and
+# minutes (its last run did 1M lines in ~19 s), r1-import under ten minutes,
 # r2-match around two hours: 200 clients each upload a gen-v3 month, then the
 # matching jobs drain 8 at a time through the durable queue at the runner's
 # observed ~200 decided lines a second (the first run's evidence, run 44542812913).
+# r3-review seeds 80 clients the same gen-v3 way, then works the shared review
+# queue with 64 enrolled reviewers until every line is decided: its bar is a
+# million review requests, around three hours at the first-run estimate.
 
 on:
   workflow_dispatch:
     inputs:
       scenario:
-        description: "all, or scenarios separated by commas (r0-import, r1-import, r2-match)"
+        description: "all, or scenarios separated by commas (r0-import, r1-import, r2-match, r3-review)"
         type: string
         default: all
 
@@ -49,7 +52,7 @@ jobs:
         env:
           CHOSEN: ${{ inputs.scenario }}
         run: |
-          all='["r0-import","r1-import","r2-match"]'
+          all='["r0-import","r1-import","r2-match","r3-review"]'
           if [ "$CHOSEN" = all ]; then
             echo "scenarios=$all" >> "$GITHUB_OUTPUT"
             exit 0
@@ -64,9 +67,9 @@ jobs:
     name: load ${{ matrix.scenario }} (full)
     needs: plan
     runs-on: ubuntu-latest
-    # The longest scenario (r2-match) takes around two hours on the runner; the build
-    # and the database's own setup come on top.
-    timeout-minutes: 210
+    # The longest scenario (r3-review: the r2-match seed plus the review phase) takes
+    # around three hours on the runner; the build and the database's own setup come on top.
+    timeout-minutes: 270
     strategy:
       fail-fast: false
       matrix:

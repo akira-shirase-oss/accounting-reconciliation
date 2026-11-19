@@ -1,6 +1,16 @@
-//! `recon-loadgen`: the `r0-import`, `r1-import` and `r2-match` load scenarios (ROADMAP
-//! R0, R1 and R2; the unit, D-027, is one statement line taken through import — for
-//! `r2-match`, one line taken through matching: snapshot, engine, committed chunks).
+//! `recon-loadgen`: the `r0-import`, `r1-import`, `r2-match` and `r3-review` load
+//! scenarios (ROADMAP R0–R3; the unit, D-027, is one statement line taken through its
+//! milestone — for `r3-review`, one review request on a shared queue).
+//!
+//! `r3-review` seeds each client like `r2-match` (a gen-v3 month, the matching job),
+//! then enrols `reviewers` real users — created, TOTP-enrolled and signed in over the
+//! API — who work every client's review queue concurrently: approve or reject the
+//! proposed matches, exclude or manually match the exception lines, and resolve the
+//! rejected proposals' orphaned lines the same way, until every line is matched or
+//! excluded. Row-version 409s and named 422 refusals under contention are counted,
+//! never lost: the run then checks every match is terminal, every line decided, no
+//! subject decided twice terminally, a four-eyes commit's second eye is a different
+//! person, and the decision log replays to the stored state.
 //!
 //! `r2-match` gives each client one `gen-v3` month — statement plus documents plus the
 //! truth file — uploads both, then posts the client's matching job and waits for it.
@@ -63,13 +73,18 @@ fn env(name: &str) -> anyhow::Result<String> {
 impl Plan {
     fn from_env() -> anyhow::Result<Self> {
         let scenario = std::env::var("SCENARIO").unwrap_or_else(|_| "r0-import".into());
-        if !matches!(scenario.as_str(), "r0-import" | "r1-import" | "r2-match") {
-            bail!("SCENARIO must be r0-import, r1-import or r2-match, not {scenario:?}");
+        if !matches!(
+            scenario.as_str(),
+            "r0-import" | "r1-import" | "r2-match" | "r3-review"
+        ) {
+            bail!("SCENARIO must be r0-import, r1-import, r2-match or r3-review, not {scenario:?}");
         }
         let mode = std::env::var("MODE").unwrap_or_else(|_| "smoke".into());
         let (clients, files, lines) = match (scenario.as_str(), mode.as_str()) {
             ("r2-match", "full") => (200, 1, 5_000),
             ("r2-match", "smoke") => (10, 1, 1_000),
+            ("r3-review", "full") => (80, 1, 5_000),
+            ("r3-review", "smoke") => (8, 1, 800),
             (_, "full") => (200, 5, 1_000),
             (_, "smoke") => (20, 5, 500),
             (_, other) => bail!("MODE must be full or smoke, not {other:?}"),
@@ -359,6 +374,21 @@ async fn main() -> anyhow::Result<()> {
         )
         .await;
     }
+    if plan.scenario == "r3-review" {
+        return r3_review(
+            plan,
+            pairs,
+            http,
+            base,
+            token,
+            firm_id,
+            pool,
+            db_before,
+            server,
+            stderr_task,
+        )
+        .await;
+    }
     let jobs: Vec<(usize, usize)> = (0..plan.files_per_account)
         .flat_map(|f| (0..plan.clients).map(move |c| (c, f)))
         .collect();
@@ -605,27 +635,42 @@ fn truth_counts(truth: &[u8]) -> anyhow::Result<(u64, u64, u64)> {
     Ok((matched, proposed, exception))
 }
 
-/// The `r2-match` scenario: every client gets one generated `gen-v3` month (statement +
-/// documents + truth), both uploads go through the API, then the client's matching job
-/// runs and the database is checked line-for-line against the truth's label counts.
-#[allow(clippy::too_many_arguments, reason = "the scenario's shared run state")]
-async fn r2_match(
-    plan: Arc<Plan>,
-    pairs: Arc<Vec<(String, String)>>,
-    http: reqwest::Client,
-    base: String,
-    token: String,
-    firm_id: String,
-    pool: sqlx::PgPool,
-    db_before: i64,
-    mut server: tokio::process::Child,
-    stderr_task: tokio::task::JoinHandle<String>,
-) -> anyhow::Result<()> {
+/// What the shared seed left behind.
+struct SeedOutcome {
+    upload_seconds: f64,
+    match_seconds: f64,
+    /// `(client, t1_lines, proposed_lines, exception_lines)` from the truth files.
+    truth: Vec<(String, u64, u64, u64)>,
+    distractors: u32,
+    /// Submission→complete and first-cursor→complete job times (ms).
+    job_latencies: Vec<f64>,
+    drive_latencies: Vec<f64>,
+    jobs_failed: u64,
+    jobs_open: usize,
+    errors: Vec<String>,
+}
+
+/// The shared seed of the matching-backed scenarios (r2-match, r3-review): the firm's
+/// residual tolerances, then every client's gen-v3 set uploaded and its matching job
+/// driven to a terminal state — jobs past the worker limit queue for the sweeper.
+#[expect(
+    clippy::too_many_lines,
+    reason = "two phases, each with its own failure accounting"
+)]
+async fn seed_match_queue(
+    plan: &Arc<Plan>,
+    pairs: &Arc<Vec<(String, String)>>,
+    http: &reqwest::Client,
+    base: &str,
+    token: &str,
+    firm_id: &str,
+    pool: &sqlx::PgPool,
+) -> anyhow::Result<SeedOutcome> {
     // The firm's residual tolerances, pinned into each job (D-014): bank fees to 10.00.
     sqlx::query("UPDATE recon.firms SET residual_tolerances = $1 WHERE id = $2::uuid")
         .bind(json!({"USD": {"bank_fee": 1000, "tax_withheld": 0, "rounding": 0}}))
-        .bind(&firm_id)
-        .execute(&pool)
+        .bind(firm_id)
+        .execute(pool)
         .await
         .context("setting the firm's residual tolerances")?;
 
@@ -644,8 +689,12 @@ async fn r2_match(
             truth.clone(),
             pairs.clone(),
         );
-        let (http, base, token, firm_id) =
-            (http.clone(), base.clone(), token.clone(), firm_id.clone());
+        let (http, base, token, firm_id) = (
+            http.clone(),
+            base.to_owned(),
+            token.to_owned(),
+            firm_id.to_owned(),
+        );
         workers.spawn(async move {
             loop {
                 let c = next.fetch_add(1, Ordering::Relaxed);
@@ -722,7 +771,7 @@ async fn r2_match(
         let r = loop {
             let r = http
                 .post(format!("{base}{}", job_path(client)))
-                .bearer_auth(&token)
+                .bearer_auth(token)
                 .header("content-length", "0")
                 .send()
                 .await;
@@ -789,7 +838,7 @@ async fn r2_match(
         for (client, id, sent) in pending {
             let r = http
                 .get(format!("{base}{}/{id}", job_path(&client)))
-                .bearer_auth(&token)
+                .bearer_auth(token)
                 .send()
                 .await;
             match r {
@@ -855,7 +904,48 @@ async fn r2_match(
             .await
             .push(format!("job {id} never reached a terminal state"));
     }
-    let match_seconds = match_started.elapsed().as_secs_f64();
+    Ok(SeedOutcome {
+        upload_seconds,
+        match_seconds: match_started.elapsed().as_secs_f64(),
+        truth,
+        distractors,
+        job_latencies: latencies,
+        drive_latencies,
+        jobs_failed,
+        jobs_open: pending.len(),
+        errors: errors.lock().await.clone(),
+    })
+}
+
+/// The `r2-match` scenario: every client gets one generated `gen-v3` month (statement +
+/// documents + truth), both uploads go through the API, then the client's matching job
+/// runs and the database is checked line-for-line against the truth's label counts.
+#[allow(clippy::too_many_arguments, reason = "the scenario's shared run state")]
+async fn r2_match(
+    plan: Arc<Plan>,
+    pairs: Arc<Vec<(String, String)>>,
+    http: reqwest::Client,
+    base: String,
+    token: String,
+    firm_id: String,
+    pool: sqlx::PgPool,
+    db_before: i64,
+    mut server: tokio::process::Child,
+    stderr_task: tokio::task::JoinHandle<String>,
+) -> anyhow::Result<()> {
+    let seed = seed_match_queue(&plan, &pairs, &http, &base, &token, &firm_id, &pool).await?;
+    let SeedOutcome {
+        upload_seconds,
+        match_seconds,
+        truth,
+        distractors,
+        mut job_latencies,
+        mut drive_latencies,
+        jobs_failed,
+        jobs_open,
+        errors: seed_errors,
+    } = seed;
+    let errors = Arc::new(Mutex::new(seed_errors));
 
     // Verification against the database: terminal line states per client equal the
     // truth's label counts; committed matches are all t1; no subject decided twice.
@@ -926,7 +1016,7 @@ async fn r2_match(
     stop_server(&mut server, plan.port).await?;
     let _ = tokio::time::timeout(Duration::from_secs(10), stderr_task).await;
 
-    latencies.sort_by(f64::total_cmp);
+    job_latencies.sort_by(f64::total_cmp);
     drive_latencies.sort_by(f64::total_cmp);
     let errors = errors.lock().await.clone();
     let expected = plan.total_lines();
@@ -938,7 +1028,7 @@ async fn r2_match(
         .saturating_add(proposals)
         .saturating_add(exceptions);
     let lines_per_s = decided as f64 / match_seconds;
-    let p99 = percentile(&latencies, 99.0);
+    let p99 = percentile(&job_latencies, 99.0);
     // Two separate numbers, never conflated. The tripwire gates CI on the shared
     // 4-core runner — a regression detector floored by the first run's starved
     // ~173 decided lines/s (run 44542812913) and by the drive deadline (~260 s
@@ -968,7 +1058,7 @@ async fn r2_match(
         Value::Null
     };
     let checks = json!({
-        "every_job_complete_with_digest": usize::try_from(jobs_complete).unwrap_or(0) == truth.len() && jobs_no_digest == 0 && jobs_failed == 0 && pending.is_empty(),
+        "every_job_complete_with_digest": usize::try_from(jobs_complete).unwrap_or(0) == truth.len() && jobs_no_digest == 0 && jobs_failed == 0 && jobs_open == 0,
         "line_states_equal_truth_per_client": states_ok,
         "zero_false_auto_matches": committed_other == 0,
         "proposals_equal_truth": u64::try_from(proposals).unwrap_or(0) == p_total,
@@ -1007,10 +1097,10 @@ async fn r2_match(
             "match_seconds": (match_seconds * 1000.0).round() / 1000.0,
             "lines_per_s": lines_per_s.round(),
             "job_latency_ms": {
-                "p50": percentile(&latencies, 50.0).round(),
-                "p95": percentile(&latencies, 95.0).round(),
+                "p50": percentile(&job_latencies, 50.0).round(),
+                "p95": percentile(&job_latencies, 95.0).round(),
                 "p99": p99.round(),
-                "max": latencies.last().copied().unwrap_or(0.0).round(),
+                "max": job_latencies.last().copied().unwrap_or(0.0).round(),
             },
             "job_drive_ms": {
                 "p50": percentile(&drive_latencies, 50.0).round(),
@@ -1018,15 +1108,15 @@ async fn r2_match(
                 "p99": drive_p99.round(),
                 "max": drive_latencies.last().copied().unwrap_or(0.0).round(),
             },
-            "jobs_completed": latencies.len(), "jobs_failed": jobs_failed,
+            "jobs_completed": job_latencies.len(), "jobs_failed": jobs_failed,
             "errors": errors.len(),
             "first_errors": errors.iter().take(5).collect::<Vec<_>>(),
             "jobs_never_admitted": truth.len().saturating_sub(
                 usize::try_from(jobs_complete).unwrap_or(0)
                     + jobs_failed as usize
-                    + pending.len(),
+                    + jobs_open,
             ),
-            "jobs_open_at_close": pending.len(),
+            "jobs_open_at_close": jobs_open,
             "truth": { "t1_matched": m_total, "proposed": p_total, "exception": e_total },
             "database": {
                 "committed_t1": committed_t1, "committed_other_tiers": committed_other,
@@ -1047,5 +1137,824 @@ async fn r2_match(
     });
     std::fs::write(&plan.out, serde_json::to_string_pretty(&result)? + "\n")?;
     println!("{}", serde_json::to_string_pretty(&result)?);
+    Ok(())
+}
+
+// ----------------------------------------------------------------------------------------------
+// The `r3-review` scenario: a shared review queue worked by real signed-in people.
+
+/// A deterministic per-worker RNG (xorshift64*; the work pattern needs no crypto).
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.0 = x;
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+
+    fn chance(&mut self, pct: u64) -> bool {
+        self.below(100) < pct
+    }
+}
+
+/// A signed-in reviewer: the session cookie, its CSRF token and its user id (the
+/// second-eye rule needs to know which person "me" is).
+#[derive(Clone)]
+struct Reviewer {
+    cookie: String,
+    csrf: String,
+    user: String,
+    email: String,
+    home: usize,
+}
+
+/// Review-phase counters: every request by kind, the honest refusals, per-action
+/// latencies. A 409 or 422 is a named answer, never a lost or double decision.
+#[derive(Default, Clone)]
+struct ReviewStats {
+    requests: u64,
+    conflicts: u64,
+    refusals: u64,
+    reauths: u64,
+    errors: Vec<String>,
+    latencies: std::collections::BTreeMap<&'static str, Vec<f64>>,
+    /// Terminal decisions: a committed or rejected match, an excluded line.
+    decided: u64,
+    /// First eyes recorded (the match still needs its second, distinct approver).
+    first_eyes: u64,
+    /// Manual-match proposals created.
+    manual_matches: u64,
+}
+
+/// Sign a user in over the public auth routes: the password answers `pending`, the
+/// TOTP code answers the session. The secret is read from the database — the harness
+/// already holds it; a person's authenticator does the same maths. Answers
+/// `(cookie, csrf)`.
+async fn sign_in(
+    http: &reqwest::Client,
+    base: &str,
+    pool: &sqlx::PgPool,
+    firm_id: &str,
+    email: &str,
+    password: &str,
+) -> anyhow::Result<(String, String)> {
+    let r = http
+        .post(format!("{base}/v1/auth/sign-in"))
+        .json(&json!({"firm": firm_id, "email": email, "password": password}))
+        .send()
+        .await?;
+    anyhow::ensure!(r.status() == 200, "sign-in {email}: {}", r.status());
+    let pending = r.json::<Value>().await?["pending"]
+        .as_str()
+        .context("sign-in answer has no pending")?
+        .to_owned();
+    let secret: Vec<u8> =
+        sqlx::query_scalar("SELECT totp_secret FROM recon.users WHERE firm_id = $1 AND email = $2")
+            .bind(firm_id.parse::<uuid::Uuid>()?)
+            .bind(email)
+            .fetch_one(pool)
+            .await?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    let code = format!("{:06}", recon_server::auth::totp_code(&secret, now));
+    let r = http
+        .post(format!("{base}/v1/auth/totp"))
+        .json(&json!({"pending": pending, "code": code}))
+        .send()
+        .await?;
+    anyhow::ensure!(r.status() == 200, "totp {email}: {}", r.status());
+    let cookie = r
+        .headers()
+        .get(reqwest::header::SET_COOKIE)
+        .context("totp answer sets no session cookie")?
+        .to_str()?
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .strip_prefix("recon_session=")
+        .context("the cookie is not recon_session")?
+        .to_owned();
+    let csrf = r.json::<Value>().await?["session"]["csrf"]
+        .as_str()
+        .context("totp answer has no csrf")?
+        .to_owned();
+    Ok((cookie, csrf))
+}
+
+/// One review request on a person's session: the cookie always, CSRF on the POSTs.
+/// Answers `(status, body, elapsed_ms)`; a transport failure answers `(0, null, ms)`.
+async fn person_call(
+    http: &reqwest::Client,
+    reviewer: &Reviewer,
+    method: &str,
+    url: &str,
+    body: Option<Value>,
+) -> (u16, Value, f64) {
+    let sent = Instant::now();
+    let req = match method {
+        "GET" => http.get(url),
+        _ => http.post(url),
+    };
+    let req = req
+        .header(
+            reqwest::header::COOKIE,
+            format!("recon_session={}", reviewer.cookie),
+        )
+        .header("x-csrf-token", &reviewer.csrf);
+    let req = match body {
+        Some(b) => req.json(&b),
+        None => req,
+    };
+    match req.send().await {
+        Ok(r) => {
+            let status = r.status().as_u16();
+            let body = r.json::<Value>().await.unwrap_or(Value::Null);
+            (status, body, sent.elapsed().as_secs_f64() * 1_000.0)
+        }
+        Err(_) => (0, Value::Null, sent.elapsed().as_secs_f64() * 1_000.0),
+    }
+}
+
+/// The open document nearest the line: same currency, same sign, closest |open| to
+/// |line| so the residual stays a bank fee, not a plug. Answers `(doc_id, residual)`;
+/// a zero residual means no residual row is needed.
+async fn pick_document(
+    pool: &sqlx::PgPool,
+    firm: &FirmId,
+    client: &str,
+    line_amount: i64,
+    currency: &str,
+) -> Result<Option<(String, i64)>, sqlx::Error> {
+    let row: Option<(uuid::Uuid, i64)> = sqlx::query_as(
+        "SELECT id, amount_minor - allocated_minor AS open
+           FROM recon.documents
+          WHERE firm_id = $1 AND client_id = $2 AND currency = $3
+            AND (amount_minor - allocated_minor) <> 0
+            AND sign(amount_minor - allocated_minor) = sign($4)
+          ORDER BY abs((amount_minor - allocated_minor) - $4), id LIMIT 1",
+    )
+    .bind(firm.as_uuid())
+    .bind(client.parse::<uuid::Uuid>().unwrap_or_default())
+    .bind(currency)
+    .bind(line_amount)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(id, open)| (id.to_string(), line_amount - open)))
+}
+
+/// One reviewer working the queues until no client has anything left to decide.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a worker's full context; bundling it hides the call shape"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one work loop; splitting it splits the worker story"
+)]
+async fn reviewer_work(
+    me: usize,
+    mut reviewer: Reviewer,
+    http: reqwest::Client,
+    base: String,
+    firm_id: String,
+    pairs: Arc<Vec<(String, String)>>,
+    pool: sqlx::PgPool,
+    stats: Arc<Mutex<ReviewStats>>,
+    progress: Arc<AtomicUsize>,
+    stop: Arc<AtomicUsize>,
+    deadline: Instant,
+) {
+    let password = "load-reviewer-password-123";
+    let mut rng = Rng(0x9E37_79B9_7F4A_7C15
+        ^ (u64::try_from(me).unwrap_or(1) + 1).wrapping_mul(0xD1B5_4A32_D192_ED03));
+    let reasons = [
+        "internal_transfer",
+        "non_business",
+        "reversed_pair",
+        "out_of_scope",
+    ];
+    let firm = FirmId::from_uuid(firm_id.parse().unwrap_or_default());
+    let review_path =
+        |client: &str, tail: &str| format!("{base}/v1/firms/{firm_id}/clients/{client}/{tail}");
+    'outer: loop {
+        let mut worked = false;
+        for offset in 0..pairs.len() {
+            if stop.load(Ordering::Relaxed) != 0 || Instant::now() >= deadline {
+                break 'outer;
+            }
+            let (client, _) = &pairs[(reviewer.home + offset) % pairs.len()];
+            // A bounded visit: work this client's queue a little, then move on.
+            for _ in 0..64 {
+                if stop.load(Ordering::Relaxed) != 0 || Instant::now() >= deadline {
+                    break 'outer;
+                }
+                let (status, body, ms) = person_call(
+                    &http,
+                    &reviewer,
+                    "GET",
+                    &review_path(client, "review-queue?limit=500"),
+                    None,
+                )
+                .await;
+                {
+                    let mut s = stats.lock().await;
+                    s.requests += 1;
+                    s.latencies.entry("queue").or_default().push(ms);
+                }
+                if status == 401 {
+                    if let Ok((cookie, csrf)) =
+                        sign_in(&http, &base, &pool, &firm_id, &reviewer.email, password).await
+                    {
+                        reviewer.cookie = cookie;
+                        reviewer.csrf = csrf;
+                        let mut s = stats.lock().await;
+                        s.reauths += 1;
+                        s.requests += 2; // the sign-in and totp calls are phase traffic too
+                    } else {
+                        stats
+                            .lock()
+                            .await
+                            .errors
+                            .push(format!("{me}: re-auth failed"));
+                    }
+                    continue;
+                }
+                if status != 200 {
+                    stats
+                        .lock()
+                        .await
+                        .errors
+                        .push(format!("{me} queue {client}: {status}"));
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+                let items = body["items"].as_array().cloned().unwrap_or_default();
+                if items.is_empty() {
+                    // Nothing queued: the rejected proposals' orphan lines, decided by hand.
+                    let orphans: Vec<(uuid::Uuid, i64, String, i64)> = sqlx::query_as(
+                        "SELECT id, amount_minor, currency, row_version FROM recon.statement_lines
+                          WHERE firm_id = $1 AND client_id = $2 AND status = 'unreviewed'
+                          ORDER BY id LIMIT 8",
+                    )
+                    .bind(firm.as_uuid())
+                    .bind(client.parse::<uuid::Uuid>().unwrap_or_default())
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap_or_default();
+                    if orphans.is_empty() {
+                        break;
+                    }
+                    for (line, amount, currency, version) in orphans {
+                        if stop.load(Ordering::Relaxed) != 0 || Instant::now() >= deadline {
+                            break 'outer;
+                        }
+                        worked = true;
+                        let doc = pick_document(&pool, &firm, client, amount, &currency)
+                            .await
+                            .unwrap_or(None);
+                        let (status, _, ms) = match doc {
+                            Some((doc, residual)) => {
+                                let residuals = if residual == 0 {
+                                    json!([])
+                                } else {
+                                    json!([{"code": "bank_fee", "amount_minor": residual}])
+                                };
+                                person_call(
+                                    &http,
+                                    &reviewer,
+                                    "POST",
+                                    &review_path(client, &format!("lines/{line}/manual-match")),
+                                    Some(json!({"documents": [doc], "residuals": residuals})),
+                                )
+                                .await
+                            }
+                            None => {
+                                let reason = reasons[usize::try_from(rng.below(4)).unwrap_or(0)];
+                                person_call(
+                                    &http,
+                                    &reviewer,
+                                    "POST",
+                                    &review_path(client, &format!("lines/{line}/exclude")),
+                                    Some(json!({"expected_version": version, "reason": reason})),
+                                )
+                                .await
+                            }
+                        };
+                        let mut s = stats.lock().await;
+                        s.requests += 1;
+                        s.latencies.entry("orphan_decision").or_default().push(ms);
+                        match status {
+                            200 => {
+                                s.decided += 1;
+                                progress.fetch_add(1, Ordering::Relaxed);
+                            }
+                            // A manual match proposes; the line is not terminal yet.
+                            201 => {
+                                s.manual_matches += 1;
+                                progress.fetch_add(1, Ordering::Relaxed);
+                            }
+                            409 => s.conflicts += 1,
+                            422 => s.refusals += 1,
+                            other => s.errors.push(format!("{me} orphan {line}: {other}")),
+                        }
+                        drop(s);
+                    }
+                    continue;
+                }
+                worked = true;
+                // An item I already first-eyed needs a different person's second eye.
+                let eligible: Vec<&Value> = items
+                    .iter()
+                    .filter(|i| {
+                        !(i["four_eyes"].as_bool().unwrap_or(false)
+                            && i["first_approver"].as_str() == Some(reviewer.user.as_str()))
+                    })
+                    .collect();
+                if eligible.is_empty() {
+                    break;
+                }
+                let item = eligible[usize::try_from(rng.below(eligible.len() as u64)).unwrap_or(0)];
+                let (action, url, payload) = if item["kind"] == "exception" {
+                    let line = item["id"].as_str().unwrap_or_default().to_owned();
+                    let version = item["row_version"].as_i64().unwrap_or(0);
+                    if rng.chance(50) {
+                        // A manual match needs the line's amount and currency.
+                        let line_row: Option<(i64, String)> = sqlx::query_as(
+                            "SELECT amount_minor, currency FROM recon.statement_lines
+                              WHERE firm_id = $1 AND id = $2",
+                        )
+                        .bind(firm.as_uuid())
+                        .bind(line.parse::<uuid::Uuid>().unwrap_or_default())
+                        .fetch_optional(&pool)
+                        .await
+                        .unwrap_or(None);
+                        match line_row {
+                            Some((amount, currency)) => {
+                                let doc = pick_document(&pool, &firm, client, amount, &currency)
+                                    .await
+                                    .unwrap_or(None);
+                                match doc {
+                                    Some((doc, residual)) => {
+                                        let residuals = if residual == 0 {
+                                            json!([])
+                                        } else {
+                                            json!([{"code": "bank_fee", "amount_minor": residual}])
+                                        };
+                                        (
+                                            "manual_match",
+                                            review_path(
+                                                client,
+                                                &format!("lines/{line}/manual-match"),
+                                            ),
+                                            json!({"documents": [doc], "residuals": residuals}),
+                                        )
+                                    }
+                                    None => (
+                                        "exclude",
+                                        review_path(client, &format!("lines/{line}/exclude")),
+                                        json!({"expected_version": version,
+                                               "reason": reasons[usize::try_from(rng.below(4)).unwrap_or(0)]}),
+                                    ),
+                                }
+                            }
+                            None => continue, // the line moved under us; refetch
+                        }
+                    } else {
+                        (
+                            "exclude",
+                            review_path(client, &format!("lines/{line}/exclude")),
+                            json!({"expected_version": version,
+                                   "reason": reasons[usize::try_from(rng.below(4)).unwrap_or(0)]}),
+                        )
+                    }
+                } else {
+                    let match_id = item["id"].as_str().unwrap_or_default().to_owned();
+                    let version = item["row_version"].as_i64().unwrap_or(0);
+                    let four_eyes = item["four_eyes"].as_bool().unwrap_or(false);
+                    let approve_pct = if four_eyes { 80 } else { 65 };
+                    if rng.chance(approve_pct) {
+                        (
+                            "approve",
+                            review_path(client, &format!("matches/{match_id}/approve")),
+                            json!({"expected_version": version}),
+                        )
+                    } else {
+                        (
+                            "reject",
+                            review_path(client, &format!("matches/{match_id}/reject")),
+                            json!({"expected_version": version}),
+                        )
+                    }
+                };
+                let (status, _, ms) =
+                    person_call(&http, &reviewer, "POST", &url, Some(payload)).await;
+                let mut s = stats.lock().await;
+                s.requests += 1;
+                s.latencies.entry(action).or_default().push(ms);
+                match status {
+                    200 => {
+                        s.decided += 1;
+                        progress.fetch_add(1, Ordering::Relaxed);
+                    }
+                    // A manual match proposes; the line is not terminal yet.
+                    201 => {
+                        s.manual_matches += 1;
+                        progress.fetch_add(1, Ordering::Relaxed);
+                    }
+                    202 => {
+                        s.first_eyes += 1;
+                        progress.fetch_add(1, Ordering::Relaxed);
+                    }
+                    409 => s.conflicts += 1,
+                    422 => s.refusals += 1,
+                    401 => {
+                        drop(s);
+                        if let Ok((cookie, csrf)) =
+                            sign_in(&http, &base, &pool, &firm_id, &reviewer.email, password).await
+                        {
+                            reviewer.cookie = cookie;
+                            reviewer.csrf = csrf;
+                            let mut s = stats.lock().await;
+                            s.reauths += 1;
+                            s.requests += 2;
+                        } else {
+                            stats
+                                .lock()
+                                .await
+                                .errors
+                                .push(format!("{me}: re-auth failed"));
+                        }
+                        continue;
+                    }
+                    other => s.errors.push(format!("{me} {action}: {other}")),
+                }
+                drop(s);
+            }
+        }
+        if !worked {
+            break;
+        }
+    }
+}
+
+/// The `r3-review` scenario: a gen-v3 month seeded per client like `r2-match`, then
+/// `RECON_LOAD_REVIEWERS` real reviewers (created, enrolled, signed in) work the shared
+/// queue — approve/reject/exclude/manual-match — to a fully decided close. Conflicts
+/// and refusals are counted honestly; the checks prove nothing was lost or doubled.
+#[allow(clippy::too_many_arguments, reason = "the scenario's shared run state")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "seed, review and verify are one run; splitting hides the shape"
+)]
+async fn r3_review(
+    plan: Arc<Plan>,
+    pairs: Arc<Vec<(String, String)>>,
+    http: reqwest::Client,
+    base: String,
+    token: String,
+    firm_id: String,
+    pool: sqlx::PgPool,
+    db_before: i64,
+    mut server: tokio::process::Child,
+    stderr_task: tokio::task::JoinHandle<String>,
+) -> anyhow::Result<()> {
+    let seed = seed_match_queue(&plan, &pairs, &http, &base, &token, &firm_id, &pool).await?;
+    let SeedOutcome {
+        upload_seconds,
+        match_seconds,
+        truth,
+        distractors,
+        jobs_failed,
+        jobs_open,
+        errors: seed_errors,
+        ..
+    } = seed;
+    let errors = Arc::new(Mutex::new(seed_errors));
+
+    // The reviewers: real users, created and assigned to every client by the operator,
+    // each enrolled and signed in over the public auth routes — no shortcut sessions.
+    let reviewers: usize = std::env::var("RECON_LOAD_REVIEWERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(64);
+    let client_ids: Vec<String> = pairs.iter().map(|(c, _)| c.clone()).collect();
+    let mut enrolled = Vec::with_capacity(reviewers);
+    for i in 0..reviewers {
+        let email = format!("reviewer{i}@load.test");
+        let body = post(
+            &http,
+            &base,
+            &token,
+            &format!("/v1/firms/{firm_id}/users"),
+            json!({"email": email, "display_name": format!("Reviewer {i}"),
+                   "role": "reviewer", "password": "load-reviewer-password-123",
+                   "clients": client_ids}),
+        )
+        .await
+        .with_context(|| format!("creating {email}"))?;
+        let user = body["user"]["id"].as_str().context("user id")?.to_owned();
+        let (cookie, csrf) = sign_in(
+            &http,
+            &base,
+            &pool,
+            &firm_id,
+            &email,
+            "load-reviewer-password-123",
+        )
+        .await
+        .with_context(|| format!("signing in {email}"))?;
+        enrolled.push(Reviewer {
+            cookie,
+            csrf,
+            user,
+            email,
+            home: i % pairs.len().max(1),
+        });
+    }
+
+    // Phase C: the shared queue, worked concurrently. `progress` ticks on every accepted
+    // decision; the stall fuse and the wall bound are the run's honest outs.
+    let review_wall_s: u64 = std::env::var("RECON_LOAD_REVIEW_WALL_S")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(if plan.mode == "full" { 10_800 } else { 900 });
+    let stall_s: u64 = std::env::var("RECON_LOAD_STALL_S")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(600);
+    let stats = Arc::new(Mutex::new(ReviewStats::default()));
+    let progress = Arc::new(AtomicUsize::new(0));
+    let finished = Arc::new(AtomicUsize::new(0));
+    let stop = Arc::new(AtomicUsize::new(0));
+    let deadline = Instant::now() + Duration::from_secs(review_wall_s);
+    let review_started = Instant::now();
+    {
+        let (progress, finished, stop, errors) = (
+            progress.clone(),
+            finished.clone(),
+            stop.clone(),
+            errors.clone(),
+        );
+        tokio::spawn(async move {
+            let mut seen = 0_usize;
+            let mut idle = Instant::now();
+            loop {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                if stop.load(Ordering::Relaxed) != 0
+                    || finished.load(Ordering::Relaxed) >= reviewers
+                {
+                    return;
+                }
+                let now = progress.load(Ordering::Relaxed);
+                if now != seen {
+                    seen = now;
+                    idle = Instant::now();
+                } else if idle.elapsed().as_secs() >= stall_s {
+                    errors.lock().await.push(format!(
+                        "review stalled: no accepted decision for {stall_s}s"
+                    ));
+                    stop.store(1, Ordering::Relaxed);
+                    return;
+                }
+            }
+        });
+    }
+    let mut workers = tokio::task::JoinSet::new();
+    for (i, reviewer) in enrolled.into_iter().enumerate() {
+        let (http, base, firm_id, pairs, pool, stats, progress, stop, finished) = (
+            http.clone(),
+            base.clone(),
+            firm_id.clone(),
+            pairs.clone(),
+            pool.clone(),
+            stats.clone(),
+            progress.clone(),
+            stop.clone(),
+            finished.clone(),
+        );
+        workers.spawn(async move {
+            reviewer_work(
+                i, reviewer, http, base, firm_id, pairs, pool, stats, progress, stop, deadline,
+            )
+            .await;
+            finished.fetch_add(1, Ordering::Relaxed);
+        });
+    }
+    while let Some(w) = workers.join_next().await {
+        w?;
+    }
+    let review_seconds = review_started.elapsed().as_secs_f64();
+    let stats = stats.lock().await.clone();
+
+    // Verification: every match terminal, every line decided (matched or excluded), no
+    // subject decided twice terminally, the second eye distinct, the log replaying.
+    let firm = FirmId::from_uuid(firm_id.parse()?);
+    let (
+        proposed_open,
+        committed,
+        rejected,
+        lines_matched,
+        lines_excluded,
+        lines_undecided,
+        open_proposals,
+        leftover_exceptions,
+        match_terminal_dup,
+        line_terminal_dup,
+        same_eye_commits,
+        false_auto_commits,
+    ): (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM recon.matches WHERE firm_id = $1 AND status = 'proposed'),
+                (SELECT count(*) FROM recon.matches WHERE firm_id = $1 AND status = 'committed'),
+                (SELECT count(*) FROM recon.matches WHERE firm_id = $1 AND status = 'rejected'),
+                (SELECT count(*) FROM recon.statement_lines WHERE firm_id = $1 AND status = 'matched'),
+                (SELECT count(*) FROM recon.statement_lines WHERE firm_id = $1 AND status = 'excluded'),
+                (SELECT count(*) FROM recon.statement_lines WHERE firm_id = $1 AND status NOT IN ('matched','excluded')),
+                (SELECT count(*) FROM recon.proposals WHERE firm_id = $1 AND status = 'open'),
+                (SELECT count(*) FROM recon.line_exceptions WHERE firm_id = $1),
+                (SELECT count(*) FROM (SELECT subject_id FROM recon.decision_log
+                   WHERE firm_id = $1 AND subject_kind = 'match' AND to_state IN ('committed','rejected')
+                   GROUP BY subject_id HAVING count(*) > 1) d),
+                (SELECT count(*) FROM (SELECT subject_id FROM recon.decision_log
+                   WHERE firm_id = $1 AND subject_kind = 'line' AND to_state IN ('matched','excluded')
+                   GROUP BY subject_id HAVING count(*) > 1) d),
+                (SELECT count(*) FROM recon.matches m JOIN recon.decision_log d
+                   ON d.firm_id = m.firm_id AND d.subject_kind = 'match' AND d.subject_id = m.id
+                    AND d.to_state = 'committed' AND d.actor_kind = 'person'
+                  WHERE m.firm_id = $1 AND m.four_eyes AND m.first_approver IS NOT NULL
+                    AND d.actor_ref = m.first_approver::text),
+                (SELECT count(*) FROM recon.matches m JOIN recon.decision_log d
+                   ON d.firm_id = m.firm_id AND d.subject_kind = 'match' AND d.subject_id = m.id
+                    AND d.to_state = 'committed' AND d.job_id IS NOT NULL
+                  WHERE m.firm_id = $1 AND m.tier <> 't1')",
+    )
+    .bind(firm.as_uuid())
+    .fetch_one(&pool)
+    .await?;
+    // Every committed four-eyes match shows at least two distinct persons deciding.
+    let eyes_single: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM (
+             SELECT d.subject_id FROM recon.decision_log d
+              JOIN recon.matches m ON m.firm_id = d.firm_id AND m.id = d.subject_id
+             WHERE d.firm_id = $1 AND d.subject_kind = 'match' AND d.actor_kind = 'person'
+               AND m.four_eyes AND m.status = 'committed'
+             GROUP BY d.subject_id HAVING count(DISTINCT d.actor_ref) < 2) x",
+    )
+    .bind(firm.as_uuid())
+    .fetch_one(&pool)
+    .await?;
+    let replay = recon_db::replay::check(&pool, firm).await?;
+    let db_after: i64 =
+        sqlx::query_scalar("SELECT pg_catalog.pg_database_size(pg_catalog.current_database())")
+            .fetch_one(&pool)
+            .await?;
+    pool.close().await;
+
+    let rss = if let Some(pid) = server.id() {
+        peak_rss(pid).await
+    } else {
+        None
+    };
+    stop_server(&mut server, plan.port).await?;
+    let _ = tokio::time::timeout(Duration::from_secs(10), stderr_task).await;
+
+    let errors = errors.lock().await.clone();
+    let expected = plan.total_lines();
+    let (m_total, p_total, e_total): (u64, u64, u64) = truth
+        .iter()
+        .fold((0, 0, 0), |(m, p, e), (_, a, b, c)| (m + a, p + b, e + c));
+    let requests = stats.requests;
+    let request_per_s = requests as f64 / review_seconds;
+    let conflict_rate = stats.conflicts as f64 / requests.max(1) as f64;
+    let mut action_ms = serde_json::Map::new();
+    let mut decision_p99 = 0.0_f64;
+    for (action, mut ms) in stats.latencies {
+        ms.sort_by(f64::total_cmp);
+        let p99 = percentile(&ms, 99.0);
+        if action != "queue" {
+            decision_p99 = decision_p99.max(p99);
+        }
+        action_ms.insert(
+            action.to_owned(),
+            json!({"p50": percentile(&ms, 50.0).round(), "p99": p99.round(),
+                   "max": ms.last().copied().unwrap_or(0.0).round(), "n": ms.len()}),
+        );
+    }
+    // The tripwire gates CI on the shared runner; the capacity target (a dedicated
+    // host's bar) is recorded alongside it, honestly unmet on shared hardware.
+    let (req_min, p99_max, label) = if plan.mode == "full" {
+        (100.0, 5_000.0, "runner regression tripwire")
+    } else {
+        (15.0, 10_000.0, "smoke")
+    };
+    let thresholds = json!({
+        "label": label,
+        "requests_per_s_min": req_min,
+        "decision_p99_ms_max": p99_max,
+        "conflict_rate_max": 0.95,
+        "server_peak_rss_bytes_max": 536_870_912_u64,
+        "errors_max": 0,
+    });
+    let capacity_target = if plan.mode == "full" {
+        json!({
+            "requests_per_s_min": 500.0,
+            "decision_p99_ms_max": 500.0,
+            "met": request_per_s >= 500.0 && decision_p99 <= 500.0,
+            "owed": "a dedicated host; the shared-runner tripwire is not capacity",
+        })
+    } else {
+        Value::Null
+    };
+    let checks = json!({
+        "every_match_terminal": proposed_open == 0 && open_proposals == 0,
+        "every_line_decided": lines_undecided == 0 && leftover_exceptions == 0,
+        "no_subject_decided_twice": match_terminal_dup == 0 && line_terminal_dup == 0,
+        "second_eye_distinct": same_eye_commits == 0 && eyes_single == 0,
+        "zero_false_auto_matches": false_auto_commits == 0,
+        "decision_log_replays": replay.is_ok(),
+        "requests_at_least_1m": plan.mode != "full" || requests >= 1_000_000,
+        "jobs_seed_complete": jobs_failed == 0 && jobs_open == 0,
+    });
+    let checks_pass = checks
+        .as_object()
+        .is_some_and(|o| o.values().all(|v| v == true));
+    let rss_ok = if plan.mode == "full" {
+        rss.is_some_and(|r| r <= 536_870_912)
+    } else {
+        rss.is_none_or(|r| r <= 536_870_912)
+    };
+    let thresholds_pass = errors.is_empty()
+        && stats.errors.is_empty()
+        && request_per_s >= req_min
+        && decision_p99 <= p99_max
+        && conflict_rate <= 0.95
+        && rss_ok;
+    let result = json!({
+        "scenario": plan.scenario,
+        "mode": plan.mode,
+        "unit": "review request on a shared queue (queue read or decision; D-027's review half)",
+        "machine": plan.machine,
+        "commit": plan.commit,
+        "load_average_before": plan.load_before,
+        "load_average_after": std::process::Command::new("uptime").output().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned()).unwrap_or_default(),
+        "generator": recon_cli::generate::MATCH_GENERATOR_VERSION,
+        "shape": {
+            "firms": 1, "clients": plan.clients,
+            "lines_per_client": plan.lines_per_file, "distractors_per_client": distractors,
+            "lines": expected, "reviewers": reviewers,
+            "server_matching_concurrency": plan.workers,
+        },
+        "results": {
+            "upload_seconds": (upload_seconds * 1000.0).round() / 1000.0,
+            "match_seconds": (match_seconds * 1000.0).round() / 1000.0,
+            "review_seconds": (review_seconds * 1000.0).round() / 1000.0,
+            "requests": requests,
+            "requests_per_s": request_per_s.round(),
+            "conflicts_409": stats.conflicts,
+            "refusals_422": stats.refusals,
+            "conflict_rate": (conflict_rate * 10_000.0).round() / 10_000.0,
+            "first_eyes": stats.first_eyes,
+            "manual_matches_created": stats.manual_matches,
+            "decided_terminal": stats.decided,
+            "reauthentications": stats.reauths,
+            "action_latency_ms": action_ms,
+            "errors": errors.len() + stats.errors.len(),
+            "first_errors": errors.iter().chain(stats.errors.iter()).take(5).collect::<Vec<_>>(),
+            "truth_seed": { "t1_matched": m_total, "proposed": p_total, "exception": e_total },
+            "database": {
+                "matches_proposed_open": proposed_open, "matches_committed": committed,
+                "matches_rejected": rejected,
+                "lines_matched": lines_matched, "lines_excluded": lines_excluded,
+                "lines_undecided": lines_undecided, "proposals_open": open_proposals,
+                "line_exceptions_left": leftover_exceptions,
+                "match_terminal_duplicate_decisions": match_terminal_dup,
+                "line_terminal_duplicate_decisions": line_terminal_dup,
+                "same_eye_commits": same_eye_commits, "single_eye_four_eyes": eyes_single,
+                "false_auto_commits": false_auto_commits,
+            },
+            "server_peak_rss_bytes": rss,
+            "database_growth_bytes": db_after - db_before,
+            "replay": match &replay { Ok(r) => json!({"clients": r.clients, "decisions": r.decisions, "imports": r.imports, "lines": r.lines}), Err(m) => json!(m.0) },
+        },
+        "checks": checks,
+        "thresholds": thresholds,
+        "capacity_target": capacity_target,
+        "checks_pass": checks_pass,
+        "thresholds_pass": thresholds_pass,
+        "pass": checks_pass && thresholds_pass,
+    });
+    std::fs::write(&plan.out, serde_json::to_string_pretty(&result)? + "\n")?;
+    println!("{}", serde_json::to_string_pretty(&result)?);
+    if !checks_pass || !thresholds_pass {
+        std::process::exit(1);
+    }
     Ok(())
 }
