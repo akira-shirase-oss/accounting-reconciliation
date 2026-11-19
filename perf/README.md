@@ -12,8 +12,9 @@ and is kept as evidence, never rerun until green.
 
 The unit (D-027, import half) is one statement line taken through import:
 parsed, validated, normalized, staged, fingerprinted and published by the
-flip. `perf/loadgen` starts the server under `/usr/bin/time` (exact peak
-RSS), creates one firm with 200 clients and one USD account each, and eight
+flip. `perf/loadgen` starts the server as a direct child (peak RSS read
+from `/proc`, unknown off Linux), creates one firm with 200 clients and one
+USD account each, and eight
 workers upload five `gen-v1` statements of 1,000 lines per account (disjoint
 months) — 1,000 files, 1,000,000 lines. Every tenth file is then uploaded
 again and must be answered with the earlier import.

@@ -37,7 +37,7 @@ use recon_cli::generate::{GENERATOR_VERSION, StatementSpec, statement};
 use recon_domain::{Currency, Date, FirmId};
 use serde_json::{Value, json};
 use tokio::io::AsyncReadExt as _;
-use tokio::process::Command;
+use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
 struct Plan {
@@ -113,17 +113,27 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
     sorted[(rank as usize).min(sorted.len() - 1)]
 }
 
-/// Peak RSS in bytes from `/usr/bin/time` output (macOS `-l`: bytes; GNU `-v`: KiB).
-fn peak_rss(time_output: &str) -> Option<u64> {
-    for line in time_output.lines() {
-        let line = line.trim();
-        if let Some(n) = line.strip_suffix("maximum resident set size") {
-            return n.trim().parse().ok();
-        }
-        if let Some(n) = line.strip_prefix("Maximum resident set size (kbytes):") {
-            return n.trim().parse::<u64>().ok().map(|k| k * 1024);
-        }
-    }
+/// Peak RSS in bytes — Linux `/proc/<pid>/status` VmHWM, the kernel's high-water mark
+/// (the same number /usr/bin/time reported). Read while the server is still alive, just
+/// before the stop; unknown on systems without /proc.
+#[cfg(target_os = "linux")]
+async fn peak_rss(pid: u32) -> Option<u64> {
+    let text = tokio::fs::read_to_string(format!("/proc/{pid}/status"))
+        .await
+        .ok()?;
+    let kb: u64 = text
+        .lines()
+        .find_map(|l| l.strip_prefix("VmHWM:"))?
+        .trim()
+        .trim_end_matches(" kB")
+        .parse()
+        .ok()?;
+    Some(kb * 1024)
+}
+
+/// No /proc off Linux — the peak is honestly unknown.
+#[cfg(not(target_os = "linux"))]
+async fn peak_rss(_pid: u32) -> Option<u64> {
     None
 }
 
@@ -139,6 +149,41 @@ async fn wait_ready(base: &str) -> anyhow::Result<()> {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     bail!("the server never became ready")
+}
+
+/// True when nothing on 127.0.0.1 holds `port` — the only honest "the server is gone"
+/// check: the spawned wrapper can exit while its server survives as an orphan.
+async fn port_free(port: u16) -> bool {
+    tokio::net::TcpListener::bind(("127.0.0.1", port))
+        .await
+        .is_ok()
+}
+
+/// `port_free` with a short grace period — a gracefully stopped server can take a beat to
+/// release its listener after the wrapper exits.
+async fn wait_port_free(port: u16) -> bool {
+    for _ in 0..50 {
+        if port_free(port).await {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    false
+}
+
+/// Stop the spawned server and prove the port is free. The server is a direct child, so
+/// `start_kill` is a SIGKILL straight at it — there is no wrapper that could die first
+/// and orphan it — and `wait_port_free` proves the listener is really gone before the
+/// run reports. A stale server on the port makes the NEXT run 401 on every call (it
+/// answers readiness but holds a different token — the CI failure).
+async fn stop_server(server: &mut Child, port: u16) -> anyhow::Result<()> {
+    let _ = server.start_kill();
+    let _ = tokio::time::timeout(Duration::from_secs(10), server.wait()).await;
+    anyhow::ensure!(
+        wait_port_free(port).await,
+        "127.0.0.1:{port} is still held after the stop — a foreign process owns it"
+    );
+    Ok(())
 }
 
 async fn post(
@@ -210,21 +255,18 @@ async fn main() -> anyhow::Result<()> {
         u128::from(std::process::id()) * 0x9E37_79B9_7F4A_7C15_u128
     );
     let base = format!("http://127.0.0.1:{}", plan.port);
-    // /usr/bin/time reports the exact peak RSS (macOS `-l`, GNU `-v`); without it the
-    // server runs directly and the RSS is recorded as unknown.
-    let time_flag = if cfg!(target_os = "macos") {
-        "-l"
-    } else {
-        "-v"
-    };
-    let mut command = if std::path::Path::new("/usr/bin/time").exists() {
-        let mut c = Command::new("/usr/bin/time");
-        c.arg(time_flag).arg(&plan.server_bin);
-        c
-    } else {
-        Command::new(&plan.server_bin)
-    };
-    let mut server = command
+    // Fail fast on a held port: a stale load server answers readiness but rejects this
+    // run's freshly generated token, so every authenticated call 401s (the CI failure).
+    anyhow::ensure!(
+        port_free(plan.port).await,
+        "127.0.0.1:{} is already bound — a stale load server holds it; stop it and rerun",
+        plan.port
+    );
+    // The server is a direct child — no /usr/bin/time wrapper: a wrapper signalled first
+    // dies without forwarding and orphans the server, which keeps the port, answers the
+    // NEXT run's readiness probe, and rejects that run's token — every call 401s (the
+    // CI failure). Peak RSS comes from /proc instead (peak_rss).
+    let mut server = Command::new(&plan.server_bin)
         .env("RECON_DATABASE_URL", &plan.database_url)
         .env("RECON_LISTEN", format!("127.0.0.1:{}", plan.port))
         .env("RECON_OPERATOR_TOKEN", &token)
@@ -236,7 +278,7 @@ async fn main() -> anyhow::Result<()> {
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
-        .context("starting the server under /usr/bin/time")?;
+        .context("starting the server")?;
     let mut server_stderr = server.stderr.take().context("server stderr")?;
     let stderr_task = tokio::spawn(async move {
         let mut text = String::new();
@@ -261,7 +303,11 @@ async fn main() -> anyhow::Result<()> {
         "/v1/firms",
         json!({"name": "Load firm"}),
     )
-    .await?;
+    .await
+    .context(
+        "the first authenticated call failed — on a 401 a stale load server holds the \
+         port and rejects this run's freshly generated token; stop it and rerun",
+    )?;
     let firm_id = firm["firm"]["id"].as_str().context("firm id")?.to_owned();
     // r2-match needs the client id (document imports and matching jobs are client-scoped)
     // as well as the account id (statement imports are account-scoped).
@@ -436,34 +482,15 @@ async fn main() -> anyhow::Result<()> {
             .await?;
     pool.close().await;
 
-    // Stop the server and read its peak RSS. /usr/bin/time forwards SIGTERM to its child
-    // and prints the summary when it exits; pkill -P reaches the same child directly when
-    // the process list is readable. If neither lands, kill the wrapper and bound every
-    // wait so a stop failure can never hang the run — the RSS is then honestly unknown.
-    if let Some(pid) = server.id() {
-        let _ = std::process::Command::new("kill")
-            .arg("-TERM")
-            .arg(pid.to_string())
-            .status();
-        let _ = std::process::Command::new("pkill")
-            .arg("-TERM")
-            .arg("-P")
-            .arg(pid.to_string())
-            .status();
-    }
-    if tokio::time::timeout(Duration::from_secs(60), server.wait())
-        .await
-        .is_err()
-    {
-        let _ = server.start_kill();
-        let _ = tokio::time::timeout(Duration::from_secs(10), server.wait()).await;
-    }
-    let server_log = tokio::time::timeout(Duration::from_secs(10), stderr_task)
-        .await
-        .ok()
-        .and_then(Result::ok)
-        .unwrap_or_default();
-    let rss = peak_rss(&server_log);
+    // Peak RSS needs the live process (/proc): read it just before the stop, which must
+    // leave the port provably free — a survivor would 401 the next run.
+    let rss = if let Some(pid) = server.id() {
+        peak_rss(pid).await
+    } else {
+        None
+    };
+    stop_server(&mut server, plan.port).await?;
+    let _ = tokio::time::timeout(Duration::from_secs(10), stderr_task).await;
 
     let mut latencies = latencies.lock().await.clone();
     latencies.sort_by(f64::total_cmp);
@@ -502,10 +529,15 @@ async fn main() -> anyhow::Result<()> {
     let checks_pass = checks
         .as_object()
         .is_some_and(|o| o.values().all(|v| v == true));
-    let thresholds_pass = errors.is_empty()
-        && lines_per_s >= lines_min
-        && p99 <= p99_max
-        && rss.is_some_and(|r| r <= 268_435_456);
+    // A full run must carry the RSS evidence (an unmeasured peak fails it); a smoke
+    // records an unmeasurable peak as unknown rather than a miss — a measured miss still
+    // fails either mode.
+    let rss_ok = if plan.mode == "full" {
+        rss.is_some_and(|r| r <= 268_435_456)
+    } else {
+        rss.is_none_or(|r| r <= 268_435_456)
+    };
+    let thresholds_pass = errors.is_empty() && lines_per_s >= lines_min && p99 <= p99_max && rss_ok;
     let result = json!({
         "scenario": plan.scenario,
         "mode": plan.mode,
@@ -838,30 +870,13 @@ async fn r2_match(
             .await?;
     pool.close().await;
 
-    if let Some(pid) = server.id() {
-        let _ = std::process::Command::new("kill")
-            .arg("-TERM")
-            .arg(pid.to_string())
-            .status();
-        let _ = std::process::Command::new("pkill")
-            .arg("-TERM")
-            .arg("-P")
-            .arg(pid.to_string())
-            .status();
-    }
-    if tokio::time::timeout(Duration::from_secs(60), server.wait())
-        .await
-        .is_err()
-    {
-        let _ = server.start_kill();
-        let _ = tokio::time::timeout(Duration::from_secs(10), server.wait()).await;
-    }
-    let server_log = tokio::time::timeout(Duration::from_secs(10), stderr_task)
-        .await
-        .ok()
-        .and_then(Result::ok)
-        .unwrap_or_default();
-    let rss = peak_rss(&server_log);
+    let rss = if let Some(pid) = server.id() {
+        peak_rss(pid).await
+    } else {
+        None
+    };
+    stop_server(&mut server, plan.port).await?;
+    let _ = tokio::time::timeout(Duration::from_secs(10), stderr_task).await;
 
     latencies.sort_by(f64::total_cmp);
     let errors = errors.lock().await.clone();
@@ -898,10 +913,14 @@ async fn r2_match(
     let checks_pass = checks
         .as_object()
         .is_some_and(|o| o.values().all(|v| v == true));
-    let thresholds_pass = errors.is_empty()
-        && lines_per_s >= lines_min
-        && p99 <= p99_max
-        && rss.is_some_and(|r| r <= 536_870_912);
+    // Same RSS rule as the import scenarios: a full run must carry the evidence, a smoke
+    // records an unmeasurable peak as unknown; a measured miss fails either mode.
+    let rss_ok = if plan.mode == "full" {
+        rss.is_some_and(|r| r <= 536_870_912)
+    } else {
+        rss.is_none_or(|r| r <= 536_870_912)
+    };
+    let thresholds_pass = errors.is_empty() && lines_per_s >= lines_min && p99 <= p99_max && rss_ok;
     let result = json!({
         "scenario": plan.scenario,
         "mode": plan.mode,
