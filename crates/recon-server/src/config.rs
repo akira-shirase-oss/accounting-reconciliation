@@ -262,11 +262,20 @@ impl Config {
     }
 
     /// The drive deadline for a job with `lines` pinned lines: floor + per line,
-    /// capped (D-033's companion bound).
+    /// capped (D-033's companion bound). The per-line term stretches with the workers'
+    /// oversubscription of the cores — an engine that owns half a core takes twice the
+    /// wall time, so `concurrency / cores` scales it (queue time is outside the drive's
+    /// deadline by design; it is a hang bound, not a throughput gate).
     pub fn matching_deadline(&self, lines: i64) -> Duration {
         let lines = u32::try_from(lines.max(0)).unwrap_or(u32::MAX);
+        let cores = std::thread::available_parallelism().map_or(1, usize::from);
+        let stretch = u32::try_from(self.matching_concurrency.div_ceil(cores)).unwrap_or(1);
         self.matching_deadline_min
-            .saturating_add(self.matching_deadline_per_line.saturating_mul(lines))
+            .saturating_add(
+                self.matching_deadline_per_line
+                    .saturating_mul(lines)
+                    .saturating_mul(stretch.max(1)),
+            )
             .min(self.matching_deadline_max)
     }
 }

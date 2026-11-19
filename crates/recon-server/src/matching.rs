@@ -22,34 +22,42 @@ pub async fn start(
     firm: FirmId,
     client: ClientId,
 ) -> Result<Start, recon_db::DbError> {
-    // A worker permit before the claim: a job we cannot run now would sit claimed until
-    // its lease expired, so the claim is only made when the worker can start.
-    let Ok(permit) = state.match_permits.clone().try_acquire_owned() else {
-        return Err(recon_db::DbError::Unavailable(sqlx::Error::PoolTimedOut));
-    };
-    let started = matching::start(
-        &state.pool,
-        firm,
-        client,
-        state.config.matching_lease,
-        ENGINE_VERSION,
-    )
-    .await?;
-    if let Start::Created(lease) | Start::Resumed(lease) = started {
-        let state = state.clone();
-        let shutdown = state.shutdown.clone();
-        tokio::spawn(async move {
-            let _permit = permit;
-            run(state, lease, shutdown).await;
-        });
+    // A worker permit drives the job at once. With none free the job is still written —
+    // as a durable row whose lease is already expired: it is the queue, claimed in
+    // creation order by the sweeper as workers free (one running job per client still
+    // bounds it). Only the drive is concurrency-limited, never the submission.
+    if let Ok(permit) = state.match_permits.clone().try_acquire_owned() {
+        let started = matching::start(
+            &state.pool,
+            firm,
+            client,
+            state.config.matching_lease,
+            ENGINE_VERSION,
+        )
+        .await?;
+        if let Start::Created(lease) | Start::Resumed(lease) = started {
+            let state = state.clone();
+            let shutdown = state.shutdown.clone();
+            tokio::spawn(async move {
+                let _permit = permit;
+                run(state, lease, shutdown).await;
+            });
+        }
+        return Ok(started);
     }
-    Ok(started)
+    matching::start(&state.pool, firm, client, Duration::ZERO, ENGINE_VERSION).await
 }
 
-/// Claims every expired job (the sweeper's call each round) and drives each under a
-/// worker permit. Jobs without a permit stay claimable next round.
+/// Claims up to `available_permits` expired jobs (the sweeper's call each round) and
+/// drives each under a worker permit — the queued rows leave the queue in creation
+/// order. Jobs without a permit stay claimable next round.
 pub async fn resume_expired(state: &AppState, shutdown: CancellationToken) {
-    let claimed = matching::claim_expired(&state.pool, state.config.matching_lease).await;
+    let claimed = matching::claim_expired(
+        &state.pool,
+        state.config.matching_lease,
+        state.match_permits.available_permits(),
+    )
+    .await;
     match claimed {
         Ok(leases) => {
             for lease in leases {

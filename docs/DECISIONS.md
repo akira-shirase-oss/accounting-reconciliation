@@ -854,6 +854,17 @@ conservative side.
   equal, committed matches all `t1` (zero false auto-matches), proposals and exceptions
   equal, no subject decided twice, the log replays. Full run: 200 clients × 5,000 lines
   = 1,000,000 decided; smoke: 10 × 1,000.
+- **D-074 — A matching job's row is also its queue.** `POST …/matching-jobs` always
+  writes the durable job: with a worker permit free it is claimed and driven at once;
+  without one it is inserted with an already-expired lease and the sweeper claims it,
+  in creation order, as workers free (the `match_jobs_one_running_per_client` index
+  bounds the queue to one job per client). Only the drive is concurrency-limited —
+  never the submission — so a busy worker can no longer make a client's job vanish
+  (the first `r2-match` full run lost 167 of 200 jobs to that refusal, mislabelled
+  `database_unavailable`; see `perf/results/r2-match-full-20261119T142406Z.json`). The
+  drive deadline's per-line term stretches by `matching_concurrency / cores`: the
+  deadline bounds hung work, and an engine that owns a fraction of a core takes
+  proportionally longer in wall time.
 
 ## Open questions (blocked on the maintainer or an outside party)
 
