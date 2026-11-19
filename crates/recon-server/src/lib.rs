@@ -4,6 +4,7 @@
 //! readiness. Sessions, roles and the review API arrive in R3; until then an operator token
 //! guards every `/v1` route (D-041).
 
+pub mod auth;
 pub mod config;
 pub mod error;
 pub mod faults;
@@ -93,6 +94,33 @@ async fn require_operator(State(state): State<AppState>, request: Request, next:
     }
 }
 
+/// The three auth gates (D-021): sign-in is public; `Session` routes need a signed-in
+/// person; `actor` routes open to either credential and the handler decides what the actor
+/// may do (an owner manages users).
+fn auth_routes(state: &AppState) -> Router<AppState> {
+    let sign_in = Router::new()
+        .route("/v1/auth/sign-in", post(auth::sign_in))
+        .route("/v1/auth/totp", post(auth::totp))
+        .route("/v1/auth/sign-out", post(auth::sign_out));
+    // Session-only routes (the session middleware adds the CSRF check on mutations).
+    let session = Router::new()
+        .route("/v1/auth/session", get(auth::whoami))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_session,
+        ));
+    let actor = Router::new()
+        .route("/v1/firms/{firm}/users", post(auth::create_user))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_actor,
+        ));
+    Router::<AppState>::new()
+        .merge(sign_in)
+        .merge(session)
+        .merge(actor)
+}
+
 /// The application with its middleware, outermost first: drop the client's request id →
 /// set the server's → propagate it →
 /// trace (method, route, status, latency; never headers or bodies) → catch panics into the
@@ -152,6 +180,7 @@ pub fn router(state: AppState) -> Router {
         .route("/healthz", get(handlers::healthz))
         .route("/readyz", get(handlers::readyz))
         .merge(v1)
+        .merge(auth_routes(&state))
         .fallback(handlers::fallback)
         .layer(DefaultBodyLimit::max(JSON_BODY_LIMIT))
         .layer(

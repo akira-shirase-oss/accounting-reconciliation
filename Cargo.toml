@@ -21,9 +21,11 @@ recon-cli = { path = "crates/recon-cli" }
 # one TLS stack (rustls with ring and the webpki roots, so `sslmode=require` and
 # `verify-full` URLs such as Neon's work without a system OpenSSL).
 anyhow = "1.0.104"
+# Password credentials are argon2id PHC strings (D-021).
+argon2 = { version = "0.5.3", default-features = false, features = ["alloc", "password-hash"] }
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "json", "query", "matched-path"] }
 hex = "0.4.3"
-# Head anchors are HMAC-SHA256 signed (D-049).
+# Head anchors are HMAC-SHA256 signed (D-049); TOTP is HMAC-SHA1 (RFC 4226, D-021).
 hmac = "0.13"
 # Salt for the role password's SCRAM verifier (D-057).
 getrandom = "0.3.4"
@@ -35,6 +37,7 @@ hyper-util = { version = "0.1.21", default-features = false, features = ["tokio"
 proptest = "1.12.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+sha1 = "0.11"
 sha2 = "0.11"
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "postgres", "macros", "migrate", "uuid", "time", "json"] }
 subtle = "2.6.1"

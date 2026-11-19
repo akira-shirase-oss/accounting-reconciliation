@@ -9,6 +9,7 @@
 #![deny(clippy::arithmetic_side_effects)]
 
 pub mod anchor;
+pub mod auth;
 pub mod date;
 pub mod decision;
 pub mod document;
@@ -22,6 +23,7 @@ pub mod money;
 pub mod refusal;
 pub mod text;
 
+pub use auth::{Act, Role};
 pub use date::Date;
 pub use ids::{AccountId, ClientId, DecisionId, DocumentId, FirmId, ImportId, LineId, UserId};
 pub use money::{Currency, Money, MoneyError, MoneySum};
