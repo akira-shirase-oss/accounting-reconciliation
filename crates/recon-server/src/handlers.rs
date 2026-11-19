@@ -406,6 +406,58 @@ pub async fn get_profile(
     Ok((StatusCode::OK, Json(json!({ "profile": profile }))))
 }
 
+/// `POST /v1/firms/{firm}/clients/{client}/matching-jobs`: claims the client's
+/// deterministic matching job and drives it on a worker; `202` with the job's row while
+/// it runs. One running job per client (D-033): a second start is `409 client_busy`
+/// naming the running job.
+pub async fn start_matching_job(
+    State(state): State<AppState>,
+    Path((firm, client)): Path<(String, String)>,
+) -> ApiResult {
+    let firm = FirmId::from_uuid(id(&firm)?);
+    let client = ClientId::from_uuid(id(&client)?);
+    if !state.startup_checked() {
+        return Err(ApiError::database_unavailable());
+    }
+    let lease = match crate::matching::start(&state, firm, client).await {
+        Ok(
+            recon_db::matching::Start::Created(lease) | recon_db::matching::Start::Resumed(lease),
+        ) => lease,
+        Ok(recon_db::matching::Start::Busy { job }) => {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "client_busy",
+                "a matching job is already running for this client",
+            )
+            .with("job", json!(job))
+            .retry_after(2));
+        }
+        // The client is not this firm's (or does not exist): the composite key refused it.
+        Err(recon_db::DbError::Constraint(_)) => return Err(ApiError::not_found()),
+        Err(e) => return Err(ApiError::from_db(&e)),
+    };
+    let record = recon_db::matching::get(&state.pool, firm, lease.id).await?;
+    Ok((StatusCode::ACCEPTED, Json(json!({ "job": record }))))
+}
+
+/// `GET /v1/firms/{firm}/clients/{client}/matching-jobs/{job}`: the job's durable row —
+/// its status, cursor against the pinned snapshot, counters and (once complete) the run's
+/// digest.
+pub async fn get_matching_job(
+    State(state): State<AppState>,
+    Path((firm, client, job)): Path<(String, String, String)>,
+) -> ApiResult {
+    let firm = FirmId::from_uuid(id(&firm)?);
+    let client = ClientId::from_uuid(id(&client)?);
+    let job = id(&job)?;
+    let record = recon_db::matching::get(&state.pool, firm, job).await?;
+    if record.client_id != client.as_uuid() {
+        // A job of another client in the same firm is not this resource.
+        return Err(ApiError::not_found());
+    }
+    Ok((StatusCode::OK, Json(json!({ "job": record }))))
+}
+
 /// Anything else.
 pub async fn fallback() -> ApiError {
     ApiError::not_found()

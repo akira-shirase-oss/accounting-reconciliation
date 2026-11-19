@@ -8,6 +8,7 @@ pub mod config;
 pub mod error;
 pub mod faults;
 pub mod handlers;
+pub mod matching;
 pub mod profiles;
 pub mod serve;
 pub mod state;
@@ -129,6 +130,14 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/v1/firms/{firm}/imports/{import}/reject",
             post(handlers::reject_revision),
+        )
+        .route(
+            "/v1/firms/{firm}/clients/{client}/matching-jobs",
+            post(handlers::start_matching_job),
+        )
+        .route(
+            "/v1/firms/{firm}/clients/{client}/matching-jobs/{job}",
+            get(handlers::get_matching_job),
         )
         .route("/v1/firms/{firm}/profiles", post(handlers::create_profile))
         .route(

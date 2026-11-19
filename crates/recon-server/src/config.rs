@@ -49,8 +49,12 @@ pub struct Config {
     pub flip_timeout: Duration,
     /// Overall deadline for any request.
     pub request_timeout: Duration,
-    /// How often the sweeper discards expired staging imports.
+    /// How often the sweeper discards expired staging imports and reclaims matching jobs.
     pub sweep_interval: Duration,
+    /// The matching job's lease, renewed by every committed chunk (D-033: 30 s).
+    pub matching_lease: Duration,
+    /// Most matching workers in flight; a start without one is `503`.
+    pub matching_concurrency: usize,
     /// How long shutdown waits for requests in flight.
     pub drain_timeout: Duration,
     /// Longest a connection may take to send a request head, and longest it may sit idle
@@ -85,6 +89,8 @@ impl fmt::Debug for Config {
             .field("flip_timeout", &self.flip_timeout)
             .field("request_timeout", &self.request_timeout)
             .field("sweep_interval", &self.sweep_interval)
+            .field("matching_lease", &self.matching_lease)
+            .field("matching_concurrency", &self.matching_concurrency)
             .field("drain_timeout", &self.drain_timeout)
             .field("header_read_timeout", &self.header_read_timeout)
             .field("max_connections", &self.max_connections)
@@ -128,6 +134,7 @@ impl Config {
         let flip_timeout = millis("RECON_FLIP_TIMEOUT_MS", 60_000, 1_000, 600_000);
         let request_timeout = millis("RECON_REQUEST_TIMEOUT_MS", 150_000, 1_000, 900_000);
         let sweep_interval = millis("RECON_SWEEP_INTERVAL_MS", 10_000, 50, 3_600_000);
+        let matching_lease = millis("RECON_MATCHING_LEASE_MS", 30_000, 1_000, 600_000);
         let drain_timeout = millis("RECON_DRAIN_MS", 30_000, 0, 600_000);
         let statement_timeout = millis("RECON_STATEMENT_TIMEOUT_MS", 10_000, 100, 600_000);
         let acquire_timeout = millis("RECON_DB_ACQUIRE_MS", 1_500, 50, 60_000);
@@ -161,6 +168,7 @@ impl Config {
             }
         };
         let import_concurrency = count("RECON_IMPORT_CONCURRENCY", 4, 64, &mut problems);
+        let matching_concurrency = count("RECON_MATCHING_CONCURRENCY", 4, 32, &mut problems);
         let max_connections = count("RECON_DB_MAX_CONNECTIONS", 32, 256, &mut problems);
         let max_open_connections = count("RECON_MAX_CONNECTIONS", 512, 65_536, &mut problems);
         let max_in_flight = count("RECON_MAX_IN_FLIGHT", 256, 4_096, &mut problems);
@@ -198,6 +206,8 @@ impl Config {
             flip_timeout,
             request_timeout,
             sweep_interval,
+            matching_lease,
+            matching_concurrency: usize::try_from(matching_concurrency).unwrap_or(4),
             drain_timeout,
             header_read_timeout,
             max_connections: usize::try_from(max_open_connections).unwrap_or(512),

@@ -22,8 +22,13 @@ pub struct AppState {
     /// The staging budget in KiB permits (D-050): parsed rows waiting to be stored, across
     /// every upload.
     pub staging_budget: Arc<Semaphore>,
+    /// One permit per matching worker in flight (a job without one stays claimable).
+    pub match_permits: Arc<Semaphore>,
     /// Fault points (drills only).
     pub faults: Arc<Faults>,
+    /// Cancelled when the process shuts down; spawned workers check it between chunks.
+    /// The server replaces it with a child of its token (tests keep the fresh one).
+    pub shutdown: tokio_util::sync::CancellationToken,
     checked: Arc<AtomicBool>,
     /// When the readiness probe last reached the database, in milliseconds since `born`
     /// (0: never). `/readyz` reads this instead of querying (D-051).
@@ -37,10 +42,12 @@ impl AppState {
         Self {
             pool,
             import_permits: Arc::new(Semaphore::new(config.import_concurrency)),
+            match_permits: Arc::new(Semaphore::new(config.matching_concurrency)),
             staging_budget: Arc::new(Semaphore::new(config.staging_budget_bytes / 1024)),
             config: Arc::new(config),
             faults: Arc::new(faults),
             checked: Arc::new(AtomicBool::new(false)),
+            shutdown: tokio_util::sync::CancellationToken::new(),
             db_ok_at: Arc::new(AtomicU64::new(0)),
             born: Instant::now(),
         }

@@ -115,6 +115,12 @@ impl ApiError {
                 "another import into this account (or this client's documents) is being published; nothing changed, try again shortly",
             )
             .retry_after(2),
+            DbError::ClientBusy => Self::new(
+                StatusCode::CONFLICT,
+                "client_busy",
+                "a matching job is already running for this client",
+            )
+            .retry_after(2),
             DbError::NotARevision => Self::new(
                 StatusCode::CONFLICT,
                 "not_a_revision",

@@ -23,6 +23,9 @@ pub enum DbError {
     /// (D-053).
     #[error("another import into this account is being published")]
     AccountBusy,
+    /// A matching job already runs for the client (D-033: one running job per client).
+    #[error("a matching job is already running for this client")]
+    ClientBusy,
     /// The firm already holds the most profile names it may (D-062).
     #[error("the firm's profile limit is reached")]
     ProfileLimit,
@@ -84,7 +87,7 @@ impl DbError {
 }
 
 /// The schema's custom SQLSTATEs and their names.
-const GUARDS: [(&str, &str); 17] = [
+const GUARDS: [(&str, &str); 23] = [
     ("RCA01", "decision_log_append_only"),
     ("RCA02", "no_decision_chain"),
     ("RCA03", "decision_already_recorded"),
@@ -102,6 +105,12 @@ const GUARDS: [(&str, &str); 17] = [
     ("RCL02", "lines_need_complete_import"),
     ("RCL03", "lines_immutable"),
     ("RCL04", "line_needs_its_decision"),
+    ("RCL05", "line_exception_state_mismatch"),
+    ("RCJ01", "match_job_refused"),
+    ("RCM01", "match_refused"),
+    ("RCM02", "match_needs_its_decision"),
+    ("RCM03", "allocation_refused"),
+    ("RCD03", "document_bookkeeping_refused"),
 ];
 
 impl From<sqlx::Error> for DbError {

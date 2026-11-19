@@ -1256,6 +1256,7 @@ dependencies = [
  "recon-db",
  "recon-domain",
  "recon-import",
+ "recon-match",
  "reqwest",
  "serde",
  "serde_json",

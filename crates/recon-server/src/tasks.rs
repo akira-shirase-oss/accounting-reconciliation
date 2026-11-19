@@ -96,6 +96,13 @@ pub async fn sweeper(state: AppState, shutdown: CancellationToken) {
                 Ok(Err(e)) => tracing::warn!(error = %e, "sweep failed; retrying next round"),
                 Err(_) => tracing::warn!("sweep timed out; retrying next round"),
             }
+            // Reclaim matching jobs whose workers died (their lease expired).
+            // `resume_expired` logs its own errors; a timeout just tries next round.
+            let _ = tokio::time::timeout(
+                Duration::from_secs(30),
+                crate::matching::resume_expired(&state, shutdown.clone()),
+            )
+            .await;
         }
         tokio::select! {
             () = shutdown.cancelled() => return,
