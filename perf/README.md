@@ -82,3 +82,9 @@ MODE=smoke scripts/load.sh r2-match   # target/perf/
 Run the full size only on a quiet machine (`uptime` load average below about
 6 on this 12-core laptop); otherwise run the smoke and record the full run as
 owed. CI runs the smoke on every push.
+
+The full runs live in `.github/workflows/load-full.yml`: `gh workflow run
+load-full.yml -f scenario=all` (or `-f scenario=r2-match`) runs each scenario
+on its own runner with its own PostgreSQL and uploads the labelled result
+JSON as an artifact, pass or miss. A threshold miss fails the job and is kept
+as evidence, never retried to green.

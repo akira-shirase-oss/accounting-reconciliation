@@ -230,6 +230,7 @@ async fn main() -> anyhow::Result<()> {
         .env("RECON_OPERATOR_TOKEN", &token)
         .env("RECON_LOG", "warn")
         .env("RECON_IMPORT_CONCURRENCY", plan.workers.to_string())
+        .env("RECON_MATCHING_CONCURRENCY", plan.workers.to_string())
         .env("RECON_DB_MAX_CONNECTIONS", "32")
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
