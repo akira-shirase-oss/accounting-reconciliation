@@ -422,6 +422,28 @@ pub async fn get(pool: &PgPool, firm: FirmId, id: Uuid) -> Result<JobRecord, DbE
     })
 }
 
+/// Extends the claimed job's lease under the token CAS — the worker's heartbeat during
+/// the snapshot-and-engine stretch, where no chunk commit renews it. `LeaseLost` when
+/// another claim holds the job.
+pub async fn renew(pool: &PgPool, lease: &JobLease, lease_for: Duration) -> Result<(), DbError> {
+    let ok = sqlx::query(
+        "UPDATE recon.match_jobs
+            SET lease_until = pg_catalog.clock_timestamp() + ($4::bigint * interval '1 millisecond')
+          WHERE firm_id = $1 AND id = $2 AND lease_token = $3 AND status = 'running'",
+    )
+    .bind(lease.firm.as_uuid())
+    .bind(lease.id)
+    .bind(lease.token)
+    .bind(millis(lease_for))
+    .execute(pool)
+    .await?
+    .rows_affected();
+    if ok == 0 {
+        return Err(DbError::LeaseLost);
+    }
+    Ok(())
+}
+
 /// The job's pinned settings and token check — `LeaseLost` for a stale worker.
 pub async fn job_settings(pool: &PgPool, lease: &JobLease) -> Result<JobSettings, DbError> {
     let row = sqlx::query(

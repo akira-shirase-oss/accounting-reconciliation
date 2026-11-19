@@ -3,10 +3,11 @@
 //! start the server (config).
 //!
 //! `RECON_FAULT=<point>` names one point (`staged_batch:<n>`, `before_flip`,
-//! `flip_lines_inserted`, `flip_before_commit`, `after_commit`). When the server reaches it,
-//! it creates the file `RECON_FAULT_MARKER` and waits forever, holding whatever it holds
-//! (inside the flip: an open transaction), so the drill can `SIGKILL` it at exactly that
-//! point.
+//! `flip_lines_inserted`, `flip_before_commit`, `after_commit` for imports; `match_snapshot`,
+//! `match_chunk:<n>`, `match_before_finish`, `match_finished` for the matching worker). When
+//! the server reaches it, it creates the file `RECON_FAULT_MARKER` and waits forever,
+//! holding whatever it holds (inside the flip: an open transaction), so the drill can
+//! `SIGKILL` it at exactly that point.
 
 use recon_db::imports::{FlipHook, FlipPoint};
 
@@ -23,6 +24,14 @@ pub enum FaultPoint {
     FlipBeforeCommit,
     /// The flip committed; the response has not been sent.
     AfterCommit,
+    /// A matching job's snapshot is pinned; no outcome is committed yet.
+    MatchSnapshot,
+    /// The n-th matching chunk (1-based) has committed; the worker continues.
+    MatchChunk(u32),
+    /// Every chunk committed; the job's `complete` update has not run.
+    MatchBeforeFinish,
+    /// The job row is `complete`; the worker has not exited.
+    MatchFinished,
 }
 
 impl FaultPoint {
@@ -33,7 +42,19 @@ impl FaultPoint {
             "flip_lines_inserted" => Self::FlipLinesInserted,
             "flip_before_commit" => Self::FlipBeforeCommit,
             "after_commit" => Self::AfterCommit,
-            other => Self::StagedBatch(other.strip_prefix("staged_batch:")?.parse().ok()?),
+            "match_snapshot" => Self::MatchSnapshot,
+            "match_before_finish" => Self::MatchBeforeFinish,
+            "match_finished" => Self::MatchFinished,
+            other => other
+                .strip_prefix("staged_batch:")
+                .and_then(|n| n.parse().ok())
+                .map(Self::StagedBatch)
+                .or_else(|| {
+                    other
+                        .strip_prefix("match_chunk:")
+                        .and_then(|n| n.parse().ok())
+                        .map(Self::MatchChunk)
+                })?,
         })
     }
 }
@@ -114,5 +135,14 @@ mod tests {
         );
         assert_eq!(FaultPoint::parse("staged_batch:x"), None);
         assert_eq!(FaultPoint::parse("anything"), None);
+        assert_eq!(
+            FaultPoint::parse("match_snapshot"),
+            Some(FaultPoint::MatchSnapshot)
+        );
+        assert_eq!(
+            FaultPoint::parse("match_chunk:12"),
+            Some(FaultPoint::MatchChunk(12))
+        );
+        assert_eq!(FaultPoint::parse("match_chunk:x"), None);
     }
 }

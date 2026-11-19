@@ -4,6 +4,7 @@
 //! and the sweeper's next claim resumes the job where the cursor stands (D-033).
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use recon_db::matching::{self, ChunkReport, Decided, DecidedLine, JobLease, Start};
 use recon_domain::{ClientId, Currency, FirmId, LineId};
@@ -73,7 +74,33 @@ pub async fn resume_expired(state: &AppState, shutdown: CancellationToken) {
 /// transaction that renews the lease. A lost lease means stop quietly; a real failure
 /// marks the job `failed` with a code.
 async fn run(state: AppState, lease: JobLease, shutdown: CancellationToken) {
-    match drive(&state, &lease, &shutdown).await {
+    // The lease renews on every chunk commit; the snapshot-and-engine stretch in
+    // between can run far past one lease window, so a heartbeat keeps it alive.
+    // Its cadence is a third of the lease: two missed renewals may pass before the
+    // sweeper could claim the job. A lost lease stops the heart — the drive then
+    // fails fenced at its next write.
+    let heartbeat = CancellationToken::new();
+    let beat = {
+        let (pool, token) = (state.pool.clone(), heartbeat.clone());
+        let lease_for = state.config.matching_lease;
+        tokio::spawn(async move {
+            let every = (lease_for / 3).max(Duration::from_millis(50));
+            loop {
+                tokio::select! {
+                    () = tokio::time::sleep(every) => {
+                        if matching::renew(&pool, &lease, lease_for).await.is_err() {
+                            return;
+                        }
+                    }
+                    () = token.cancelled() => return,
+                }
+            }
+        })
+    };
+    let driven = drive(&state, &lease, &shutdown).await;
+    heartbeat.cancel();
+    let _ = beat.await;
+    match driven {
         Ok(()) => {}
         Err(Step::LeaseLost) => tracing::info!("matching job lost its lease; stopping"),
         Err(Step::Failed(code)) => {
@@ -116,6 +143,10 @@ async fn drive(
     let line_count = matching::snapshot(pool, lease)
         .await
         .map_err(|e| Step::db(&e))?;
+    state
+        .faults
+        .reached(crate::faults::FaultPoint::MatchSnapshot)
+        .await;
     let settings = matching::job_settings(pool, lease)
         .await
         .map_err(|e| Step::db(&e))?;
@@ -126,30 +157,7 @@ async fn drive(
     if line_count != i64::try_from(lines.len()).map_err(|_| Step::Failed("storage_error"))? {
         return Err(Step::Failed("snapshot_inconsistent"));
     }
-    let seqs: BTreeMap<LineId, i64> = lines.iter().map(|l| (l.id, l.seq)).collect();
-    let engine_lines: Vec<recon_match::LineInput> = lines
-        .into_iter()
-        .map(|l| recon_match::LineInput {
-            id: l.id,
-            booking_date: l.booking_date,
-            amount: l.amount,
-            narration_norm: l.narration_norm,
-            reference: l.reference,
-            counterparty_norm: l.counterparty_norm,
-        })
-        .collect();
-    let engine_docs: Vec<recon_match::DocumentInput> = documents
-        .into_iter()
-        .map(|d| recon_match::DocumentInput {
-            id: d.id,
-            kind: d.kind,
-            number_norm: d.number_norm,
-            issue_date: d.issue_date,
-            due_date: d.due_date,
-            open_amount: d.open_amount,
-            counterparty_norm: d.counterparty_norm,
-        })
-        .collect();
+    let (seqs, engine_lines, engine_docs) = engine_inputs(lines, documents);
 
     // The engine is pure CPU: off the async threads, bounded by its own budgets (D-013).
     let run = tokio::task::spawn_blocking(move || {
@@ -165,6 +173,7 @@ async fn drive(
         .cursor;
     let mut decided: Vec<DecidedLine> = Vec::with_capacity(matching::CHUNK_LINES);
     let mut reports = ChunkReport::default();
+    let mut chunks = 0_u32;
     for (line_id, seq) in seqs.iter().filter(|(_, seq)| **seq > cursor) {
         let outcome = run
             .outcomes
@@ -183,6 +192,11 @@ async fn drive(
                     .map_err(|e| Step::db(&e))?,
             );
             decided.clear();
+            chunks = chunks.saturating_add(1);
+            state
+                .faults
+                .reached(crate::faults::FaultPoint::MatchChunk(chunks))
+                .await;
             if shutdown.is_cancelled() {
                 return Err(Step::LeaseLost);
             }
@@ -195,10 +209,23 @@ async fn drive(
                 .await
                 .map_err(|e| Step::db(&e))?,
         );
+        chunks = chunks.saturating_add(1);
+        state
+            .faults
+            .reached(crate::faults::FaultPoint::MatchChunk(chunks))
+            .await;
     }
+    state
+        .faults
+        .reached(crate::faults::FaultPoint::MatchBeforeFinish)
+        .await;
     matching::finish(pool, lease, run.digest)
         .await
         .map_err(|e| Step::db(&e))?;
+    state
+        .faults
+        .reached(crate::faults::FaultPoint::MatchFinished)
+        .await;
     tracing::info!(
         matched = reports.matched,
         proposed = reports.proposed,
@@ -207,6 +234,43 @@ async fn drive(
         "matching job complete"
     );
     Ok(())
+}
+
+/// The stored snapshot rows as the engine's inputs plus each line's sequence for the
+/// commit order (`match_job_lines.seq` follows the id order `BTreeMap` iterates).
+fn engine_inputs(
+    lines: Vec<matching::JobLine>,
+    documents: Vec<matching::JobDocument>,
+) -> (
+    BTreeMap<LineId, i64>,
+    Vec<recon_match::LineInput>,
+    Vec<recon_match::DocumentInput>,
+) {
+    let seqs: BTreeMap<LineId, i64> = lines.iter().map(|l| (l.id, l.seq)).collect();
+    let lines = lines
+        .into_iter()
+        .map(|l| recon_match::LineInput {
+            id: l.id,
+            booking_date: l.booking_date,
+            amount: l.amount,
+            narration_norm: l.narration_norm,
+            reference: l.reference,
+            counterparty_norm: l.counterparty_norm,
+        })
+        .collect();
+    let docs = documents
+        .into_iter()
+        .map(|d| recon_match::DocumentInput {
+            id: d.id,
+            kind: d.kind,
+            number_norm: d.number_norm,
+            issue_date: d.issue_date,
+            due_date: d.due_date,
+            open_amount: d.open_amount,
+            counterparty_norm: d.counterparty_norm,
+        })
+        .collect();
+    (seqs, lines, docs)
 }
 
 /// The engine's `Outcome` as `recon-db`'s `Decided` (storage has no engine types).

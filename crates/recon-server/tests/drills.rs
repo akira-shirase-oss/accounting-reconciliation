@@ -5,6 +5,11 @@
 //!   flip, inside the flip's transaction, after its commit. Each import must be complete
 //!   or invisible; a re-run must complete exactly once with lines identical to an
 //!   uninterrupted import.
+//! * `kill-mid-batch` (failure case 4, matching half): a `gen-v3` month is imported and
+//!   its matching job `SIGKILL`ed at seeded points — after the snapshot, after chunk
+//!   commits, before and after the job's `complete`. A fresh server's sweeper resumes
+//!   the job: every line ends in exactly one state, no subject sees a second decision,
+//!   and the outcomes are identical to an uninterrupted run.
 //! * `db-down`: PostgreSQL is cut off (a proxy drops every connection): readiness goes red
 //!   within 2 s, uploads are answered `503` and never accepted then lost, an upload cut off
 //!   mid-way publishes nothing, and after recovery every file imports exactly once.
@@ -27,11 +32,14 @@ mod common;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use common::{GENERATED_CONTENT, Proxy, Server, TOKEN, assert_log_clean, http, tenant, upload};
-use recon_cli::generate::{Rng, StatementSpec, statement};
+use common::{
+    GENERATED_CONTENT, Proxy, Server, TOKEN, assert_log_clean, http, post_json, tenant, upload,
+};
+use recon_cli::generate::{MatchSpec, Rng, StatementSpec, match_set, statement};
 use recon_db::testing::{APP_PASSWORD, TestDb};
 use recon_db::{imports, replay, tenancy};
 use recon_domain::{AccountId, ClientId, Currency, Date, FirmId};
+use serde_json::Value;
 use tokio::sync::Semaphore;
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
@@ -487,4 +495,290 @@ async fn drill_db_down() {
         "db-down: readiness red after {red_after:?}, ready again {recovered_after:?} after recovery"
     );
     db.cleanup().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// kill-mid-batch: the matching half of failure case 4.
+
+/// The matching drill's servers: like `KILL_ENV`, plus a 1 s job lease so the dead
+/// worker's job is claimable almost at once.
+const MATCH_ENV: [(&str, &str); 5] = [
+    ("RECON_IMPORT_LEASE_MS", "5000"),
+    ("RECON_SWEEP_INTERVAL_MS", "200"),
+    ("RECON_DB_MAX_CONNECTIONS", "8"),
+    ("RECON_DB_ACQUIRE_MS", "5000"),
+    ("RECON_MATCHING_LEASE_MS", "1000"),
+];
+
+/// The seeded kill points: distinct chunk commits, then every lifecycle edge.
+fn match_kill_points(chunks: u32, count: usize) -> Vec<String> {
+    let mut rng = Rng::new(SEED);
+    let mut pool: Vec<u32> = (1..=chunks).collect();
+    let fixed = ["match_snapshot", "match_before_finish", "match_finished"];
+    let wanted = count.saturating_sub(fixed.len()).min(pool.len());
+    for i in 0..wanted {
+        let j = i + usize::try_from(rng.below(u64::try_from(pool.len() - i).unwrap())).unwrap();
+        pool.swap(i, j);
+    }
+    let mut chosen: Vec<u32> = pool[..wanted].to_vec();
+    chosen.sort_unstable();
+    let mut points: Vec<String> = chosen
+        .into_iter()
+        .map(|b| format!("match_chunk:{b}"))
+        .collect();
+    points.extend(fixed.iter().map(|p| (*p).to_owned()));
+    points.truncate(count);
+    points
+}
+
+/// Uploads the documents file through its own route.
+async fn upload_documents(base: &str, firm: &str, client: &str, body: Vec<u8>) {
+    let r = http()
+        .post(format!(
+            "{base}/v1/firms/{firm}/clients/{client}/document-imports"
+        ))
+        .bearer_auth(TOKEN)
+        .header("content-type", "text/csv")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    let status = r.status().as_u16();
+    let text: Value = r.json().await.unwrap_or(Value::Null);
+    assert_eq!(status, 201, "{text}");
+}
+
+/// Posts a matching job and answers its id.
+async fn post_job(base: &str, firm: &str, client: &str) -> String {
+    let (status, body) = post_json(
+        base,
+        &format!("/v1/firms/{firm}/clients/{client}/matching-jobs"),
+        &serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, 202, "{body}");
+    body["job"]["id"].as_str().unwrap().to_owned()
+}
+
+/// Polls the job row until it leaves `running` or the deadline passes.
+async fn wait_job(db: &TestDb, job: Uuid, within: Duration) -> String {
+    let deadline = Instant::now() + within;
+    loop {
+        let status: String = sqlx::query_scalar(
+            "SELECT status FROM recon.match_jobs WHERE firm_id = $1 AND id = $2",
+        )
+        .bind(FIRM.as_uuid())
+        .bind(job)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        if status != "running" || Instant::now() >= deadline {
+            return status;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Every line's outcome as `(status, match/proposal tier, exception kind)`, ordered by
+/// its CSV row: stable across databases because `row_no` is the file's own order.
+async fn outcomes(db: &TestDb) -> Vec<(i32, String, String, String)> {
+    sqlx::query_as(
+        "SELECT l.row_no, l.status::text,
+                coalesce(m.tier, pm.tier, '')::text,
+                coalesce(e.kind, '')::text
+           FROM recon.statement_lines l
+           LEFT JOIN recon.match_lines ml
+                  ON ml.firm_id = l.firm_id AND ml.line_id = l.id
+           LEFT JOIN recon.matches m
+                  ON m.firm_id = l.firm_id AND m.id = ml.match_id
+           LEFT JOIN recon.proposals p
+                  ON p.firm_id = l.firm_id AND p.line_id = l.id
+           LEFT JOIN recon.matches pm
+                  ON pm.firm_id = l.firm_id AND pm.id = p.match_id
+           LEFT JOIN recon.line_exceptions e
+                  ON e.firm_id = l.firm_id AND e.line_id = l.id
+          WHERE l.firm_id = $1 AND l.client_id = $2
+          ORDER BY l.row_no",
+    )
+    .bind(FIRM.as_uuid())
+    .bind(CLIENT.as_uuid())
+    .fetch_all(&db.pool)
+    .await
+    .unwrap()
+}
+
+/// No subject may carry two decisions of one job (resumed or not).
+async fn duplicate_decisions(db: &TestDb) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM (
+             SELECT job_id, subject_id FROM recon.decision_log
+              WHERE firm_id = $1 AND job_id IS NOT NULL
+              GROUP BY job_id, subject_id HAVING count(*) > 1) d",
+    )
+    .bind(FIRM.as_uuid())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap()
+}
+
+/// Imports the set, runs the job to completion, answers the outcome rows every
+/// re-run must equal.
+async fn reference_outcomes(
+    set: &recon_cli::generate::MatchSet,
+) -> Vec<(i32, String, String, String)> {
+    let db = TestDb::new().await;
+    fixed_tenant(&db).await;
+    let server = Server::start(&db.app_url(), &MATCH_ENV).await;
+    let (firm, account) = firm_path();
+    let client = CLIENT.to_string();
+    let (status, body) = upload(&server.base, &firm, &account, set.statement.clone())
+        .await
+        .unwrap();
+    assert_eq!(status, 201, "{body}");
+    upload_documents(&server.base, &firm, &client, set.documents.clone()).await;
+    let job = post_job(&server.base, &firm, &client).await;
+    assert_eq!(
+        wait_job(&db, Uuid::parse_str(&job).unwrap(), Duration::from_mins(15)).await,
+        "complete"
+    );
+    let out = outcomes(&db).await;
+    replay::check(&db.pool, FIRM)
+        .await
+        .unwrap()
+        .expect("the reference matching run replays");
+    let log = server.stop().await;
+    assert_log_clean(&log, &GENERATED_CONTENT);
+    db.cleanup().await;
+    out
+}
+
+async fn kill_match_at(
+    point: String,
+    set: Arc<recon_cli::generate::MatchSet>,
+    reference: Arc<Vec<(i32, String, String, String)>>,
+) {
+    let db = TestDb::new().await;
+    fixed_tenant(&db).await;
+    let marker = std::env::temp_dir().join(format!(
+        "recon-match-drill-{}-{}.marker",
+        std::process::id(),
+        Uuid::now_v7()
+    ));
+    let mut env = MATCH_ENV.to_vec();
+    let marker_text = marker.display().to_string();
+    env.push(("RECON_FAULT", point.as_str()));
+    env.push(("RECON_FAULT_MARKER", marker_text.as_str()));
+    let server = Server::start(&db.app_url(), &env).await;
+    let (firm, account) = firm_path();
+    let client = CLIENT.to_string();
+    let (status, body) = upload(&server.base, &firm, &account, set.statement.clone())
+        .await
+        .unwrap();
+    assert_eq!(status, 201, "{body}");
+    upload_documents(&server.base, &firm, &client, set.documents.clone()).await;
+    let job = post_job(&server.base, &firm, &client).await;
+    let deadline = Instant::now() + Duration::from_secs(600);
+    while !marker.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "{point}: the fault point was never reached"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let killed_log = server.kill().await;
+
+    // Whatever the kill caught, the state left behind must be whole: the chain replays
+    // to it, every line holds exactly one state, no subject carries two decisions.
+    replay::check(&db.pool, FIRM)
+        .await
+        .unwrap()
+        .unwrap_or_else(|m| panic!("{point}: the log does not replay after the kill: {m}"));
+    assert_eq!(
+        duplicate_decisions(&db).await,
+        0,
+        "{point}: a subject carries two decisions"
+    );
+    let expected_status = if point == "match_finished" {
+        "complete"
+    } else {
+        "running"
+    };
+    assert_eq!(
+        wait_job(&db, Uuid::parse_str(&job).unwrap(), Duration::from_secs(5)).await,
+        expected_status,
+        "{point}: the killed job's status"
+    );
+
+    // A fresh process: the sweeper claims the dead worker's lease and resumes from the
+    // cursor — never re-deciding a committed line.
+    let server = Server::start(&db.app_url(), &MATCH_ENV).await;
+    assert_eq!(
+        wait_job(&db, Uuid::parse_str(&job).unwrap(), Duration::from_mins(15)).await,
+        "complete",
+        "{point}: the resumed job did not finish"
+    );
+    let out = outcomes(&db).await;
+    assert_eq!(
+        &out,
+        reference.as_ref(),
+        "{point}: the resumed run's outcomes differ from an uninterrupted run"
+    );
+    assert_eq!(
+        duplicate_decisions(&db).await,
+        0,
+        "{point}: the resume wrote a second decision for a subject"
+    );
+    replay::check(&db.pool, FIRM)
+        .await
+        .unwrap()
+        .unwrap_or_else(|m| panic!("{point}: {m}"));
+    let log = server.stop().await;
+    assert_log_clean(&killed_log, &GENERATED_CONTENT);
+    assert_log_clean(&log, &GENERATED_CONTENT);
+    let _ = std::fs::remove_file(&marker);
+    db.cleanup().await;
+    eprintln!("kill-mid-batch: {point} ok");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn drill_kill_mid_batch() {
+    // The engine scans its client's documents per line, so the drill's single client
+    // keeps to a month-sized set: enough for twenty chunk commits and every lifecycle
+    // edge, fast enough that the heartbeat, not the lease window, carries the compute.
+    let rows = u32::try_from(env_or("RECON_DRILL_ROWS", 10_000)).unwrap();
+    let points = match_kill_points(rows.div_ceil(500), env_or("RECON_DRILL_POINTS", 20));
+    let parallel = env_or("RECON_DRILL_PARALLEL", 4).max(1);
+    let set = Arc::new(match_set(&MatchSpec {
+        seed: SEED,
+        lines: rows,
+        distractors: rows / 10,
+        currency: Currency::Usd,
+        start: Date::new(2026, 3, 1).unwrap(),
+        days: 28,
+    }));
+    let started = Instant::now();
+    let reference = Arc::new(reference_outcomes(&set).await);
+    eprintln!(
+        "kill-mid-batch: {rows} lines, {} points {points:?}, {} reference outcomes",
+        points.len(),
+        reference.len()
+    );
+    let permits = Arc::new(Semaphore::new(parallel));
+    let mut runs = tokio::task::JoinSet::new();
+    for point in points {
+        let (set, reference, permits) = (set.clone(), reference.clone(), permits.clone());
+        runs.spawn(async move {
+            let _permit = permits.acquire_owned().await.unwrap();
+            kill_match_at(point, set, reference).await;
+        });
+    }
+    while let Some(run) = runs.join_next().await {
+        if let Err(e) = run {
+            std::panic::resume_unwind(e.into_panic());
+        }
+    }
+    eprintln!(
+        "kill-mid-batch: all points passed in {:?}",
+        started.elapsed()
+    );
 }
