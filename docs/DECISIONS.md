@@ -869,6 +869,22 @@ conservative side.
   drive p99 — first cursor to complete, queue time excluded — 300 s) and the
   capacity target (2,000 lines/s, the original bar), recorded as unmet on shared
   hardware and owed for a dedicated host. The tripwire is not capacity.
+- **D-075 — `503` is honest backpressure, and the verdict is the exit code.** Two
+  contracts the second `r2-match` full run exposed (run 44585172464: `pass` false
+  behind a green workflow — the loadgen wrote the verdict but always exited zero;
+  every tail now exits non-zero exactly when `pass` is false, tested). A status
+  read stays behind the one admission gate — exempting polls would only move the
+  shed to the connection pool, which is where it came from anyway: the observed
+  503s were `PoolTimedOut` at a saturated pool (32 connections, 1.5 s acquire
+  deadline) while every match worker held connections through its chunk commits.
+  So a `503` is backpressure, not failure: the API carries `Retry-After` on every
+  one, names it `overloaded` when the cause is contention (pool acquire timeout,
+  `55P03` lock, `40001`/`40P01`, `53300` too many connections) and keeps
+  `database_unavailable` only for a genuinely unreachable or restarting database,
+  and the load client sleeps the hint, retries bounded, and counts shed responses
+  (`server_shed_responses`) separately from errors — a shed is measured, never
+  called lost work and never called an error unless it outlives the retry bound.
+  A `503` past the bound still answers as an error: persistent shedding is.
 
 ## Open questions (blocked on the maintainer or an outside party)
 

@@ -72,12 +72,24 @@ impl ApiError {
         )
     }
 
-    /// 503 for an unreachable or overloaded database.
+    /// 503 for an unreachable database.
     pub fn database_unavailable() -> Self {
         Self::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "database_unavailable",
             "the database is unavailable; nothing was accepted, retry later",
+        )
+        .retry_after(1)
+    }
+
+    /// 503 when the service is at a local capacity bound — the in-flight request
+    /// limit or the connection pool (D-075). The database may be perfectly healthy;
+    /// retrying after the hint is the right move.
+    pub fn overloaded() -> Self {
+        Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "overloaded",
+            "the service is at capacity; nothing was accepted, retry after the hint",
         )
         .retry_after(1)
     }
@@ -96,9 +108,23 @@ impl ApiError {
     pub fn from_db(error: &DbError) -> Self {
         match error {
             DbError::NotFound => Self::not_found(),
-            DbError::Unavailable(_) | DbError::Timeout(_) | DbError::Retryable(_) => {
-                tracing::warn!(error = %error, sqlstate = ?error.sqlstate(), "database unavailable");
-                Self::database_unavailable()
+            DbError::Unavailable(e) | DbError::Timeout(e) | DbError::Retryable(e) => {
+                // Honest naming (D-075): a saturated connection pool, a lock or
+                // serialization conflict, or the database refusing connections is
+                // backpressure — `overloaded` — not `database_unavailable`, which is
+                // kept for the database actually being unreachable or restarting.
+                let contention = matches!(e, sqlx::Error::PoolTimedOut)
+                    || matches!(
+                        error.sqlstate().as_deref(),
+                        Some("55P03" | "53300" | "40001" | "40P01")
+                    );
+                if contention {
+                    tracing::warn!(error = %error, sqlstate = ?error.sqlstate(), "service overloaded");
+                    Self::overloaded()
+                } else {
+                    tracing::warn!(error = %error, sqlstate = ?error.sqlstate(), "database unavailable");
+                    Self::database_unavailable()
+                }
             }
             DbError::LeaseLost | DbError::StagingIncomplete => {
                 tracing::warn!(error = %error, "import interrupted");
@@ -179,5 +205,37 @@ impl IntoResponse for ApiError {
                 .insert(header::RETRY_AFTER, HeaderValue::from(seconds));
         }
         response
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A saturated connection pool is backpressure named `overloaded` — not
+    /// `database_unavailable`, which is kept for a database actually unreachable
+    /// (D-075: the r2-match full run's 3,301 poll 503s were pool contention while
+    /// the database was healthy).
+    #[test]
+    fn a_saturated_pool_is_named_overloaded() {
+        let e = ApiError::from_db(&DbError::Unavailable(sqlx::Error::PoolTimedOut));
+        assert_eq!(
+            (e.status(), e.code()),
+            (StatusCode::SERVICE_UNAVAILABLE, "overloaded")
+        );
+        assert!(e.retry_after.is_some());
+    }
+
+    /// A transport failure to the database stays `database_unavailable`.
+    #[test]
+    fn an_unreachable_database_is_named_unavailable() {
+        let e = ApiError::from_db(&DbError::Unavailable(sqlx::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "refused",
+        ))));
+        assert_eq!(
+            (e.status(), e.code()),
+            (StatusCode::SERVICE_UNAVAILABLE, "database_unavailable")
+        );
     }
 }

@@ -8,6 +8,17 @@ observations, never production capacity; a run on a busy machine says so in
 its load average and is a smoke observation. A threshold miss fails the run
 and is kept as evidence, never rerun until green.
 
+Backpressure is honest and counted, not an error (D-075): a `503` carries
+`Retry-After`, is named `overloaded` when the cause is contention (a saturated
+connection pool, a lock or serialization conflict) and `database_unavailable`
+only when the database is unreachable; the generator sleeps the hint, retries
+bounded, and reports every shed response as `server_shed_responses` in the
+result. A request still shed past the retry bound is a real error.
+
+`pass` in the result JSON is the verdict; the process exit code is `1` when it
+is false, and `load.sh` propagates it — the workflow fails on a red verdict
+after uploading the artifact.
+
 ## `r0-import` (ROADMAP R0)
 
 The unit (D-027, import half) is one statement line taken through import:

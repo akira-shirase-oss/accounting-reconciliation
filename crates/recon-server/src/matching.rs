@@ -173,6 +173,7 @@ async fn drive(
     let pool = &state.pool;
     let lease_for = state.config.matching_lease;
     let statement_timeout = state.config.pool.statement_timeout;
+    let setup_started = std::time::Instant::now();
     let line_count = matching::snapshot(pool, lease)
         .await
         .map_err(|e| Step::db(&e))?;
@@ -203,7 +204,7 @@ async fn drive(
         }
         result = drive_engine_and_commit(
             state, lease, drive_cancel, lease_for, statement_timeout,
-            settings, seqs, engine_lines, engine_docs,
+            setup_started.elapsed(), settings, seqs, engine_lines, engine_docs,
         ) => result,
     }
 }
@@ -222,6 +223,7 @@ async fn drive_engine_and_commit(
     drive_cancel: &CancellationToken,
     lease_for: Duration,
     statement_timeout: Duration,
+    setup_ms: Duration,
     settings: recon_match::Settings,
     seqs: BTreeMap<LineId, i64>,
     engine_lines: Vec<recon_match::LineInput>,
@@ -232,12 +234,14 @@ async fn drive_engine_and_commit(
     }
     let pool = &state.pool;
     let faults = state.faults.clone();
+    let engine_started = std::time::Instant::now();
     let run = tokio::task::spawn_blocking(move || {
         faults.reached_blocking(crate::faults::FaultPoint::MatchEngine);
         recon_match::run(&engine_lines, &engine_docs, &settings)
     })
     .await
     .map_err(|_| Step::Failed("engine_panicked"))?;
+    let engine_ms = engine_started.elapsed();
     if drive_cancel.is_cancelled() {
         return Err(Step::LeaseLost);
     }
@@ -250,6 +254,10 @@ async fn drive_engine_and_commit(
     let mut decided: Vec<DecidedLine> = Vec::with_capacity(matching::CHUNK_LINES);
     let mut reports = ChunkReport::default();
     let mut chunks = 0_u32;
+    // Phase timings on the completion log line (D-075): which phase takes a drive's
+    // time, and whether the chunks carry a growing tail.
+    let mut commit_ms = Duration::ZERO;
+    let mut slowest_chunk_ms = Duration::ZERO;
     for (line_id, seq) in seqs.iter().filter(|(_, seq)| **seq > cursor) {
         let outcome = run
             .outcomes
@@ -261,12 +269,15 @@ async fn drive_engine_and_commit(
             outcome: translate(outcome),
         });
         if decided.len() == matching::CHUNK_LINES {
-            fold(
-                &mut reports,
+            let chunk_started = std::time::Instant::now();
+            let report =
                 matching::commit_chunk(pool, lease, &decided, lease_for, statement_timeout)
                     .await
-                    .map_err(|e| Step::db(&e))?,
-            );
+                    .map_err(|e| Step::db(&e))?;
+            let ms = chunk_started.elapsed();
+            fold(&mut reports, report);
+            commit_ms += ms;
+            slowest_chunk_ms = slowest_chunk_ms.max(ms);
             decided.clear();
             chunks = chunks.saturating_add(1);
             state
@@ -279,12 +290,14 @@ async fn drive_engine_and_commit(
         }
     }
     if !decided.is_empty() {
-        fold(
-            &mut reports,
-            matching::commit_chunk(pool, lease, &decided, lease_for, statement_timeout)
-                .await
-                .map_err(|e| Step::db(&e))?,
-        );
+        let chunk_started = std::time::Instant::now();
+        let report = matching::commit_chunk(pool, lease, &decided, lease_for, statement_timeout)
+            .await
+            .map_err(|e| Step::db(&e))?;
+        let ms = chunk_started.elapsed();
+        fold(&mut reports, report);
+        commit_ms += ms;
+        slowest_chunk_ms = slowest_chunk_ms.max(ms);
         chunks = chunks.saturating_add(1);
         state
             .faults
@@ -295,9 +308,11 @@ async fn drive_engine_and_commit(
         .faults
         .reached(crate::faults::FaultPoint::MatchBeforeFinish)
         .await;
+    let finish_started = std::time::Instant::now();
     matching::finish(pool, lease, run.digest)
         .await
         .map_err(|e| Step::db(&e))?;
+    let finish_ms = finish_started.elapsed();
     state
         .faults
         .reached(crate::faults::FaultPoint::MatchFinished)
@@ -307,6 +322,11 @@ async fn drive_engine_and_commit(
         proposed = reports.proposed,
         exceptions = reports.exceptions,
         skipped = reports.skipped,
+        setup_ms = u64::try_from(setup_ms.as_millis()).unwrap_or(u64::MAX),
+        engine_ms = u64::try_from(engine_ms.as_millis()).unwrap_or(u64::MAX),
+        commit_ms = u64::try_from(commit_ms.as_millis()).unwrap_or(u64::MAX),
+        slowest_chunk_ms = u64::try_from(slowest_chunk_ms.as_millis()).unwrap_or(u64::MAX),
+        finish_ms = u64::try_from(finish_ms.as_millis()).unwrap_or(u64::MAX),
         "matching job complete"
     );
     Ok(())

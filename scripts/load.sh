@@ -73,8 +73,12 @@ if [ "$mode" = "full" ] || [ "${KEEP:-}" = "1" ]; then outdir="perf/results"; el
 mkdir -p "$outdir" target/perf
 out="${outdir}/${scenario}-${mode}-${stamp}.json"
 
+status=0
 SCENARIO="$scenario" MODE="$mode" PORT="${RECON_LOAD_PORT:-62490}" OUT="$out" \
 SERVER_BIN="./target/release/recon-server" MACHINE="$machine" COMMIT="$commit" LOAD_BEFORE="$load_before" \
 RECON_DATABASE_URL="postgres://recon_app:${RECON_APP_PASSWORD}@${host}/${db}" \
-  ./target/release/recon-loadgen
+  ./target/release/recon-loadgen || status=$?
+# The result file exists either way — a red verdict is kept as evidence and the
+# loadgen's exit code is the workflow's signal, never masked by this script's own.
 echo "result: $out"
+exit "$status"

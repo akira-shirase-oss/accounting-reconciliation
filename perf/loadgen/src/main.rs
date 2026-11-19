@@ -152,6 +152,46 @@ async fn peak_rss(_pid: u32) -> Option<u64> {
     None
 }
 
+/// The backpressure contract (D-075): a `503` is the server's honest "busy" and
+/// always carries `Retry-After` — the client sleeps it and retries, and every shed
+/// response is counted, never called an error. Only a request still shed after the
+/// bound surfaces to the caller (as its 503, which then *is* an error).
+async fn send(
+    req: reqwest::RequestBuilder,
+    shed: &AtomicUsize,
+) -> Result<reqwest::Response, reqwest::Error> {
+    let mut sheds = 0_u32;
+    loop {
+        // The clone keeps `req` alive for the next attempt; an unclonable body
+        // (a stream) is sent once — there is no honest retry for it.
+        let Some(builder) = req.try_clone() else {
+            return req.send().await;
+        };
+        let r = builder.send().await;
+        let wait = match &r {
+            Ok(resp) if resp.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE && sheds < 20 => {
+                resp.headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(1)
+                    .clamp(1, 30)
+            }
+            _ => return r,
+        };
+        sheds += 1;
+        shed.fetch_add(1, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_secs(wait)).await;
+    }
+}
+
+/// The verdict-to-exit contract: `pass` in the result JSON is the run's verdict and
+/// the process exit code is `1` when it is false — a red verdict is never a green
+/// check (run 44585172464 reported `pass: false` behind a successful workflow).
+fn verdict_exit_code(pass: bool) -> i32 {
+    if pass { 0 } else { 1 }
+}
+
 async fn wait_ready(base: &str) -> anyhow::Result<()> {
     let http = reqwest::Client::new();
     let deadline = Instant::now() + Duration::from_secs(60);
@@ -207,13 +247,15 @@ async fn post(
     token: &str,
     path: &str,
     body: Value,
+    shed: &AtomicUsize,
 ) -> anyhow::Result<Value> {
-    let r = http
-        .post(format!("{base}{path}"))
-        .bearer_auth(token)
-        .json(&body)
-        .send()
-        .await?;
+    let r = send(
+        http.post(format!("{base}{path}"))
+            .bearer_auth(token)
+            .json(&body),
+        shed,
+    )
+    .await?;
     let status = r.status();
     let body: Value = r.json().await?;
     if status != 201 {
@@ -311,12 +353,15 @@ async fn main() -> anyhow::Result<()> {
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(120))
         .build()?;
+    // Every 503 the server sheds, counted across the whole run (D-075).
+    let shed = Arc::new(AtomicUsize::new(0));
     let firm = post(
         &http,
         &base,
         &token,
         "/v1/firms",
         json!({"name": "Load firm"}),
+        &shed,
     )
     .await
     .context(
@@ -334,6 +379,7 @@ async fn main() -> anyhow::Result<()> {
             &token,
             &format!("/v1/firms/{firm_id}/clients"),
             json!({"name": format!("Client {c}")}),
+            &shed,
         )
         .await?;
         let client_id = client["client"]["id"]
@@ -346,6 +392,7 @@ async fn main() -> anyhow::Result<()> {
             &token,
             &format!("/v1/firms/{firm_id}/clients/{client_id}/accounts"),
             json!({"name": "Current", "currency": "USD"}),
+            &shed,
         )
         .await?;
         pairs.push((
@@ -371,6 +418,7 @@ async fn main() -> anyhow::Result<()> {
             db_before,
             server,
             stderr_task,
+            shed,
         )
         .await;
     }
@@ -386,6 +434,7 @@ async fn main() -> anyhow::Result<()> {
             db_before,
             server,
             stderr_task,
+            shed,
         )
         .await;
     }
@@ -400,7 +449,7 @@ async fn main() -> anyhow::Result<()> {
     let started = Instant::now();
     let mut workers = tokio::task::JoinSet::new();
     for _ in 0..plan.workers {
-        let (plan, jobs, next, latencies, errors, pairs, busy) = (
+        let (plan, jobs, next, latencies, errors, pairs, busy, shed) = (
             plan.clone(),
             jobs.clone(),
             next.clone(),
@@ -408,6 +457,7 @@ async fn main() -> anyhow::Result<()> {
             errors.clone(),
             pairs.clone(),
             busy.clone(),
+            shed.clone(),
         );
         let (http, base, token, firm_id) =
             (http.clone(), base.clone(), token.clone(), firm_id.clone());
@@ -421,16 +471,17 @@ async fn main() -> anyhow::Result<()> {
                 let sent = Instant::now();
                 let mut attempt = 0;
                 let result = loop {
-                    let result = http
-                        .post(format!(
+                    let result = send(
+                        http.post(format!(
                             "{base}/v1/firms/{firm_id}/accounts/{}/imports",
                             pairs[client].1
                         ))
                         .bearer_auth(&token)
                         .header("content-type", "text/csv")
-                        .body(body.clone())
-                        .send()
-                        .await;
+                        .body(body.clone()),
+                        &shed,
+                    )
+                    .await;
                     match result {
                         Ok(r) if r.status() == 409 && attempt < 10 => {
                             attempt += 1;
@@ -467,16 +518,17 @@ async fn main() -> anyhow::Result<()> {
     for (i, &(client, file)) in jobs.iter().enumerate().filter(|(i, _)| i % 10 == 0) {
         let _ = i;
         repeats += 1;
-        let r = http
-            .post(format!(
+        let r = send(
+            http.post(format!(
                 "{base}/v1/firms/{firm_id}/accounts/{}/imports",
                 pairs[client].1
             ))
             .bearer_auth(&token)
             .header("content-type", "text/csv")
-            .body(statement(&spec(&plan, client, file)))
-            .send()
-            .await?;
+            .body(statement(&spec(&plan, client, file))),
+            &shed,
+        )
+        .await?;
         let status = r.status();
         let body: Value = r.json().await.unwrap_or(Value::Null);
         if status == 200 && body["duplicate_file"] == true {
@@ -593,6 +645,7 @@ async fn main() -> anyhow::Result<()> {
             },
             "errors": errors.len(),
             "account_busy_retries": busy.load(Ordering::Relaxed),
+            "server_shed_responses": shed.load(Ordering::Relaxed),
             "rows_read": rows_read, "rows_per_s": rows_per_s.round(),
             "lines_created": lines_created, "duplicates": duplicates, "revisions_held": revisions,
             "first_errors": errors.iter().take(5).collect::<Vec<_>>(),
@@ -610,14 +663,10 @@ async fn main() -> anyhow::Result<()> {
     });
     std::fs::write(&plan.out, serde_json::to_string_pretty(&result)? + "\n")?;
     println!("{}", serde_json::to_string_pretty(&result)?);
-    // Correctness always gates. Thresholds gate a full run and an r1-import smoke (its
-    // looser smoke thresholds); an r0-import smoke records them, labelled. No smoke is
-    // capacity evidence (a shared CI runner or a busy laptop).
-    let gate_thresholds = plan.mode == "full" || plan.scenario == "r1-import";
-    if !checks_pass || (gate_thresholds && !thresholds_pass) {
-        std::process::exit(1);
-    }
-    Ok(())
+    // The JSON `pass` is the verdict; the exit code is `1` when it is false — a red
+    // verdict is never a green check. A smoke's thresholds are its labelled floor:
+    // on a busy laptop a miss fails the run rather than hiding in the JSON.
+    std::process::exit(verdict_exit_code(checks_pass && thresholds_pass));
 }
 
 /// Truth-file labels → the line's expected terminal status.
@@ -657,6 +706,7 @@ struct SeedOutcome {
     clippy::too_many_lines,
     reason = "two phases, each with its own failure accounting"
 )]
+#[allow(clippy::too_many_arguments, reason = "the scenarios' shared run state")]
 async fn seed_match_queue(
     plan: &Arc<Plan>,
     pairs: &Arc<Vec<(String, String)>>,
@@ -665,6 +715,7 @@ async fn seed_match_queue(
     token: &str,
     firm_id: &str,
     pool: &sqlx::PgPool,
+    shed: &Arc<AtomicUsize>,
 ) -> anyhow::Result<SeedOutcome> {
     // The firm's residual tolerances, pinned into each job (D-014): bank fees to 10.00.
     sqlx::query("UPDATE recon.firms SET residual_tolerances = $1 WHERE id = $2::uuid")
@@ -682,12 +733,13 @@ async fn seed_match_queue(
     let upload_started = Instant::now();
     let mut workers = tokio::task::JoinSet::new();
     for _ in 0..plan.workers {
-        let (plan, next, errors, truth, pairs) = (
+        let (plan, next, errors, truth, pairs, shed) = (
             plan.clone(),
             next.clone(),
             errors.clone(),
             truth.clone(),
             pairs.clone(),
+            shed.clone(),
         );
         let (http, base, token, firm_id) = (
             http.clone(),
@@ -719,13 +771,14 @@ async fn seed_match_queue(
                         set.documents,
                     ),
                 ] {
-                    let r = http
-                        .post(format!("{base}{path}"))
-                        .bearer_auth(&token)
-                        .header("content-type", "text/csv")
-                        .body(body)
-                        .send()
-                        .await;
+                    let r = send(
+                        http.post(format!("{base}{path}"))
+                            .bearer_auth(&token)
+                            .header("content-type", "text/csv")
+                            .body(body),
+                        &shed,
+                    )
+                    .await;
                     match r {
                         Ok(r) if r.status() == 201 => {}
                         Ok(r) => {
@@ -765,24 +818,16 @@ async fn seed_match_queue(
     let match_started = Instant::now();
     let mut pending: Vec<(String, String, Instant)> = Vec::with_capacity(truth.len());
     for (client, ..) in &truth {
-        // A 5xx start ("database_unavailable", "nothing was accepted") is retried like a
-        // busy upload; a 409 client_busy means a job already runs — impossible here.
-        let mut attempt = 0;
-        let r = loop {
-            let r = http
-                .post(format!("{base}{}", job_path(client)))
+        // A shed start ("overloaded", "nothing was accepted") is retried after its
+        // Retry-After — counted, never an error (D-075); a 409 client_busy means a
+        // job already runs — impossible here.
+        let r = send(
+            http.post(format!("{base}{}", job_path(client)))
                 .bearer_auth(token)
-                .header("content-length", "0")
-                .send()
-                .await;
-            match &r {
-                Ok(r) if r.status().is_server_error() && attempt < 10 => {
-                    attempt += 1;
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                }
-                _ => break r,
-            }
-        };
+                .header("content-length", "0"),
+            shed,
+        )
+        .await;
         match r {
             Ok(r) if r.status() == 202 => {
                 let body: Value = r.json().await.unwrap_or(Value::Null);
@@ -836,11 +881,12 @@ async fn seed_match_queue(
         tokio::time::sleep(Duration::from_millis(500)).await;
         let mut still = Vec::with_capacity(pending.len());
         for (client, id, sent) in pending {
-            let r = http
-                .get(format!("{base}{}/{id}", job_path(&client)))
-                .bearer_auth(token)
-                .send()
-                .await;
+            let r = send(
+                http.get(format!("{base}{}/{id}", job_path(&client)))
+                    .bearer_auth(token),
+                shed,
+            )
+            .await;
             match r {
                 Ok(r) if r.status() == 200 => {
                     let body: Value = r.json().await.unwrap_or(Value::Null);
@@ -932,8 +978,10 @@ async fn r2_match(
     db_before: i64,
     mut server: tokio::process::Child,
     stderr_task: tokio::task::JoinHandle<String>,
+    shed: Arc<AtomicUsize>,
 ) -> anyhow::Result<()> {
-    let seed = seed_match_queue(&plan, &pairs, &http, &base, &token, &firm_id, &pool).await?;
+    let seed =
+        seed_match_queue(&plan, &pairs, &http, &base, &token, &firm_id, &pool, &shed).await?;
     let SeedOutcome {
         upload_seconds,
         match_seconds,
@@ -1110,6 +1158,7 @@ async fn r2_match(
             },
             "jobs_completed": job_latencies.len(), "jobs_failed": jobs_failed,
             "errors": errors.len(),
+            "server_shed_responses": shed.load(Ordering::Relaxed),
             "first_errors": errors.iter().take(5).collect::<Vec<_>>(),
             "jobs_never_admitted": truth.len().saturating_sub(
                 usize::try_from(jobs_complete).unwrap_or(0)
@@ -1137,7 +1186,7 @@ async fn r2_match(
     });
     std::fs::write(&plan.out, serde_json::to_string_pretty(&result)? + "\n")?;
     println!("{}", serde_json::to_string_pretty(&result)?);
-    Ok(())
+    std::process::exit(verdict_exit_code(checks_pass && thresholds_pass));
 }
 
 // ----------------------------------------------------------------------------------------------
@@ -1205,12 +1254,14 @@ async fn sign_in(
     firm_id: &str,
     email: &str,
     password: &str,
+    shed: &AtomicUsize,
 ) -> anyhow::Result<(String, String)> {
-    let r = http
-        .post(format!("{base}/v1/auth/sign-in"))
-        .json(&json!({"firm": firm_id, "email": email, "password": password}))
-        .send()
-        .await?;
+    let r = send(
+        http.post(format!("{base}/v1/auth/sign-in"))
+            .json(&json!({"firm": firm_id, "email": email, "password": password})),
+        shed,
+    )
+    .await?;
     anyhow::ensure!(r.status() == 200, "sign-in {email}: {}", r.status());
     let pending = r.json::<Value>().await?["pending"]
         .as_str()
@@ -1226,11 +1277,12 @@ async fn sign_in(
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs();
     let code = format!("{:06}", recon_server::auth::totp_code(&secret, now));
-    let r = http
-        .post(format!("{base}/v1/auth/totp"))
-        .json(&json!({"pending": pending, "code": code}))
-        .send()
-        .await?;
+    let r = send(
+        http.post(format!("{base}/v1/auth/totp"))
+            .json(&json!({"pending": pending, "code": code})),
+        shed,
+    )
+    .await?;
     anyhow::ensure!(r.status() == 200, "totp {email}: {}", r.status());
     let cookie = r
         .headers()
@@ -1258,6 +1310,7 @@ async fn person_call(
     method: &str,
     url: &str,
     body: Option<Value>,
+    shed: &AtomicUsize,
 ) -> (u16, Value, f64) {
     let sent = Instant::now();
     let req = match method {
@@ -1274,7 +1327,7 @@ async fn person_call(
         Some(b) => req.json(&b),
         None => req,
     };
-    match req.send().await {
+    match send(req, shed).await {
         Ok(r) => {
             let status = r.status().as_u16();
             let body = r.json::<Value>().await.unwrap_or(Value::Null);
@@ -1331,6 +1384,7 @@ async fn reviewer_work(
     stats: Arc<Mutex<ReviewStats>>,
     progress: Arc<AtomicUsize>,
     stop: Arc<AtomicUsize>,
+    shed: Arc<AtomicUsize>,
     deadline: Instant,
 ) {
     let password = "load-reviewer-password-123";
@@ -1363,6 +1417,7 @@ async fn reviewer_work(
                     "GET",
                     &review_path(client, "review-queue?limit=500"),
                     None,
+                    &shed,
                 )
                 .await;
                 {
@@ -1371,8 +1426,16 @@ async fn reviewer_work(
                     s.latencies.entry("queue").or_default().push(ms);
                 }
                 if status == 401 {
-                    if let Ok((cookie, csrf)) =
-                        sign_in(&http, &base, &pool, &firm_id, &reviewer.email, password).await
+                    if let Ok((cookie, csrf)) = sign_in(
+                        &http,
+                        &base,
+                        &pool,
+                        &firm_id,
+                        &reviewer.email,
+                        password,
+                        &shed,
+                    )
+                    .await
                     {
                         reviewer.cookie = cookie;
                         reviewer.csrf = csrf;
@@ -1434,6 +1497,7 @@ async fn reviewer_work(
                                     "POST",
                                     &review_path(client, &format!("lines/{line}/manual-match")),
                                     Some(json!({"documents": [doc], "residuals": residuals})),
+                                    &shed,
                                 )
                                 .await
                             }
@@ -1445,6 +1509,7 @@ async fn reviewer_work(
                                     "POST",
                                     &review_path(client, &format!("lines/{line}/exclude")),
                                     Some(json!({"expected_version": version, "reason": reason})),
+                                    &shed,
                                 )
                                 .await
                             }
@@ -1556,7 +1621,7 @@ async fn reviewer_work(
                     }
                 };
                 let (status, _, ms) =
-                    person_call(&http, &reviewer, "POST", &url, Some(payload)).await;
+                    person_call(&http, &reviewer, "POST", &url, Some(payload), &shed).await;
                 let mut s = stats.lock().await;
                 s.requests += 1;
                 s.latencies.entry(action).or_default().push(ms);
@@ -1578,8 +1643,16 @@ async fn reviewer_work(
                     422 => s.refusals += 1,
                     401 => {
                         drop(s);
-                        if let Ok((cookie, csrf)) =
-                            sign_in(&http, &base, &pool, &firm_id, &reviewer.email, password).await
+                        if let Ok((cookie, csrf)) = sign_in(
+                            &http,
+                            &base,
+                            &pool,
+                            &firm_id,
+                            &reviewer.email,
+                            password,
+                            &shed,
+                        )
+                        .await
                         {
                             reviewer.cookie = cookie;
                             reviewer.csrf = csrf;
@@ -1626,8 +1699,10 @@ async fn r3_review(
     db_before: i64,
     mut server: tokio::process::Child,
     stderr_task: tokio::task::JoinHandle<String>,
+    shed: Arc<AtomicUsize>,
 ) -> anyhow::Result<()> {
-    let seed = seed_match_queue(&plan, &pairs, &http, &base, &token, &firm_id, &pool).await?;
+    let seed =
+        seed_match_queue(&plan, &pairs, &http, &base, &token, &firm_id, &pool, &shed).await?;
     let SeedOutcome {
         upload_seconds,
         match_seconds,
@@ -1658,6 +1733,7 @@ async fn r3_review(
             json!({"email": email, "display_name": format!("Reviewer {i}"),
                    "role": "reviewer", "password": "load-reviewer-password-123",
                    "clients": client_ids}),
+            &shed,
         )
         .await
         .with_context(|| format!("creating {email}"))?;
@@ -1669,6 +1745,7 @@ async fn r3_review(
             &firm_id,
             &email,
             "load-reviewer-password-123",
+            &shed,
         )
         .await
         .with_context(|| format!("signing in {email}"))?;
@@ -1730,7 +1807,7 @@ async fn r3_review(
     }
     let mut workers = tokio::task::JoinSet::new();
     for (i, reviewer) in enrolled.into_iter().enumerate() {
-        let (http, base, firm_id, pairs, pool, stats, progress, stop, finished) = (
+        let (http, base, firm_id, pairs, pool, stats, progress, stop, finished, shed) = (
             http.clone(),
             base.clone(),
             firm_id.clone(),
@@ -1740,10 +1817,12 @@ async fn r3_review(
             progress.clone(),
             stop.clone(),
             finished.clone(),
+            shed.clone(),
         );
         workers.spawn(async move {
             reviewer_work(
-                i, reviewer, http, base, firm_id, pairs, pool, stats, progress, stop, deadline,
+                i, reviewer, http, base, firm_id, pairs, pool, stats, progress, stop, shed,
+                deadline,
             )
             .await;
             finished.fetch_add(1, Ordering::Relaxed);
@@ -1940,6 +2019,7 @@ async fn r3_review(
                 "same_eye_commits": same_eye_commits, "single_eye_four_eyes": eyes_single,
                 "false_auto_commits": false_auto_commits,
             },
+            "server_shed_responses": shed.load(Ordering::Relaxed),
             "server_peak_rss_bytes": rss,
             "database_growth_bytes": db_after - db_before,
             "replay": match &replay { Ok(r) => json!({"clients": r.clients, "decisions": r.decisions, "imports": r.imports, "lines": r.lines}), Err(m) => json!(m.0) },
@@ -1953,8 +2033,17 @@ async fn r3_review(
     });
     std::fs::write(&plan.out, serde_json::to_string_pretty(&result)? + "\n")?;
     println!("{}", serde_json::to_string_pretty(&result)?);
-    if !checks_pass || !thresholds_pass {
-        std::process::exit(1);
+    std::process::exit(verdict_exit_code(checks_pass && thresholds_pass));
+}
+
+#[cfg(test)]
+mod tests {
+    /// The verdict-to-exit contract: the workflow's success is the process exit
+    /// code, so `pass` false in the JSON must never exit zero (run 44585172464
+    /// reported `pass: false` behind a green check).
+    #[test]
+    fn the_verdict_maps_to_the_exit_code() {
+        assert_eq!(super::verdict_exit_code(true), 0);
+        assert_eq!(super::verdict_exit_code(false), 1);
     }
-    Ok(())
 }

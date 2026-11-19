@@ -55,15 +55,9 @@ impl MakeRequestId for MakeId {
     }
 }
 
-/// A request beyond the in-flight limit, shed at once (D-047).
+/// A request beyond the in-flight limit, shed at once (D-047, D-075).
 async fn overloaded(_error: tower::BoxError) -> Response {
-    ApiError::new(
-        StatusCode::SERVICE_UNAVAILABLE,
-        "overloaded",
-        "the server is at its request limit; nothing was accepted, retry shortly",
-    )
-    .retry_after(1)
-    .into_response()
+    ApiError::overloaded().into_response()
 }
 
 fn panic_response(_panic: Box<dyn std::any::Any + Send + 'static>) -> Response {

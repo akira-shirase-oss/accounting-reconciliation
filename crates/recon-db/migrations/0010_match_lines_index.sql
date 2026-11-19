@@ -1,0 +1,18 @@
+-- 0010: match_lines indexed by line.
+--
+-- `match_lines_guard` (0007) refuses a line already held by a live match with a
+-- per-row `EXISTS (... ml.firm_id = ? AND ml.line_id = ? AND ml.match_id <> ? ...)`.
+-- The only index was the primary key (firm_id, match_id, line_id): for one firm the
+-- firm prefix selects every row, so each check scanned the whole table — and the
+-- table grows with every committed match (the first full r2-match run, 1M lines,
+-- had a ~20-minute drive tail for exactly this: ~500 sequential scans of an
+-- ~800,000-row table per chunk).
+--
+-- The key columns alone are not enough to make the planner take this index: its
+-- cost model treats `line_id` — a non-prefix qual on the primary key's third
+-- column — as if it bounded the scan, so the pkey index-only scan is *estimated*
+-- at ~9 cost units at any table size once heap pages are all-visible. The by-line
+-- index must therefore be index-only-capable itself: `INCLUDE (match_id)` covers
+-- the whole check (equality keys plus the `match_id <>` filter), so its plan is a
+-- true ~2-tuple descent that wins the estimate at every scale and vacuum state.
+CREATE INDEX match_lines_by_line ON recon.match_lines (firm_id, line_id) INCLUDE (match_id);

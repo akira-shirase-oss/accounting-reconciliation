@@ -490,3 +490,117 @@ async fn a_decided_subject_gets_no_second_decision_from_the_same_job() {
     assert_eq!(state, "23505", "one decision per (job, subject)");
     db.cleanup().await;
 }
+
+#[tokio::test]
+async fn the_line_held_check_uses_the_match_lines_index() {
+    let db = TestDb::new().await;
+    let (account, line, _doc) = line_and_document(&db).await;
+    // `match_lines_guard`'s per-row "the line is already held by a live match" lookup
+    // must use match_lines_by_line: without it each check scans the whole table, which
+    // is what gave the first 1M run a twenty-minute drive tail (0010). The index
+    // carries INCLUDE (match_id) for a reason: the planner under-estimates the pkey
+    // index-only scan (it costs the non-prefix line_id qual as a bound, so ~9 units
+    // at any table size once pages are all-visible) — only a covering by-line index
+    // is index-only-capable itself and stays the chosen plan in every vacuum state.
+    // The firm still gets ~20,000 rows so real scan costs diverge decisively; the
+    // fill is synthetic and suspends the row guards (the fill is plan evidence, not
+    // matching's own write path).
+    let (client_id, import_id, account_id): (Uuid, Uuid, Uuid) = sqlx::query_as(
+        "SELECT client_id, id, account_id FROM recon.imports
+          WHERE firm_id = $1 ORDER BY created_at LIMIT 1",
+    )
+    .bind(account.firm.as_uuid())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let owner = db.owner_pool().await;
+    sqlx::query("ALTER TABLE recon.matches DISABLE TRIGGER matches_have_their_decision")
+        .execute(&owner)
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE recon.statement_lines DISABLE TRIGGER statement_lines_inserted")
+        .execute(&owner)
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE recon.match_lines DISABLE TRIGGER match_lines_guard")
+        .execute(&owner)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO recon.statement_lines
+           (firm_id, client_id, account_id, import_id, currency, row_no, booking_date,
+            amount_minor, narration_raw, narration_norm, occurrence, fingerprint,
+            tuple_hash, status)
+         SELECT $1, $2, $3, $4, 'USD', 900000 + g, date '2026-01-01' + (g % 28),
+                -1000 - g, 'SCALEFILL ' || g, 'scalefill ' || g, 1,
+                decode(md5($2::text || ':' || g) || md5('fp' || g), 'hex'),
+                decode(md5('th' || g) || md5(g::text || $2::text), 'hex'), 'unreviewed'
+           FROM generate_series(1, 20000) g",
+    )
+    .bind(account.firm.as_uuid())
+    .bind(client_id)
+    .bind(account_id)
+    .bind(import_id)
+    .execute(&owner)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO recon.matches (firm_id, client_id, tier, status, currency)
+         SELECT $1, $2, 't1', 'proposed', 'USD' FROM generate_series(1, 20000) g",
+    )
+    .bind(account.firm.as_uuid())
+    .bind(client_id)
+    .execute(&owner)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO recon.match_lines (firm_id, client_id, match_id, line_id, amount_minor)
+         SELECT m.firm_id, m.client_id, m.id, l.id, -1000
+           FROM (SELECT firm_id, client_id, id, row_number() OVER (ORDER BY id) rn
+                   FROM recon.matches WHERE firm_id = $1) m
+           JOIN (SELECT id, row_number() OVER (ORDER BY id) rn FROM recon.statement_lines
+                  WHERE firm_id = $1 AND row_no >= 900000) l ON l.rn = m.rn",
+    )
+    .bind(account.firm.as_uuid())
+    .execute(&owner)
+    .await
+    .unwrap();
+    sqlx::query("ALTER TABLE recon.matches ENABLE TRIGGER matches_have_their_decision")
+        .execute(&owner)
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE recon.statement_lines ENABLE TRIGGER statement_lines_inserted")
+        .execute(&owner)
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE recon.match_lines ENABLE TRIGGER match_lines_guard")
+        .execute(&owner)
+        .await
+        .unwrap();
+    owner.close().await;
+    // VACUUM ANALYZE, not just ANALYZE: all-visible pages are the dangerous state —
+    // that is when the pkey's index-only scan gets its optimistic ~9-unit estimate.
+    sqlx::query("VACUUM ANALYZE recon.match_lines")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let plan: Vec<String> = sqlx::query(
+        "EXPLAIN SELECT 1 FROM recon.match_lines ml
+                  WHERE ml.firm_id = $1 AND ml.line_id = $2 AND ml.match_id <> $3",
+    )
+    .bind(account.firm.as_uuid())
+    .bind(line.as_uuid())
+    .bind(Uuid::now_v7())
+    .fetch_all(&db.pool)
+    .await
+    .unwrap()
+    .iter()
+    .map(|r| r.get::<String, _>(0))
+    .collect();
+    let plan = plan.join("\n");
+    assert!(
+        plan.contains("match_lines_by_line"),
+        "the line-held check must use the (firm, line) index:\n{plan}"
+    );
+    db.cleanup().await;
+}

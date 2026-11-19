@@ -106,6 +106,19 @@ impl TestDb {
             .connect_with(options)
             .await
             .expect("connecting as recon_app");
+        // The embedded migrator's contents are not a cargo-tracked input, so a
+        // stale rlib can carry an old migration list — name it instead of letting
+        // a missing migration surface as a planner or schema mystery.
+        let (applied, expected) = (
+            crate::roles::applied_version(&pool)
+                .await
+                .expect("reading the migration ledger"),
+            crate::roles::expected_version(),
+        );
+        assert_eq!(
+            applied, expected,
+            "the embedded migrator is stale — `cargo clean -p recon-db` and rebuild"
+        );
         Self {
             pool,
             admin_url,
