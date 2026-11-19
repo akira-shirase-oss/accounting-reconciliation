@@ -1,0 +1,129 @@
+name: load-full
+
+# The full (>=1,000,000-line) load runs, on GitHub-hosted runners: the development
+# laptop is shared with other work, so its load must not decide the result (the
+# workspace load standard). Manual only. One job per scenario, each on its own runner
+# with its own PostgreSQL (deploy/compose.yaml, the local stack's image, digest and
+# settings), the release build, and `MODE=full scripts/load.sh <scenario>`. Each
+# result JSON records the machine, the commit and the load average inside it, is
+# labelled as a GitHub-hosted runner observation, and is uploaded as an artifact,
+# pass or miss; results are committed under perf/results/ by hand. A threshold miss
+# fails the job and is kept as evidence, never retried to green.
+#
+#   gh workflow run load-full.yml -f scenario=all
+#   gh workflow run load-full.yml -f scenario=r2-match
+#
+# Expected durations on a 4-core hosted runner (build aside): r0-import a few
+# minutes (its last run did 1M lines in ~19 s), r1-import under ten minutes, and
+# r2-match roughly 15-25 minutes: 200 clients each upload a gen-v3 month, then the
+# matching jobs (8 at a time) decide 1,000,000 lines through the engine's
+# per-line candidate scan.
+
+on:
+  workflow_dispatch:
+    inputs:
+      scenario:
+        description: "all, or scenarios separated by commas (r0-import, r1-import, r2-match)"
+        type: string
+        default: all
+
+permissions:
+  contents: read
+
+concurrency:
+  group: load-full-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  plan:
+    name: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      scenarios: ${{ steps.pick.outputs.scenarios }}
+    steps:
+      - id: pick
+        env:
+          CHOSEN: ${{ inputs.scenario }}
+        run: |
+          all='["r0-import","r1-import","r2-match"]'
+          if [ "$CHOSEN" = all ]; then
+            echo "scenarios=$all" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Only names from the list above, so nothing else reaches a job's name or a path.
+          picked="$(jq -cn --arg chosen "$CHOSEN" --argjson all "$all" \
+            '[$chosen | split(",")[] | gsub("^ +| +$"; "")] | unique as $c
+             | if ($c - $all) == [] and ($c | length) > 0 then $c else error("unknown scenario in \($chosen)") end')"
+          echo "scenarios=$picked" >> "$GITHUB_OUTPUT"
+
+  load:
+    name: load ${{ matrix.scenario }} (full)
+    needs: plan
+    runs-on: ubuntu-latest
+    # The longest scenario (r2-match) takes roughly 15-25 minutes; the build and the
+    # database's own setup come on top.
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario: ${{ fromJSON(needs.plan.outputs.scenarios) }}
+    env:
+      SCENARIO: ${{ matrix.scenario }}
+    steps:
+      # Third-party actions are pinned to commit SHAs, as in ci.yml.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned toolchain
+        run: |
+          channel=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$channel" --profile minimal
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: PostgreSQL, as the local stack runs it
+        run: scripts/stack.sh up
+      - name: The full run
+        id: run
+        run: |
+          eval "$(scripts/stack.sh env)"
+          set +e
+          MODE=full scripts/load.sh "$SCENARIO"
+          echo "load_status=$?" >> "$GITHUB_OUTPUT"
+      - name: Label the result as a GitHub-hosted runner observation
+        id: label
+        if: always()
+        run: |
+          # This run's result is the one file git does not know (earlier results are committed).
+          mapfile -t results < <(git status --porcelain --untracked-files=all -- perf/results \
+            | awk '/^\?\? / {print $2}' | grep -- "${SCENARIO}-full-" || true)
+          [ "${#results[@]}" -eq 1 ] || { echo "expected one new result, found ${#results[@]}" >&2; exit 1; }
+          echo "result=${results[0]}" >> "$GITHUB_OUTPUT"
+          labelled="$(jq \
+            --arg image "${ImageOS:-unknown}/${ImageVersion:-unknown}" \
+            --arg arch "$RUNNER_ARCH" \
+            --arg workflow_run "$GITHUB_RUN_ID" \
+            '.machine = (.machine + "; GitHub-hosted runner observation") |
+             .runner = {label: "GitHub-hosted runner", image: $image, arch: $arch, workflow_run: ($workflow_run | tonumber),
+                        note: "the load generator, the server, the network and PostgreSQL share one runner VM on shared cloud hardware; an observation, not capacity"}' \
+            "${results[0]}")"
+          printf '%s\n' "$labelled" > "${results[0]}"
+          jq '{scenario, mode, pass, checks_pass, thresholds_pass,
+               results: {lines_per_s: .results.lines_per_s, errors: .results.errors},
+               machine, commit}' "${results[0]}"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: load-${{ matrix.scenario }}
+          path: ${{ steps.label.outputs.result }}
+          if-no-files-found: error
+          retention-days: 30
+      - name: A threshold miss fails the job (the result is kept either way)
+        if: steps.run.outputs.load_status != '0'
+        env:
+          LOAD_STATUS: ${{ steps.run.outputs.load_status }}
+        run: |
+          echo "the load run exited $LOAD_STATUS: a threshold miss or a failed check, kept as evidence" >&2
+          exit 1

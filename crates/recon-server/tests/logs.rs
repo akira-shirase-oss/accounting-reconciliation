@@ -3,13 +3,18 @@
 //! refusal, a wrong token, a lookup) and every R1 path (a stored profile, an ambiguous
 //! date, OFX, documents, a held revision listed and accepted), then its whole log is
 //! scanned for the fixtures' distinctive content.
-#![allow(clippy::unwrap_used, clippy::expect_used, reason = "integration tests")]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::too_many_lines,
+    reason = "integration tests"
+)]
 
 mod common;
 
 use common::{Server, TOKEN, assert_log_clean, http, post_json, upload};
 use recon_db::testing::TestDb;
-use serde_json::json;
+use serde_json::{Value, json};
 
 #[tokio::test]
 async fn logs_carry_no_secrets_or_financial_content() {
@@ -72,6 +77,34 @@ async fn logs_carry_no_secrets_or_financial_content() {
         .unwrap();
     assert_eq!(got.status(), 200);
     r1_paths(&base, &firm, &client, &account).await;
+    // The matching job path over the seeded lines and documents: its logs must carry
+    // only ids and counters, never the narrations or amounts it read (D-025).
+    let (s, body) = post_json(
+        &base,
+        &format!("/v1/firms/{firm}/clients/{client}/matching-jobs"),
+        &json!({}),
+    )
+    .await;
+    assert_eq!(s, 202, "{body}");
+    let job = body["job"]["id"].as_str().unwrap().to_owned();
+    let mut finished = String::new();
+    for _ in 0..200 {
+        let r = http()
+            .get(format!(
+                "{base}/v1/firms/{firm}/clients/{client}/matching-jobs/{job}"
+            ))
+            .bearer_auth(TOKEN)
+            .send()
+            .await
+            .unwrap();
+        let v: Value = r.json().await.unwrap_or_default();
+        finished = v["job"]["status"].as_str().unwrap_or_default().to_owned();
+        if finished != "running" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(finished, "complete", "the matching job did not finish");
     let log = server.stop().await;
     assert_log_clean(
         &log,

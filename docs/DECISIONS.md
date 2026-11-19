@@ -804,6 +804,57 @@ conservative side.
   orders them; R2 has no UI. Cost: lines that compete for one document always reach a
   person, even when one of them is right.
 
+- **D-071 — Durable matching jobs (migration 0007).** A matching job is one client's
+  decision run, and the database — not the worker — owns its correctness. `match_jobs`
+  pins the engine name and version, the firm's settings (tolerances included, D-014) and
+  the exact snapshot: `match_job_lines`/`match_job_documents` copy the open set at start
+  so a resumed job never sees different inputs, and the run digest is SHA-256 over every
+  outcome in line order. A job holds a lease token and expiry; every write path —
+  `commit_chunk`, `renew`, `finish`, `fail` — is fenced by a compare-and-swap on that
+  token, so a worker whose lease was reclaimed cannot write. `commit_chunk` is one
+  transaction: matches, allocations, residuals, proposals, exceptions, the decision log,
+  line states and the cursor. A partial unique index permits exactly one running job per
+  client (`client_busy` → 409 + `Retry-After`); two concurrent starts are a schema test,
+  not a hope. A subject gets at most one decision per job (another partial index). Only
+  T1 reaches `status = 'committed'` and that is a trigger, not application code; a
+  document's allocated total can never exceed its open amount (`CHECK`); the sweeper
+  claims expired leases and resumes from the cursor. Cost: a matching run cannot be
+  queried mid-flight for "what would it do" — the pinned snapshot is the answer, not a
+  live scan.
+
+- **D-072 — The lease heartbeat and the job deadline.** A drive's compute can outlive
+  its lease: the engine decides all lines before the first chunk commits, so a heartbeat
+  task renews the lease at a third of its length while the drive runs. Renewal errors
+  are not all equal: a transient timeout or pool error retries on the next beat (the
+  lease has slack); `LeaseLost` stops the heartbeat and cancels the drive at once through
+  a child of the shutdown token, checked before the engine, before its results are used
+  and between chunks — a fenced-out worker never computes on. Each renew call is bounded
+  inside the beat; a heartbeat panic is logged once at error. And because a hung drive
+  must not hold a lease forever, the engine-and-commit stretch runs under a deadline —
+  a floor plus a per-pinned-line allowance, capped (`RECON_MATCHING_DEADLINE_MS`,
+  `_PER_LINE_MS`, `_MAX_MS`) — racing the work in `tokio::select!`; expiry fails the job
+  `deadline_exceeded`, and the sweeper never resurrects it. The engine itself runs on
+  `tokio::task::spawn_blocking`, off the async workers. Cost: a job killed by the
+  deadline is not retried automatically — an operator reads `error_code`, and the drill
+  `drill_matching_deadline_exceeded` proves the lease dies with it.
+
+- **D-073 — `gen-v3`, the labelled set and `r2-match`.** The labelled generator
+  (`MatchSpec`/`match_set`) emits a statement, a documents file and a truth CSV
+  (`line,expected,documents,residual_minor`) for the D-027 mix — 70% T1 exact
+  references, 15% T2 exact amounts, 5% T3 many-to-one, 5% T4 bank-fee residuals and a
+  5% no-match fifth split across `no_candidate`, `multiple_candidates`, a foreign-twin
+  trap and `amount_mismatch`. Ambiguity is only ever the labelled kind: buckets that
+  need a unique amount draw from a disjoint sequence spaced wider than any tolerance
+  plus the largest generated fee, and T3/T4/no-match lines get unique counterparties so
+  the search pool is deterministic. The foreign twin is labelled `no_candidate` — the
+  engine's `cross_currency` kind needs an empty same-currency candidate set, which a
+  fixture with same-currency distractors can never produce (engine unit tests cover
+  that branch). `r2-match` loads each client's set through the API, runs one matching
+  job per client and checks the database against the truth: per-client line states
+  equal, committed matches all `t1` (zero false auto-matches), proposals and exceptions
+  equal, no subject decided twice, the log replays. Full run: 200 clients × 5,000 lines
+  = 1,000,000 decided; smoke: 10 × 1,000.
+
 ## Open questions (blocked on the maintainer or an outside party)
 
 Each is in the README's *Blocked on* table. None blocks R0–R6.

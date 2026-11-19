@@ -173,6 +173,24 @@ pub async fn lock_down_database(admin: &mut PgConnection, name: &str) -> Result<
     .await
 }
 
+/// Drops `name` (`WITH (FORCE)` terminates anything still connected). The name is
+/// validated like `create_database`'s; which names may be dropped is the caller's
+/// decision — `recon db drop` allows only the `recon_load_`/`recon_test_` scratch
+/// prefixes.
+pub async fn drop_database(admin: &mut PgConnection, name: &str) -> Result<(), DbError> {
+    if !is_safe_identifier(name) {
+        return Err(DbError::Inconsistent(format!(
+            "unsafe database name {name:?}"
+        )));
+    }
+    execute_formatted(
+        admin,
+        "SELECT pg_catalog.format('DROP DATABASE IF EXISTS %I WITH (FORCE)', $1::text)",
+        &[name],
+    )
+    .await
+}
+
 /// One reason a connection is not a safe runtime connection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoleProblem(pub String);

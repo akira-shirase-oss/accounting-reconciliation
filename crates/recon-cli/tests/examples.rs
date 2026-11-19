@@ -34,6 +34,7 @@ fn help_lists_every_command_and_explains_each_one() {
             "import check",
             "profile check",
             "db setup",
+            "db drop",
             "audit verify",
             "audit anchor",
         ] {
@@ -216,4 +217,17 @@ fn documents_and_ofx_examples_check_too() {
     ]);
     assert_eq!(code, 1);
     assert!(text.contains("--currency is required"), "{text}");
+}
+
+#[test]
+fn db_drop_refuses_anything_but_a_scratch_name() {
+    // The guard runs before the database is touched, so the refusal needs no server.
+    for name in ["recon", "postgres", "recon_production"] {
+        let (code, text) = recon(&["db", "drop", "--database", name]);
+        assert_eq!(code, 1, "{name}");
+        assert!(
+            text.contains("refusing to drop") && text.contains("scratch"),
+            "{name}: {text}"
+        );
+    }
 }

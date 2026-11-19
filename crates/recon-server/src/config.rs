@@ -49,8 +49,20 @@ pub struct Config {
     pub flip_timeout: Duration,
     /// Overall deadline for any request.
     pub request_timeout: Duration,
-    /// How often the sweeper discards expired staging imports.
+    /// How often the sweeper discards expired staging imports and reclaims matching jobs.
     pub sweep_interval: Duration,
+    /// The matching job's lease, renewed by every committed chunk (D-033: 30 s).
+    pub matching_lease: Duration,
+    /// The drive deadline's floor: `floor + per_line × pinned lines`, capped — a drive
+    /// that outlives it ends `deadline_exceeded` so a stuck engine cannot hold the
+    /// lease forever (D-033).
+    pub matching_deadline_min: Duration,
+    /// Added to the drive deadline per pinned line.
+    pub matching_deadline_per_line: Duration,
+    /// The drive deadline's cap.
+    pub matching_deadline_max: Duration,
+    /// Most matching workers in flight; a start without one is `503`.
+    pub matching_concurrency: usize,
     /// How long shutdown waits for requests in flight.
     pub drain_timeout: Duration,
     /// Longest a connection may take to send a request head, and longest it may sit idle
@@ -85,6 +97,14 @@ impl fmt::Debug for Config {
             .field("flip_timeout", &self.flip_timeout)
             .field("request_timeout", &self.request_timeout)
             .field("sweep_interval", &self.sweep_interval)
+            .field("matching_lease", &self.matching_lease)
+            .field("matching_deadline_min", &self.matching_deadline_min)
+            .field(
+                "matching_deadline_per_line",
+                &self.matching_deadline_per_line,
+            )
+            .field("matching_deadline_max", &self.matching_deadline_max)
+            .field("matching_concurrency", &self.matching_concurrency)
             .field("drain_timeout", &self.drain_timeout)
             .field("header_read_timeout", &self.header_read_timeout)
             .field("max_connections", &self.max_connections)
@@ -110,6 +130,10 @@ pub const DEFAULT_LISTEN: &str = "127.0.0.1:62480";
 
 impl Config {
     /// Reads `RECON_*` variables through `get` (the environment in production).
+    #[allow(
+        clippy::too_many_lines,
+        reason = "a flat environment-parse table; splitting it adds indirection, not clarity"
+    )]
     pub fn from_source(get: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
         let mut problems = vec![];
         let mut millis = |name: &str, default: u64, min: u64, max: u64| -> Duration {
@@ -128,12 +152,27 @@ impl Config {
         let flip_timeout = millis("RECON_FLIP_TIMEOUT_MS", 60_000, 1_000, 600_000);
         let request_timeout = millis("RECON_REQUEST_TIMEOUT_MS", 150_000, 1_000, 900_000);
         let sweep_interval = millis("RECON_SWEEP_INTERVAL_MS", 10_000, 50, 3_600_000);
+        let matching_lease = millis("RECON_MATCHING_LEASE_MS", 30_000, 1_000, 600_000);
+        let matching_deadline_min = millis("RECON_MATCHING_DEADLINE_MS", 60_000, 1_000, 3_600_000);
+        let matching_deadline_per_line =
+            millis("RECON_MATCHING_DEADLINE_PER_LINE_MS", 20, 0, 60_000);
+        let matching_deadline_max = millis(
+            "RECON_MATCHING_DEADLINE_MAX_MS",
+            1_800_000,
+            1_000,
+            86_400_000,
+        );
         let drain_timeout = millis("RECON_DRAIN_MS", 30_000, 0, 600_000);
         let statement_timeout = millis("RECON_STATEMENT_TIMEOUT_MS", 10_000, 100, 600_000);
         let acquire_timeout = millis("RECON_DB_ACQUIRE_MS", 1_500, 50, 60_000);
         let header_read_timeout = millis("RECON_HEADER_READ_TIMEOUT_MS", 10_000, 100, 120_000);
         let write_stall = millis("RECON_WRITE_STALL_MS", 10_000, 100, 120_000);
         let connection_max_age = millis("RECON_CONNECTION_MAX_AGE_MS", 300_000, 1_000, 3_600_000);
+        if matching_deadline_min > matching_deadline_max {
+            problems.push(
+                "RECON_MATCHING_DEADLINE_MS must not exceed RECON_MATCHING_DEADLINE_MAX_MS".into(),
+            );
+        }
 
         let database_url = get("RECON_DATABASE_URL").unwrap_or_default();
         if database_url.is_empty() {
@@ -161,6 +200,7 @@ impl Config {
             }
         };
         let import_concurrency = count("RECON_IMPORT_CONCURRENCY", 4, 64, &mut problems);
+        let matching_concurrency = count("RECON_MATCHING_CONCURRENCY", 4, 32, &mut problems);
         let max_connections = count("RECON_DB_MAX_CONNECTIONS", 32, 256, &mut problems);
         let max_open_connections = count("RECON_MAX_CONNECTIONS", 512, 65_536, &mut problems);
         let max_in_flight = count("RECON_MAX_IN_FLIGHT", 256, 4_096, &mut problems);
@@ -198,6 +238,11 @@ impl Config {
             flip_timeout,
             request_timeout,
             sweep_interval,
+            matching_lease,
+            matching_deadline_min,
+            matching_deadline_per_line,
+            matching_deadline_max,
+            matching_concurrency: usize::try_from(matching_concurrency).unwrap_or(4),
             drain_timeout,
             header_read_timeout,
             max_connections: usize::try_from(max_open_connections).unwrap_or(512),
@@ -214,6 +259,15 @@ impl Config {
     /// Reads the process environment.
     pub fn from_env() -> Result<Self, ConfigError> {
         Self::from_source(|name| std::env::var(name).ok())
+    }
+
+    /// The drive deadline for a job with `lines` pinned lines: floor + per line,
+    /// capped (D-033's companion bound).
+    pub fn matching_deadline(&self, lines: i64) -> Duration {
+        let lines = u32::try_from(lines.max(0)).unwrap_or(u32::MAX);
+        self.matching_deadline_min
+            .saturating_add(self.matching_deadline_per_line.saturating_mul(lines))
+            .min(self.matching_deadline_max)
     }
 }
 

@@ -74,10 +74,11 @@ async fn run() -> anyhow::Result<ExitCode> {
         max_age: config.connection_max_age,
         request_grace: config.request_timeout,
     };
-    let state = AppState::new(pool.clone(), config, faults);
+    let mut state = AppState::new(pool.clone(), config, faults);
     tracing::info!(listen = %listener.local_addr()?, "listening");
 
     let shutdown = CancellationToken::new();
+    state.shutdown = shutdown.child_token();
     let (fatal_tx, fatal_rx) = oneshot::channel();
     let mut tasks = JoinSet::new();
     tasks.spawn(tasks::startup_check(

@@ -54,6 +54,7 @@ Before you upload (no server or database needed):
 Operating the server:
   recon db setup [--database NAME]      create the roles and the database
   recon db migrate [--database NAME]    apply the migrations
+  recon db drop --database NAME         drop a scratch database (recon_load_*, recon_test_*)
   recon audit verify FIRM [--anchors FILE] [--allow-empty]
                                         verify every client's decision chain
   recon audit anchor FIRM --out FILE    sign and append every verified chain head
@@ -136,6 +137,17 @@ Environment: RECON_ADMIN_DATABASE_URL.
 ",
     ),
     (
+        "db drop",
+        r"recon db drop --database NAME
+
+Drops a scratch database (its name must start with recon_load_ or recon_test_ — the
+load and test harnesses' own names), forcing out anything still connected. A named
+database like the development or production one is dropped by hand, never here.
+
+Environment: RECON_ADMIN_DATABASE_URL.
+",
+    ),
+    (
         "audit verify",
         r"recon audit verify FIRM [--anchors FILE] [--allow-empty]
 
@@ -202,6 +214,7 @@ async fn run(args: &[String]) -> anyhow::Result<ExitCode> {
     match words.get(..2).unwrap_or(&words) {
         ["db", "setup"] => setup(args).await,
         ["db", "migrate"] => migrate(args).await,
+        ["db", "drop"] => drop_database(args).await,
         ["audit", "verify"] => verify(args).await,
         ["audit", "anchor"] => anchor(args).await,
         ["audit", "replay"] => replay(args).await,
@@ -306,6 +319,25 @@ async fn migrate(args: &[String]) -> anyhow::Result<ExitCode> {
         "migrate ok: database {name}, schema version {:?}",
         roles::expected_version()
     );
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn drop_database(args: &[String]) -> anyhow::Result<ExitCode> {
+    let name = flag(args, "--database").unwrap_or_default();
+    if !(name.starts_with("recon_load_") || name.starts_with("recon_test_")) {
+        bail!(
+            "refusing to drop {name:?}: `recon db drop` drops only the harnesses' \
+             scratch databases (recon_load_*, recon_test_*); a named database is \
+             dropped by hand"
+        );
+    }
+    let mut admin = sqlx::PgConnection::connect(&env("RECON_ADMIN_DATABASE_URL")?)
+        .await
+        .context("connecting as the administrator")?;
+    roles::drop_database(&mut admin, &name)
+        .await
+        .context("dropping the database")?;
+    println!("drop ok: database {name}");
     Ok(ExitCode::SUCCESS)
 }
 

@@ -12,8 +12,9 @@ and is kept as evidence, never rerun until green.
 
 The unit (D-027, import half) is one statement line taken through import:
 parsed, validated, normalized, staged, fingerprinted and published by the
-flip. `perf/loadgen` starts the server under `/usr/bin/time` (exact peak
-RSS), creates one firm with 200 clients and one USD account each, and eight
+flip. `perf/loadgen` starts the server as a direct child (peak RSS read
+from `/proc`, unknown off Linux), creates one firm with 200 clients and one
+USD account each, and eight
 workers upload five `gen-v1` statements of 1,000 lines per account (disjoint
 months) — 1,000 files, 1,000,000 lines. Every tenth file is then uploaded
 again and must be answered with the earlier import.
@@ -53,6 +54,38 @@ MODE=full scripts/load.sh r1-import    # perf/results/r1-import-full-20261117T14
 MODE=smoke scripts/load.sh r1-import
 ```
 
+## `r2-match` (ROADMAP R2)
+
+The unit (D-027, matching half) is one statement line decided by a matching
+job: pinned snapshot, engine, atomically committed chunks. Each client gets
+one `gen-v3` month — a 5,000-line statement plus its documents (about 1.1 per
+line plus 500 distractors) and a truth file; the full run is 200 clients,
+1,000,000 lines. Workers upload both files per client, one matching job per
+client is started (the server's `matching_concurrency` bounds how many run at
+once; mutual exclusion is per client), and each job is polled to a terminal
+state.
+
+Checks (all must hold): every job `complete` with a digest; the per-client
+counts of `matched`, `proposed` and `exception` line states equal the truth
+file's labels; zero committed matches outside tier `t1` and the committed
+count equal to the truth's `t1` count (zero false auto-matches); proposals
+and exceptions equal their truth counts; no subject decided twice; the
+decision log replays. Thresholds — full: at least 2,000 lines/s decided
+end to end, job p99 at most 120,000 ms, server peak RSS at most 512 MiB
+(each drive holds one client's pinned set in memory), zero errors; smoke
+(10 clients x 1,000 lines): at least 300 lines/s, job p99 at most 60,000 ms.
+
+```sh
+MODE=full scripts/load.sh r2-match    # perf/results/r2-match-full-<stamp>.json (CI)
+MODE=smoke scripts/load.sh r2-match   # target/perf/
+```
+
 Run the full size only on a quiet machine (`uptime` load average below about
 6 on this 12-core laptop); otherwise run the smoke and record the full run as
 owed. CI runs the smoke on every push.
+
+The full runs live in `.github/workflows/load-full.yml`: `gh workflow run
+load-full.yml -f scenario=all` (or `-f scenario=r2-match`) runs each scenario
+on its own runner with its own PostgreSQL and uploads the labelled result
+JSON as an artifact, pass or miss. A threshold miss fails the job and is kept
+as evidence, never retried to green.

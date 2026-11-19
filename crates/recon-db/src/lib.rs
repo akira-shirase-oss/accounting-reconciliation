@@ -12,6 +12,7 @@
 pub mod decisions;
 pub mod error;
 pub mod imports;
+pub mod matching;
 pub mod pool;
 pub mod profiles;
 pub mod replay;

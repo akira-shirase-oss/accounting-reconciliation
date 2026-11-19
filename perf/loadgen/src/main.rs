@@ -1,5 +1,13 @@
-//! `recon-loadgen`: the `r0-import` and `r1-import` load scenarios (ROADMAP R0 and R1; the
-//! unit, D-027, is one statement line taken through import).
+//! `recon-loadgen`: the `r0-import`, `r1-import` and `r2-match` load scenarios (ROADMAP
+//! R0, R1 and R2; the unit, D-027, is one statement line taken through import — for
+//! `r2-match`, one line taken through matching: snapshot, engine, committed chunks).
+//!
+//! `r2-match` gives each client one `gen-v3` month — statement plus documents plus the
+//! truth file — uploads both, then posts the client's matching job and waits for it.
+//! A line is done when the job is `complete` with a digest; the database is then checked:
+//! every line in exactly one terminal state, the job's counters equal the truth's label
+//! counts, zero committed matches outside tier `t1` (zero false auto-matches), no subject
+//! decided twice, and the decision log replaying to the stored state.
 //!
 //! `r1-import` (D-067) gives each account one continuous 140-day statement cut into five
 //! files whose day windows overlap by seven days, so every file after the first repeats the
@@ -29,7 +37,7 @@ use recon_cli::generate::{GENERATOR_VERSION, StatementSpec, statement};
 use recon_domain::{Currency, Date, FirmId};
 use serde_json::{Value, json};
 use tokio::io::AsyncReadExt as _;
-use tokio::process::Command;
+use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
 struct Plan {
@@ -55,14 +63,16 @@ fn env(name: &str) -> anyhow::Result<String> {
 impl Plan {
     fn from_env() -> anyhow::Result<Self> {
         let scenario = std::env::var("SCENARIO").unwrap_or_else(|_| "r0-import".into());
-        if !matches!(scenario.as_str(), "r0-import" | "r1-import") {
-            bail!("SCENARIO must be r0-import or r1-import, not {scenario:?}");
+        if !matches!(scenario.as_str(), "r0-import" | "r1-import" | "r2-match") {
+            bail!("SCENARIO must be r0-import, r1-import or r2-match, not {scenario:?}");
         }
         let mode = std::env::var("MODE").unwrap_or_else(|_| "smoke".into());
-        let (clients, files, lines) = match mode.as_str() {
-            "full" => (200, 5, 1_000),
-            "smoke" => (20, 5, 500),
-            other => bail!("MODE must be full or smoke, not {other:?}"),
+        let (clients, files, lines) = match (scenario.as_str(), mode.as_str()) {
+            ("r2-match", "full") => (200, 1, 5_000),
+            ("r2-match", "smoke") => (10, 1, 1_000),
+            (_, "full") => (200, 5, 1_000),
+            (_, "smoke") => (20, 5, 500),
+            (_, other) => bail!("MODE must be full or smoke, not {other:?}"),
         };
         // A functional check with fewer accounts (not a load result; see perf/README.md).
         let clients = std::env::var("CLIENTS")
@@ -103,17 +113,27 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
     sorted[(rank as usize).min(sorted.len() - 1)]
 }
 
-/// Peak RSS in bytes from `/usr/bin/time` output (macOS `-l`: bytes; GNU `-v`: KiB).
-fn peak_rss(time_output: &str) -> Option<u64> {
-    for line in time_output.lines() {
-        let line = line.trim();
-        if let Some(n) = line.strip_suffix("maximum resident set size") {
-            return n.trim().parse().ok();
-        }
-        if let Some(n) = line.strip_prefix("Maximum resident set size (kbytes):") {
-            return n.trim().parse::<u64>().ok().map(|k| k * 1024);
-        }
-    }
+/// Peak RSS in bytes — Linux `/proc/<pid>/status` VmHWM, the kernel's high-water mark
+/// (the same number /usr/bin/time reported). Read while the server is still alive, just
+/// before the stop; unknown on systems without /proc.
+#[cfg(target_os = "linux")]
+async fn peak_rss(pid: u32) -> Option<u64> {
+    let text = tokio::fs::read_to_string(format!("/proc/{pid}/status"))
+        .await
+        .ok()?;
+    let kb: u64 = text
+        .lines()
+        .find_map(|l| l.strip_prefix("VmHWM:"))?
+        .trim()
+        .trim_end_matches(" kB")
+        .parse()
+        .ok()?;
+    Some(kb * 1024)
+}
+
+/// No /proc off Linux — the peak is honestly unknown.
+#[cfg(not(target_os = "linux"))]
+async fn peak_rss(_pid: u32) -> Option<u64> {
     None
 }
 
@@ -129,6 +149,41 @@ async fn wait_ready(base: &str) -> anyhow::Result<()> {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     bail!("the server never became ready")
+}
+
+/// True when nothing on 127.0.0.1 holds `port` — the only honest "the server is gone"
+/// check: the spawned wrapper can exit while its server survives as an orphan.
+async fn port_free(port: u16) -> bool {
+    tokio::net::TcpListener::bind(("127.0.0.1", port))
+        .await
+        .is_ok()
+}
+
+/// `port_free` with a short grace period — a gracefully stopped server can take a beat to
+/// release its listener after the wrapper exits.
+async fn wait_port_free(port: u16) -> bool {
+    for _ in 0..50 {
+        if port_free(port).await {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    false
+}
+
+/// Stop the spawned server and prove the port is free. The server is a direct child, so
+/// `start_kill` is a SIGKILL straight at it — there is no wrapper that could die first
+/// and orphan it — and `wait_port_free` proves the listener is really gone before the
+/// run reports. A stale server on the port makes the NEXT run 401 on every call (it
+/// answers readiness but holds a different token — the CI failure).
+async fn stop_server(server: &mut Child, port: u16) -> anyhow::Result<()> {
+    let _ = server.start_kill();
+    let _ = tokio::time::timeout(Duration::from_secs(10), server.wait()).await;
+    anyhow::ensure!(
+        wait_port_free(port).await,
+        "127.0.0.1:{port} is still held after the stop — a foreign process owns it"
+    );
+    Ok(())
 }
 
 async fn post(
@@ -200,32 +255,30 @@ async fn main() -> anyhow::Result<()> {
         u128::from(std::process::id()) * 0x9E37_79B9_7F4A_7C15_u128
     );
     let base = format!("http://127.0.0.1:{}", plan.port);
-    // /usr/bin/time reports the exact peak RSS (macOS `-l`, GNU `-v`); without it the
-    // server runs directly and the RSS is recorded as unknown.
-    let time_flag = if cfg!(target_os = "macos") {
-        "-l"
-    } else {
-        "-v"
-    };
-    let mut command = if std::path::Path::new("/usr/bin/time").exists() {
-        let mut c = Command::new("/usr/bin/time");
-        c.arg(time_flag).arg(&plan.server_bin);
-        c
-    } else {
-        Command::new(&plan.server_bin)
-    };
-    let mut server = command
+    // Fail fast on a held port: a stale load server answers readiness but rejects this
+    // run's freshly generated token, so every authenticated call 401s (the CI failure).
+    anyhow::ensure!(
+        port_free(plan.port).await,
+        "127.0.0.1:{} is already bound — a stale load server holds it; stop it and rerun",
+        plan.port
+    );
+    // The server is a direct child — no /usr/bin/time wrapper: a wrapper signalled first
+    // dies without forwarding and orphans the server, which keeps the port, answers the
+    // NEXT run's readiness probe, and rejects that run's token — every call 401s (the
+    // CI failure). Peak RSS comes from /proc instead (peak_rss).
+    let mut server = Command::new(&plan.server_bin)
         .env("RECON_DATABASE_URL", &plan.database_url)
         .env("RECON_LISTEN", format!("127.0.0.1:{}", plan.port))
         .env("RECON_OPERATOR_TOKEN", &token)
         .env("RECON_LOG", "warn")
         .env("RECON_IMPORT_CONCURRENCY", plan.workers.to_string())
+        .env("RECON_MATCHING_CONCURRENCY", plan.workers.to_string())
         .env("RECON_DB_MAX_CONNECTIONS", "32")
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
-        .context("starting the server under /usr/bin/time")?;
+        .context("starting the server")?;
     let mut server_stderr = server.stderr.take().context("server stderr")?;
     let stderr_task = tokio::spawn(async move {
         let mut text = String::new();
@@ -250,9 +303,15 @@ async fn main() -> anyhow::Result<()> {
         "/v1/firms",
         json!({"name": "Load firm"}),
     )
-    .await?;
+    .await
+    .context(
+        "the first authenticated call failed — on a 401 a stale load server holds the \
+         port and rejects this run's freshly generated token; stop it and rerun",
+    )?;
     let firm_id = firm["firm"]["id"].as_str().context("firm id")?.to_owned();
-    let mut accounts = Vec::with_capacity(plan.clients);
+    // r2-match needs the client id (document imports and matching jobs are client-scoped)
+    // as well as the account id (statement imports are account-scoped).
+    let mut pairs: Vec<(String, String)> = Vec::with_capacity(plan.clients);
     for c in 0..plan.clients {
         let client = post(
             &http,
@@ -262,7 +321,10 @@ async fn main() -> anyhow::Result<()> {
             json!({"name": format!("Client {c}")}),
         )
         .await?;
-        let client_id = client["client"]["id"].as_str().context("client id")?;
+        let client_id = client["client"]["id"]
+            .as_str()
+            .context("client id")?
+            .to_owned();
         let account = post(
             &http,
             &base,
@@ -271,16 +333,32 @@ async fn main() -> anyhow::Result<()> {
             json!({"name": "Current", "currency": "USD"}),
         )
         .await?;
-        accounts.push(
+        pairs.push((
+            client_id,
             account["account"]["id"]
                 .as_str()
                 .context("account id")?
                 .to_owned(),
-        );
+        ));
     }
-    let accounts = Arc::new(accounts);
+    let pairs = Arc::new(pairs);
 
     // The jobs, interleaved across accounts so concurrent uploads hit different accounts.
+    if plan.scenario == "r2-match" {
+        return r2_match(
+            plan,
+            pairs,
+            http,
+            base,
+            token,
+            firm_id,
+            pool,
+            db_before,
+            server,
+            stderr_task,
+        )
+        .await;
+    }
     let jobs: Vec<(usize, usize)> = (0..plan.files_per_account)
         .flat_map(|f| (0..plan.clients).map(move |c| (c, f)))
         .collect();
@@ -292,13 +370,13 @@ async fn main() -> anyhow::Result<()> {
     let started = Instant::now();
     let mut workers = tokio::task::JoinSet::new();
     for _ in 0..plan.workers {
-        let (plan, jobs, next, latencies, errors, accounts, busy) = (
+        let (plan, jobs, next, latencies, errors, pairs, busy) = (
             plan.clone(),
             jobs.clone(),
             next.clone(),
             latencies.clone(),
             errors.clone(),
-            accounts.clone(),
+            pairs.clone(),
             busy.clone(),
         );
         let (http, base, token, firm_id) =
@@ -316,7 +394,7 @@ async fn main() -> anyhow::Result<()> {
                     let result = http
                         .post(format!(
                             "{base}/v1/firms/{firm_id}/accounts/{}/imports",
-                            accounts[client]
+                            pairs[client].1
                         ))
                         .bearer_auth(&token)
                         .header("content-type", "text/csv")
@@ -362,7 +440,7 @@ async fn main() -> anyhow::Result<()> {
         let r = http
             .post(format!(
                 "{base}/v1/firms/{firm_id}/accounts/{}/imports",
-                accounts[client]
+                pairs[client].1
             ))
             .bearer_auth(&token)
             .header("content-type", "text/csv")
@@ -404,18 +482,15 @@ async fn main() -> anyhow::Result<()> {
             .await?;
     pool.close().await;
 
-    // Stop the server and read its peak RSS.
-    if let Some(pid) = server.id() {
-        // /usr/bin/time forwards SIGTERM to its child and prints the summary when it exits.
-        let _ = std::process::Command::new("pkill")
-            .arg("-TERM")
-            .arg("-P")
-            .arg(pid.to_string())
-            .status();
-    }
-    let _ = tokio::time::timeout(Duration::from_secs(60), server.wait()).await;
-    let server_log = stderr_task.await.unwrap_or_default();
-    let rss = peak_rss(&server_log);
+    // Peak RSS needs the live process (/proc): read it just before the stop, which must
+    // leave the port provably free — a survivor would 401 the next run.
+    let rss = if let Some(pid) = server.id() {
+        peak_rss(pid).await
+    } else {
+        None
+    };
+    stop_server(&mut server, plan.port).await?;
+    let _ = tokio::time::timeout(Duration::from_secs(10), stderr_task).await;
 
     let mut latencies = latencies.lock().await.clone();
     latencies.sort_by(f64::total_cmp);
@@ -454,10 +529,15 @@ async fn main() -> anyhow::Result<()> {
     let checks_pass = checks
         .as_object()
         .is_some_and(|o| o.values().all(|v| v == true));
-    let thresholds_pass = errors.is_empty()
-        && lines_per_s >= lines_min
-        && p99 <= p99_max
-        && rss.is_some_and(|r| r <= 268_435_456);
+    // A full run must carry the RSS evidence (an unmeasured peak fails it); a smoke
+    // records an unmeasurable peak as unknown rather than a miss — a measured miss still
+    // fails either mode.
+    let rss_ok = if plan.mode == "full" {
+        rss.is_some_and(|r| r <= 268_435_456)
+    } else {
+        rss.is_none_or(|r| r <= 268_435_456)
+    };
+    let thresholds_pass = errors.is_empty() && lines_per_s >= lines_min && p99 <= p99_max && rss_ok;
     let result = json!({
         "scenario": plan.scenario,
         "mode": plan.mode,
@@ -507,5 +587,385 @@ async fn main() -> anyhow::Result<()> {
     if !checks_pass || (gate_thresholds && !thresholds_pass) {
         std::process::exit(1);
     }
+    Ok(())
+}
+
+/// Truth-file labels → the line's expected terminal status.
+fn truth_counts(truth: &[u8]) -> anyhow::Result<(u64, u64, u64)> {
+    let text = std::str::from_utf8(truth).context("truth is not UTF-8")?;
+    let (mut matched, mut proposed, mut exception) = (0_u64, 0_u64, 0_u64);
+    for row in text.lines().skip(1) {
+        let label = row.split(',').nth(1).unwrap_or("");
+        match label {
+            "t1" => matched += 1,
+            "t2" | "t3" | "t4" => proposed += 1,
+            _ => exception += 1,
+        }
+    }
+    Ok((matched, proposed, exception))
+}
+
+/// The `r2-match` scenario: every client gets one generated `gen-v3` month (statement +
+/// documents + truth), both uploads go through the API, then the client's matching job
+/// runs and the database is checked line-for-line against the truth's label counts.
+#[allow(clippy::too_many_arguments, reason = "the scenario's shared run state")]
+async fn r2_match(
+    plan: Arc<Plan>,
+    pairs: Arc<Vec<(String, String)>>,
+    http: reqwest::Client,
+    base: String,
+    token: String,
+    firm_id: String,
+    pool: sqlx::PgPool,
+    db_before: i64,
+    mut server: tokio::process::Child,
+    stderr_task: tokio::task::JoinHandle<String>,
+) -> anyhow::Result<()> {
+    // The firm's residual tolerances, pinned into each job (D-014): bank fees to 10.00.
+    sqlx::query("UPDATE recon.firms SET residual_tolerances = $1 WHERE id = $2::uuid")
+        .bind(json!({"USD": {"bank_fee": 1000, "tax_withheld": 0, "rounding": 0}}))
+        .bind(&firm_id)
+        .execute(&pool)
+        .await
+        .context("setting the firm's residual tolerances")?;
+
+    // Phase A: generate and upload each client's statement and documents.
+    let distractors = plan.lines_per_file / 10;
+    let next = Arc::new(AtomicUsize::new(0));
+    let errors = Arc::new(Mutex::new(Vec::<String>::new()));
+    let truth = Arc::new(Mutex::new(Vec::<(String, u64, u64, u64)>::new()));
+    let upload_started = Instant::now();
+    let mut workers = tokio::task::JoinSet::new();
+    for _ in 0..plan.workers {
+        let (plan, next, errors, truth, pairs) = (
+            plan.clone(),
+            next.clone(),
+            errors.clone(),
+            truth.clone(),
+            pairs.clone(),
+        );
+        let (http, base, token, firm_id) =
+            (http.clone(), base.clone(), token.clone(), firm_id.clone());
+        workers.spawn(async move {
+            loop {
+                let c = next.fetch_add(1, Ordering::Relaxed);
+                let Some((client, account)) = pairs.get(c) else {
+                    break;
+                };
+                let set = recon_cli::generate::match_set(&recon_cli::generate::MatchSpec {
+                    seed: 0x5EED_3000_u64 ^ (u64::try_from(c).unwrap_or(0) << 8),
+                    lines: plan.lines_per_file,
+                    distractors,
+                    currency: Currency::Usd,
+                    start: Date::new(2026, 1, 1).expect("invariant: a real date"),
+                    days: 28,
+                });
+                for (path, body) in [
+                    (
+                        format!("/v1/firms/{firm_id}/accounts/{account}/imports"),
+                        set.statement,
+                    ),
+                    (
+                        format!("/v1/firms/{firm_id}/clients/{client}/document-imports"),
+                        set.documents,
+                    ),
+                ] {
+                    let r = http
+                        .post(format!("{base}{path}"))
+                        .bearer_auth(&token)
+                        .header("content-type", "text/csv")
+                        .body(body)
+                        .send()
+                        .await;
+                    match r {
+                        Ok(r) if r.status() == 201 => {}
+                        Ok(r) => {
+                            let status = r.status();
+                            let text = r.text().await.unwrap_or_default();
+                            errors.lock().await.push(format!(
+                                "client {c} {path}: {status}: {}",
+                                text.chars().take(200).collect::<String>()
+                            ));
+                            break;
+                        }
+                        Err(e) => {
+                            errors
+                                .lock()
+                                .await
+                                .push(format!("client {c} {path}: request failed: {e}"));
+                            break;
+                        }
+                    }
+                }
+                match truth_counts(&set.truth) {
+                    Ok((m, p, e)) => truth.lock().await.push((client.clone(), m, p, e)),
+                    Err(e) => errors.lock().await.push(format!("client {c} truth: {e}")),
+                }
+            }
+        });
+    }
+    while let Some(w) = workers.join_next().await {
+        w?;
+    }
+    let upload_seconds = upload_started.elapsed().as_secs_f64();
+    let truth = truth.lock().await.clone();
+
+    // Phase B: one matching job per client; the server's matching_concurrency bounds how
+    // many run at once — every client gets its own job (mutual exclusion is per client).
+    let job_path = |client: &str| format!("/v1/firms/{firm_id}/clients/{client}/matching-jobs");
+    let match_started = Instant::now();
+    let mut pending: Vec<(String, String, Instant)> = Vec::with_capacity(truth.len());
+    for (client, ..) in &truth {
+        // A 5xx start ("database_unavailable", "nothing was accepted") is retried like a
+        // busy upload; a 409 client_busy means a job already runs — impossible here.
+        let mut attempt = 0;
+        let r = loop {
+            let r = http
+                .post(format!("{base}{}", job_path(client)))
+                .bearer_auth(&token)
+                .header("content-length", "0")
+                .send()
+                .await;
+            match &r {
+                Ok(r) if r.status().is_server_error() && attempt < 10 => {
+                    attempt += 1;
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+                _ => break r,
+            }
+        };
+        match r {
+            Ok(r) if r.status() == 202 => {
+                let body: Value = r.json().await.unwrap_or(Value::Null);
+                let id = body["job"]["id"].as_str().unwrap_or_default().to_owned();
+                pending.push((client.clone(), id, Instant::now()));
+            }
+            Ok(r) => {
+                let status = r.status();
+                let text = r.text().await.unwrap_or_default();
+                errors.lock().await.push(format!(
+                    "job start {client}: {status}: {}",
+                    text.chars().take(200).collect::<String>()
+                ));
+            }
+            Err(e) => errors
+                .lock()
+                .await
+                .push(format!("job start {client}: request failed: {e}")),
+        }
+    }
+    // Poll until every job is terminal or the overall deadline passes. The bound: every
+    // client's job gets the server's matching deadline; a stuck run is an error, not a
+    // hang (drill: drill_matching_deadline_exceeded).
+    let poll_deadline = Instant::now()
+        + Duration::from_secs(
+            (u64::try_from(plan.clients).unwrap_or(1) * 90
+                / u64::try_from(plan.workers.max(1)).unwrap_or(1))
+            .max(300),
+        );
+    let mut latencies = Vec::<f64>::with_capacity(pending.len());
+    let mut jobs_failed = 0_u64;
+    while !pending.is_empty() && Instant::now() < poll_deadline {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let mut still = Vec::with_capacity(pending.len());
+        for (client, id, sent) in pending {
+            let r = http
+                .get(format!("{base}{}/{id}", job_path(&client)))
+                .bearer_auth(&token)
+                .send()
+                .await;
+            match r {
+                Ok(r) if r.status() == 200 => {
+                    let body: Value = r.json().await.unwrap_or(Value::Null);
+                    match body["job"]["status"].as_str().unwrap_or("") {
+                        "complete" => latencies.push(sent.elapsed().as_secs_f64() * 1_000.0),
+                        "failed" => {
+                            jobs_failed += 1;
+                            errors.lock().await.push(format!(
+                                "job {id} failed: {}",
+                                body["job"]["error_code"].as_str().unwrap_or("?")
+                            ));
+                        }
+                        _ => still.push((client, id, sent)),
+                    }
+                }
+                Ok(r) => errors
+                    .lock()
+                    .await
+                    .push(format!("job poll {id}: {}", r.status())),
+                Err(e) => errors
+                    .lock()
+                    .await
+                    .push(format!("job poll {id}: request failed: {e}")),
+            }
+        }
+        pending = still;
+    }
+    for (_, id, _) in &pending {
+        errors
+            .lock()
+            .await
+            .push(format!("job {id} never reached a terminal state"));
+    }
+    let match_seconds = match_started.elapsed().as_secs_f64();
+
+    // Verification against the database: terminal line states per client equal the
+    // truth's label counts; committed matches are all t1; no subject decided twice.
+    let firm = FirmId::from_uuid(firm_id.parse()?);
+    let rows: Vec<(String, String, i64)> = sqlx::query_as(
+        "SELECT client_id::text, status::text, count(*)::int8 FROM recon.statement_lines
+           WHERE firm_id = $1 GROUP BY 1, 2",
+    )
+    .bind(firm.as_uuid())
+    .fetch_all(&pool)
+    .await?;
+    let mut status_by_client: std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, i64>,
+    > = std::collections::HashMap::new();
+    for (client, status, n) in rows {
+        *status_by_client
+            .entry(client)
+            .or_default()
+            .entry(status)
+            .or_default() += n;
+    }
+    let mut states_ok = true;
+    for (client, matched, proposed, exception) in &truth {
+        let counts = status_by_client.get(client).cloned().unwrap_or_default();
+        let get = |s: &str| counts.get(s).copied().unwrap_or(0);
+        if get("matched") != i64::try_from(*matched).unwrap_or(-1)
+            || get("proposed") != i64::try_from(*proposed).unwrap_or(-1)
+            || get("exception") != i64::try_from(*exception).unwrap_or(-1)
+            || counts
+                .keys()
+                .any(|s| !matches!(s.as_str(), "matched" | "proposed" | "exception"))
+        {
+            states_ok = false;
+            errors.lock().await.push(format!(
+                "client {client}: states {counts:?} != truth ({matched}, {proposed}, {exception})"
+            ));
+        }
+    }
+    let (committed_t1, committed_other, proposals, exceptions, jobs_complete, jobs_no_digest, dup): (
+        i64, i64, i64, i64, i64, i64, i64,
+    ) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM recon.matches WHERE firm_id = $1 AND status = 'committed' AND tier = 't1'),
+                (SELECT count(*) FROM recon.matches WHERE firm_id = $1 AND status = 'committed' AND tier <> 't1'),
+                (SELECT count(*) FROM recon.proposals WHERE firm_id = $1),
+                (SELECT count(*) FROM recon.line_exceptions WHERE firm_id = $1),
+                (SELECT count(*) FROM recon.match_jobs WHERE firm_id = $1 AND status = 'complete'),
+                (SELECT count(*) FROM recon.match_jobs WHERE firm_id = $1 AND status = 'complete' AND run_digest IS NULL),
+                (SELECT count(*) FROM (SELECT subject_id FROM recon.decision_log
+                   WHERE firm_id = $1 AND job_id IS NOT NULL
+                   GROUP BY job_id, subject_id HAVING count(*) > 1) d)",
+    )
+    .bind(firm.as_uuid())
+    .fetch_one(&pool)
+    .await?;
+    let replay = recon_db::replay::check(&pool, firm).await?;
+    let db_after: i64 =
+        sqlx::query_scalar("SELECT pg_catalog.pg_database_size(pg_catalog.current_database())")
+            .fetch_one(&pool)
+            .await?;
+    pool.close().await;
+
+    let rss = if let Some(pid) = server.id() {
+        peak_rss(pid).await
+    } else {
+        None
+    };
+    stop_server(&mut server, plan.port).await?;
+    let _ = tokio::time::timeout(Duration::from_secs(10), stderr_task).await;
+
+    latencies.sort_by(f64::total_cmp);
+    let errors = errors.lock().await.clone();
+    let expected = plan.total_lines();
+    let (m_total, p_total, e_total): (u64, u64, u64) = truth
+        .iter()
+        .fold((0, 0, 0), |(m, p, e), (_, a, b, c)| (m + a, p + b, e + c));
+    // Throughput counts the lines actually decided, not the ones intended.
+    let decided = committed_t1
+        .saturating_add(proposals)
+        .saturating_add(exceptions);
+    let lines_per_s = decided as f64 / match_seconds;
+    let p99 = percentile(&latencies, 99.0);
+    let (lines_min, p99_max) = if plan.mode == "full" {
+        (2_000.0, 120_000.0)
+    } else {
+        (300.0, 60_000.0)
+    };
+    let thresholds = json!({
+        "lines_per_s_min": lines_min,
+        "job_p99_ms_max": p99_max,
+        "server_peak_rss_bytes_max": 536_870_912_u64,
+        "errors_max": 0,
+    });
+    let checks = json!({
+        "every_job_complete_with_digest": usize::try_from(jobs_complete).unwrap_or(0) == truth.len() && jobs_no_digest == 0 && jobs_failed == 0 && pending.is_empty(),
+        "line_states_equal_truth_per_client": states_ok,
+        "zero_false_auto_matches": committed_other == 0,
+        "proposals_equal_truth": u64::try_from(proposals).unwrap_or(0) == p_total,
+        "exceptions_equal_truth": u64::try_from(exceptions).unwrap_or(0) == e_total,
+        "no_subject_decided_twice": dup == 0,
+        "decision_log_replays": replay.is_ok(),
+    });
+    let checks_pass = checks
+        .as_object()
+        .is_some_and(|o| o.values().all(|v| v == true));
+    // Same RSS rule as the import scenarios: a full run must carry the evidence, a smoke
+    // records an unmeasurable peak as unknown; a measured miss fails either mode.
+    let rss_ok = if plan.mode == "full" {
+        rss.is_some_and(|r| r <= 536_870_912)
+    } else {
+        rss.is_none_or(|r| r <= 536_870_912)
+    };
+    let thresholds_pass = errors.is_empty() && lines_per_s >= lines_min && p99 <= p99_max && rss_ok;
+    let result = json!({
+        "scenario": plan.scenario,
+        "mode": plan.mode,
+        "unit": "statement line decided by a matching job (D-027, matching half): snapshot, engine, committed chunks",
+        "machine": plan.machine,
+        "commit": plan.commit,
+        "load_average_before": plan.load_before,
+        "load_average_after": std::process::Command::new("uptime").output().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned()).unwrap_or_default(),
+        "generator": recon_cli::generate::MATCH_GENERATOR_VERSION,
+        "shape": {
+            "firms": 1, "clients": plan.clients,
+            "lines_per_client": plan.lines_per_file, "distractors_per_client": distractors,
+            "lines": expected, "workers": plan.workers,
+        },
+        "results": {
+            "upload_seconds": (upload_seconds * 1000.0).round() / 1000.0,
+            "match_seconds": (match_seconds * 1000.0).round() / 1000.0,
+            "lines_per_s": lines_per_s.round(),
+            "job_latency_ms": {
+                "p50": percentile(&latencies, 50.0).round(),
+                "p95": percentile(&latencies, 95.0).round(),
+                "p99": p99.round(),
+                "max": latencies.last().copied().unwrap_or(0.0).round(),
+            },
+            "jobs_completed": latencies.len(), "jobs_failed": jobs_failed,
+            "errors": errors.len(),
+            "first_errors": errors.iter().take(5).collect::<Vec<_>>(),
+            "truth": { "t1_matched": m_total, "proposed": p_total, "exception": e_total },
+            "database": {
+                "committed_t1": committed_t1, "committed_other_tiers": committed_other,
+                "proposals": proposals, "line_exceptions": exceptions,
+                "jobs_complete": jobs_complete, "jobs_without_digest": jobs_no_digest,
+                "duplicate_decisions": dup,
+            },
+            "server_peak_rss_bytes": rss,
+            "database_growth_bytes": db_after - db_before,
+            "replay": match &replay { Ok(r) => json!({"clients": r.clients, "decisions": r.decisions, "imports": r.imports, "lines": r.lines}), Err(m) => json!(m.0) },
+        },
+        "checks": checks,
+        "thresholds": thresholds,
+        "checks_pass": checks_pass,
+        "thresholds_pass": thresholds_pass,
+        "pass": checks_pass && thresholds_pass,
+    });
+    std::fs::write(&plan.out, serde_json::to_string_pretty(&result)? + "\n")?;
+    println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(())
 }
