@@ -347,12 +347,20 @@ pub async fn start(
 
 /// Re-claims every expired running job for the sweeper's resume pass. A claimed job
 /// resumes from its cursor; a race with another claimer loses to its token CAS.
-pub async fn claim_expired(pool: &PgPool, lease: Duration) -> Result<Vec<JobLease>, DbError> {
+pub async fn claim_expired(
+    pool: &PgPool,
+    lease: Duration,
+    limit: usize,
+) -> Result<Vec<JobLease>, DbError> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
     let stale = sqlx::query(
         "SELECT firm_id, id, client_id, lease_token FROM recon.match_jobs
           WHERE status = 'running' AND lease_until <= pg_catalog.clock_timestamp()
-          ORDER BY id FOR UPDATE SKIP LOCKED",
+          ORDER BY id LIMIT $1 FOR UPDATE SKIP LOCKED",
     )
+    .bind(i64::try_from(limit).unwrap_or(i64::MAX))
     .fetch_all(pool)
     .await?;
     let mut claimed = Vec::new();

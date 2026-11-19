@@ -33,6 +33,7 @@ use tokio::sync::Semaphore;
 use tokio::time::Sleep;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
+use tower::Service as _;
 
 /// Connection bounds.
 #[derive(Debug, Clone, Copy)]
@@ -167,8 +168,8 @@ pub async fn serve(
             () = shutdown.cancelled() => break,
             accepted = listener.accept() => accepted,
         };
-        let stream = match accepted {
-            Ok((stream, _peer)) => stream,
+        let (stream, peer) = match accepted {
+            Ok(accepted) => accepted,
             Err(e) => {
                 // Out of file descriptors and the like: back off instead of spinning.
                 tracing::warn!(error = %e, "accept failed");
@@ -185,8 +186,19 @@ pub async fn serve(
         // Count this connection's answers; the limiting one says Connection: close.
         let served = Arc::new(AtomicUsize::new(0));
         let cap = limits.max_requests_per_connection;
+        // The peer's address rides in every request's extensions (ConnectInfo) — the
+        // sign-in throttle keys on it (D-021's per-address back-off).
+        let peer_app = app.clone();
         let service = tower::ServiceExt::<axum::http::Request<hyper::body::Incoming>>::map_response(
-            app.clone(),
+            tower::service_fn(
+                move |mut request: axum::http::Request<hyper::body::Incoming>| {
+                    request
+                        .extensions_mut()
+                        .insert(axum::extract::ConnectInfo(peer));
+                    let mut app = peer_app.clone();
+                    async move { app.call(request).await }
+                },
+            ),
             move |mut response: Response| {
                 if served.fetch_add(1, Ordering::Relaxed).saturating_add(1) >= cap {
                     response

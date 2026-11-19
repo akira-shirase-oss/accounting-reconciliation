@@ -22,8 +22,11 @@ required-features = ["fault-injection"]
 
 [dependencies]
 anyhow.workspace = true
+argon2.workspace = true
 axum.workspace = true
+getrandom.workspace = true
 hex.workspace = true
+hmac.workspace = true
 http-body-util.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
@@ -33,6 +36,7 @@ recon-import.workspace = true
 recon-match.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha1.workspace = true
 sha2.workspace = true
 sqlx.workspace = true
 subtle.workspace = true

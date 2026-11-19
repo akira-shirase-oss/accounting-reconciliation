@@ -1,0 +1,86 @@
+{
+  "checks": {
+    "decision_log_replays": true,
+    "every_job_complete_with_digest": false,
+    "exceptions_equal_truth": false,
+    "line_states_equal_truth_per_client": false,
+    "no_subject_decided_twice": true,
+    "proposals_equal_truth": false,
+    "zero_false_auto_matches": true
+  },
+  "checks_pass": false,
+  "commit": "8418222a703ca013a35f40a8303bd89020027863",
+  "generator": "gen-v3",
+  "load_average_after": "14:43:11 up 21 min,  0 users,  load average: 4.42, 4.72, 4.27",
+  "load_average_before": " 14:24:06 up 2 min,  0 users,  load average: 5.17, 2.18, 0.83",
+  "machine": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz, 4 cores, 15 GiB, Linux 7.0.0-1019-azure; PostgreSQL in Docker (deploy/compose.yaml) on the same machine; GitHub-hosted runner observation",
+  "mode": "full",
+  "pass": false,
+  "results": {
+    "database": {
+      "committed_other_tiers": 0,
+      "committed_t1": 131478,
+      "duplicate_decisions": 0,
+      "jobs_complete": 33,
+      "jobs_without_digest": 0,
+      "line_exceptions": 9178,
+      "proposals": 46844
+    },
+    "database_growth_bytes": 3019472896,
+    "errors": 351,
+    "first_errors": [
+      "job start 01a1f431-7f9b-77ee-860a-825c24418d76: 503 Service Unavailable: {\"error\":{\"code\":\"database_unavailable\",\"message\":\"the database is unavailable; nothing was accepted, retry later\"}}",
+      "job start 01a1f431-7f9d-75b9-9522-730b5e91acab: 503 Service Unavailable: {\"error\":{\"code\":\"database_unavailable\",\"message\":\"the database is unavailable; nothing was accepted, retry later\"}}",
+      "job start 01a1f431-7f9f-749d-9cf0-ab1ebf31721d: 503 Service Unavailable: {\"error\":{\"code\":\"database_unavailable\",\"message\":\"the database is unavailable; nothing was accepted, retry later\"}}",
+      "job start 01a1f431-7fa0-71de-92d2-be021337cb09: 503 Service Unavailable: {\"error\":{\"code\":\"database_unavailable\",\"message\":\"the database is unavailable; nothing was accepted, retry later\"}}",
+      "job start 01a1f431-7fa3-771e-90a9-e9190719a581: 503 Service Unavailable: {\"error\":{\"code\":\"database_unavailable\",\"message\":\"the database is unavailable; nothing was accepted, retry later\"}}"
+    ],
+    "job_latency_ms": {
+      "max": 463101.0,
+      "p50": 417290.0,
+      "p95": 417298.0,
+      "p99": 463101.0
+    },
+    "jobs_completed": 16,
+    "jobs_failed": 0,
+    "lines_per_s": 173.0,
+    "match_seconds": 1083.739,
+    "replay": {
+      "clients": 200,
+      "decisions": 366222,
+      "imports": 400,
+      "lines": 1000000
+    },
+    "server_peak_rss_bytes": 182362112,
+    "truth": {
+      "exception": 49850,
+      "proposed": 249834,
+      "t1_matched": 700316
+    },
+    "upload_seconds": 48.68
+  },
+  "scenario": "r2-match",
+  "shape": {
+    "clients": 200,
+    "distractors_per_client": 500,
+    "firms": 1,
+    "lines": 1000000,
+    "lines_per_client": 5000,
+    "workers": 8
+  },
+  "thresholds": {
+    "errors_max": 0,
+    "job_p99_ms_max": 120000.0,
+    "lines_per_s_min": 2000.0,
+    "server_peak_rss_bytes_max": 536870912
+  },
+  "thresholds_pass": false,
+  "unit": "statement line decided by a matching job (D-027, matching half): snapshot, engine, committed chunks",
+  "runner": {
+    "label": "GitHub-hosted runner",
+    "image": "ubuntu26/20261111.196.1",
+    "arch": "X64",
+    "workflow_run": 44542812913,
+    "note": "the load generator, the server, the network and PostgreSQL share one runner VM on shared cloud hardware; an observation, not capacity"
+  }
+}

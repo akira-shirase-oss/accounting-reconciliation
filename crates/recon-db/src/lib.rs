@@ -9,6 +9,7 @@
 //! Queries use runtime-checked `sqlx::query` with explicit binds, so building needs no
 //! database; the tests in `tests/` prove them against a real PostgreSQL.
 
+pub mod auth;
 pub mod decisions;
 pub mod error;
 pub mod imports;
@@ -16,6 +17,7 @@ pub mod matching;
 pub mod pool;
 pub mod profiles;
 pub mod replay;
+pub mod review;
 pub mod roles;
 pub mod tenancy;
 #[cfg(feature = "test-support")]

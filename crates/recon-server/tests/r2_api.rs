@@ -262,6 +262,75 @@ async fn matching_jobs_need_the_operator_and_the_clients_firm() {
 }
 
 #[tokio::test]
+async fn a_job_past_the_worker_limit_queues_for_the_sweeper() {
+    let db = TestDb::new().await;
+    // One worker permit: the first job drives; the second must queue, never refuse.
+    let url = db.app_url();
+    let config = Config::from_source(|name| match name {
+        "RECON_DATABASE_URL" => Some(url.clone()),
+        "RECON_OPERATOR_TOKEN" => Some(TOKEN.to_owned()),
+        "RECON_MATCHING_CONCURRENCY" => Some("1".to_owned()),
+        _ => None,
+    })
+    .unwrap();
+    let state = AppState::new(db.pool.clone(), config, Faults::default());
+    state.mark_checked();
+    let t = tenant(&state).await;
+    seed_pair(&state, &t).await;
+    // A second client in the same firm, seeded with the same -1.00 pair.
+    let (s, client) = call(
+        &state,
+        post_json(
+            &format!("/v1/firms/{}/clients", t.firm),
+            &json!({"name": "Client Two"}),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{client}");
+    let other_client = client["client"]["id"].as_str().unwrap().to_owned();
+    let (s, account) = call(
+        &state,
+        post_json(
+            &format!("/v1/firms/{}/clients/{other_client}/accounts", t.firm),
+            &json!({"name": "Current", "currency": "USD"}),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{account}");
+    let other = Tenant {
+        firm: t.firm.clone(),
+        client: other_client,
+        account: account["account"]["id"].as_str().unwrap().to_owned(),
+    };
+    seed_pair(&state, &other).await;
+
+    // The first job takes the only worker permit and drives.
+    let (s, body) = call(&state, post(&jobs_path(&t))).await;
+    assert_eq!(s, StatusCode::ACCEPTED, "{body}");
+    let first = body["job"]["id"].as_str().unwrap().to_owned();
+
+    // The second is accepted too: the durable row is the queue, claimed as workers free.
+    let (s, body) = call(&state, post(&jobs_path(&other))).await;
+    assert_eq!(s, StatusCode::ACCEPTED, "queued start refused: {body}");
+    let second = body["job"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(body["job"]["status"], "running");
+
+    // While the first still runs, the second sits unclaimed: no cursor, no snapshot.
+    let body = wait_job(&state, &t, &first, Duration::from_secs(15)).await;
+    assert_eq!(body["job"]["status"], "complete", "{body}");
+    let (_, body) = call(&state, get(&format!("{}/{second}", jobs_path(&other)))).await;
+    assert_eq!(body["job"]["status"], "running");
+    assert_eq!(body["job"]["cursor"], 0, "a queued job has not started");
+
+    // The sweeper's round claims the queued job and drives it to completion.
+    recon_server::matching::resume_expired(&state, CancellationToken::new()).await;
+    let body = wait_job(&state, &other, &second, Duration::from_secs(15)).await;
+    assert_eq!(body["job"]["status"], "complete", "{body}");
+    assert_eq!(body["job"]["matched"], 1);
+    db.cleanup().await;
+}
+
+#[tokio::test]
 async fn the_sweeper_resumes_a_job_whose_worker_died() {
     let db = TestDb::new().await;
     let state = checked(&db);

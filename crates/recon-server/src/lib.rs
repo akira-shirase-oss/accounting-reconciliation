@@ -4,12 +4,14 @@
 //! readiness. Sessions, roles and the review API arrive in R3; until then an operator token
 //! guards every `/v1` route (D-041).
 
+pub mod auth;
 pub mod config;
 pub mod error;
 pub mod faults;
 pub mod handlers;
 pub mod matching;
 pub mod profiles;
+pub mod review;
 pub mod serve;
 pub mod state;
 pub mod tasks;
@@ -20,12 +22,11 @@ use std::time::Duration;
 
 use axum::Router;
 use axum::error_handling::HandleErrorLayer;
-use axum::extract::{DefaultBodyLimit, MatchedPath, Request, State};
-use axum::http::{HeaderValue, StatusCode, header};
-use axum::middleware::{self, Next};
+use axum::extract::{DefaultBodyLimit, MatchedPath, Request};
+use axum::http::{HeaderValue, StatusCode};
+use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use subtle::ConstantTimeEq as _;
 use tower::ServiceBuilder;
 use tower::limit::GlobalConcurrencyLimitLayer;
 use tower_http::catch_panic::CatchPanicLayer;
@@ -77,26 +78,44 @@ async fn strip_request_id(mut request: Request) -> Request {
     request
 }
 
-/// `/v1` requires `Authorization: Bearer <operator token>` (constant-time comparison).
-async fn require_operator(State(state): State<AppState>, request: Request, next: Next) -> Response {
-    let presented = request
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .unwrap_or_default();
-    let expected = state.config.operator_token.expose();
-    if bool::from(presented.as_bytes().ct_eq(expected)) {
-        next.run(request).await
-    } else {
-        ApiError::unauthorized().into_response()
-    }
+/// `/v1` opens to either credential — the operator token or a session — through
+/// `auth::require_actor`; each handler's `authorize` call names the `Act` the role
+/// matrix demands (D-018, D-021).
+/// The three auth gates (D-021): sign-in is public; `Session` routes need a signed-in
+/// person; `actor` routes open to either credential and the handler decides what the actor
+/// may do (an owner manages users).
+fn auth_routes(state: &AppState) -> Router<AppState> {
+    let sign_in = Router::new()
+        .route("/v1/auth/sign-in", post(auth::sign_in))
+        .route("/v1/auth/totp", post(auth::totp))
+        .route("/v1/auth/sign-out", post(auth::sign_out));
+    // Session-only routes (the session middleware adds the CSRF check on mutations).
+    let session = Router::new()
+        .route("/v1/auth/session", get(auth::whoami))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_session,
+        ));
+    let actor = Router::new()
+        .route("/v1/firms/{firm}/users", post(auth::create_user))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_actor,
+        ));
+    Router::<AppState>::new()
+        .merge(sign_in)
+        .merge(session)
+        .merge(actor)
 }
 
 /// The application with its middleware, outermost first: drop the client's request id →
 /// set the server's → propagate it →
 /// trace (method, route, status, latency; never headers or bodies) → catch panics into the
 /// envelope → the overall deadline → shed requests beyond the in-flight limit → body limits.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the route table is one list; splitting it hides which middleware each route sits under"
+)]
 pub fn router(state: AppState) -> Router {
     let request_timeout: Duration = state.config.request_timeout;
     let max_in_flight = state.config.max_in_flight;
@@ -144,14 +163,35 @@ pub fn router(state: AppState) -> Router {
             "/v1/firms/{firm}/profiles/{name}",
             get(handlers::get_profile),
         )
+        .route(
+            "/v1/firms/{firm}/clients/{client}/review-queue",
+            get(review::queue),
+        )
+        .route(
+            "/v1/firms/{firm}/clients/{client}/matches/{match}/approve",
+            post(review::approve),
+        )
+        .route(
+            "/v1/firms/{firm}/clients/{client}/matches/{match}/reject",
+            post(review::reject),
+        )
+        .route(
+            "/v1/firms/{firm}/clients/{client}/lines/{line}/exclude",
+            post(review::exclude),
+        )
+        .route(
+            "/v1/firms/{firm}/clients/{client}/lines/{line}/manual-match",
+            post(review::manual_match),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
-            require_operator,
+            crate::auth::require_actor,
         ));
     Router::new()
         .route("/healthz", get(handlers::healthz))
         .route("/readyz", get(handlers::readyz))
         .merge(v1)
+        .merge(auth_routes(&state))
         .fallback(handlers::fallback)
         .layer(DefaultBodyLimit::max(JSON_BODY_LIMIT))
         .layer(
