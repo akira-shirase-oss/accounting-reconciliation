@@ -11,6 +11,11 @@
 #                                          statement each cut into 5 files overlapping by
 #                                          7 days: about 1,200,000 rows read, the overlap
 #                                          rows duplicates); MODE=smoke: 20 accounts
+#   MODE=full  scripts/load.sh r2-match    1,000,000 lines decided (200 clients x one
+#                                          gen-v3 month of 5,000 lines + ~5,500 documents:
+#                                          statement, documents, matching job, outcome
+#                                          checked against the truth file); MODE=smoke:
+#                                          10 clients x 1,000 lines
 #
 # Every result records the machine, the commit (and whether the tree was dirty) and the
 # load average before and after: a run on a busy machine is visibly a busy-machine
@@ -19,9 +24,9 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-scenario="${1:?usage: MODE=full|smoke scripts/load.sh r0-import|r1-import}"
+scenario="${1:?usage: MODE=full|smoke scripts/load.sh r0-import|r1-import|r2-match}"
 case "$scenario" in
-  r0-import | r1-import) ;;
+  r0-import | r1-import | r2-match) ;;
   *) echo "error: unknown scenario $scenario" >&2; exit 2 ;;
 esac
 mode="${MODE:-smoke}"
@@ -43,7 +48,10 @@ cleanup() {
 trap cleanup EXIT
 
 if [ "$(uname -s)" = "Darwin" ]; then
-  machine="$(sysctl -n machdep.cpu.brand_string), $(sysctl -n hw.ncpu) cores, $(( $(sysctl -n hw.memsize) / 1073741824 )) GiB, macOS $(sw_vers -productVersion)"
+  cpu="$(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo "unknown cpu")"
+  cores="$(sysctl -n hw.ncpu 2>/dev/null || echo "?")"
+  mem="$(( $(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1073741824 ))"
+  machine="$cpu, $cores cores, $mem GiB, macOS $(sw_vers -productVersion 2>/dev/null || echo "?")"
 else
   machine="$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | xargs), $(nproc) cores, $(( $(grep MemTotal /proc/meminfo | awk '{print $2}') / 1048576 )) GiB, $(uname -sr)"
 fi
