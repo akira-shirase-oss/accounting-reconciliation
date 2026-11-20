@@ -12,6 +12,7 @@
 pub mod auth;
 pub mod decisions;
 pub mod error;
+pub mod explain;
 pub mod imports;
 pub mod matching;
 pub mod periods;

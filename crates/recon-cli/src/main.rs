@@ -10,9 +10,10 @@ use std::str::FromStr as _;
 
 use recon_db::roles;
 use recon_domain::anchor::Anchor;
-use recon_domain::{ClientId, Currency, Date, FirmId};
+use recon_domain::{ClientId, Currency, Date, FirmId, Money};
 use sqlx::Connection as _;
 use sqlx::postgres::PgConnectOptions;
+use uuid::Uuid;
 
 fn flag(args: &[String], name: &str) -> Option<String> {
     args.iter()
@@ -59,6 +60,7 @@ Operating the server:
                                         verify every client's decision chain
   recon audit anchor FIRM --out FILE    sign and append every verified chain head
   recon audit replay FIRM               replay the decision log against the stored state
+  recon explain line LINE [--json]      explain every decision that gave a line its state
   recon gen statement --seed N --lines N [--currency CODE] [--start YYYY-MM-DD] [--days N]
                                         a seeded test statement on stdout
 
@@ -183,6 +185,18 @@ Environment: RECON_DATABASE_URL. Exit status: 0 equal; 3 a mismatch, named.
 ",
     ),
     (
+        "explain line",
+        r"recon explain line LINE [--json]
+
+Explains how LINE got its state: the line's facts, every decision in its chain touching
+the line, the matches covering it and the import that brought it (in order, with actor,
+reason and evidence), each match's tier and state, and the exception it waits in. A
+person actor is named by email.
+
+Environment: RECON_DATABASE_URL. Exit status: 0 explained; 4 no such line.
+",
+    ),
+    (
         "gen statement",
         r"recon gen statement --seed N --lines N [--currency CODE] [--start YYYY-MM-DD] [--days N]
 
@@ -218,6 +232,7 @@ async fn run(args: &[String]) -> anyhow::Result<ExitCode> {
         ["audit", "verify"] => verify(args).await,
         ["audit", "anchor"] => anchor(args).await,
         ["audit", "replay"] => replay(args).await,
+        ["explain", "line"] => explain(args).await,
         ["gen", "statement"] => gen_statement(args),
         ["import", "check"] => import_check(args),
         ["profile", "check"] => profile_check(args),
@@ -539,6 +554,185 @@ async fn replay(args: &[String]) -> anyhow::Result<ExitCode> {
             Ok(ExitCode::from(3))
         }
     }
+}
+
+async fn explain(args: &[String]) -> anyhow::Result<ExitCode> {
+    let raw = args
+        .get(2)
+        .filter(|a| !a.starts_with("--"))
+        .context("which line? usage: recon explain line LINE [--json]")?;
+    let line: Uuid = raw
+        .parse()
+        .context("the line id is not a UUID; usage: recon explain line LINE [--json]")?;
+    let pool = recon_db::connect_lazy(
+        &env("RECON_DATABASE_URL")?,
+        &recon_db::PoolSettings::default(),
+    )?;
+    let Some(x) = recon_db::explain::line(&pool, line).await? else {
+        println!("no such line: {line}");
+        return Ok(ExitCode::from(4));
+    };
+    if args.iter().any(|a| a == "--json") {
+        println!("{}", serde_json::to_string_pretty(&explain_json(&x))?);
+    } else {
+        print!("{}", explain_text(&x));
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// The actor as an accountant reads it: a person by email, a rule by `rule:{id}@v{n}`,
+/// the engine by its version.
+fn explain_actor(
+    x: &recon_db::explain::LineExplanation,
+    d: &recon_db::explain::ExplainedDecision,
+) -> String {
+    if matches!(d.actor_kind.as_str(), "person" | "approval")
+        && let Some(email) = d
+            .actor_ref
+            .parse::<Uuid>()
+            .ok()
+            .and_then(|id| x.people.get(&id))
+    {
+        return format!("{} {email}", d.actor_kind);
+    }
+    if d.actor_ref.starts_with(&format!("{}:", d.actor_kind)) {
+        return d.actor_ref.clone();
+    }
+    format!("{} {}", d.actor_kind, d.actor_ref)
+}
+
+fn explain_text(x: &recon_db::explain::LineExplanation) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(out, "line {}", x.id);
+    let _ = writeln!(
+        out,
+        "  {} ({}) · {} ({})",
+        x.client_name,
+        x.client.as_uuid(),
+        x.account_name,
+        x.account.as_uuid()
+    );
+    let _ = writeln!(
+        out,
+        "  row {} of import {} · booked {} · {}",
+        x.row_no, x.import, x.booking_date, x.amount
+    );
+    let mut facts = format!("  \"{}\"", x.narration_raw);
+    if let Some(r) = &x.reference {
+        let _ = write!(facts, " · ref {r}");
+    }
+    if let Some(c) = &x.counterparty_raw {
+        let _ = write!(facts, " · counterparty {c}");
+    }
+    let _ = writeln!(out, "{facts}");
+    let _ = writeln!(out, "  status {} · row version {}", x.status, x.row_version);
+    let _ = writeln!(out, "decisions, in chain order:");
+    for d in &x.decisions {
+        let subject = if d.subject_kind == "line" {
+            "line".to_owned()
+        } else {
+            format!("{} {}", d.subject_kind, d.subject_id)
+        };
+        let _ = writeln!(
+            out,
+            "  seq {} · {} · {} · {} → {} · {} · {}",
+            d.seq,
+            d.decided_at,
+            subject,
+            d.from_state.as_deref().unwrap_or("—"),
+            d.to_state,
+            explain_actor(x, d),
+            d.reason_code
+        );
+        let _ = writeln!(out, "    evidence {}", String::from_utf8_lossy(&d.evidence));
+    }
+    for m in &x.matches {
+        let score = m
+            .score
+            .map_or("unscored".to_owned(), |s| format!("score {s}"));
+        let allocated = Money::new(m.allocated_minor, x.amount.currency()).map_or_else(
+            |_| format!("{} minor", m.allocated_minor),
+            |a| a.to_string(),
+        );
+        let _ = writeln!(
+            out,
+            "match {} · {} · {} · {} · allocated {allocated}",
+            m.id, m.tier, m.status, score
+        );
+    }
+    match &x.exception {
+        Some(e) => {
+            let ack = match (e.acknowledged_by, &e.acknowledged_at) {
+                (Some(by), Some(at)) => format!(
+                    "acknowledged by {} at {at}",
+                    x.people.get(&by).map_or(&*by.to_string(), String::as_str)
+                ),
+                _ => "unacknowledged".to_owned(),
+            };
+            let _ = writeln!(out, "exception: {} · {ack}", e.kind);
+        }
+        None => {
+            let _ = writeln!(out, "exception: none");
+        }
+    }
+    out
+}
+
+fn explain_json(x: &recon_db::explain::LineExplanation) -> serde_json::Value {
+    serde_json::json!({
+        "line": {
+            "id": x.id,
+            "firm_id": x.firm.as_uuid(),
+            "client_id": x.client.as_uuid(),
+            "client": x.client_name,
+            "account_id": x.account.as_uuid(),
+            "account": x.account_name,
+            "import_id": x.import,
+            "row_no": x.row_no,
+            "booking_date": x.booking_date,
+            "value_date": x.value_date,
+            "amount_minor": x.amount.minor(),
+            "currency": x.amount.currency().code(),
+            "amount": x.amount.to_string(),
+            "narration": x.narration_raw,
+            "reference": x.reference,
+            "counterparty": x.counterparty_raw,
+            "status": x.status,
+            "row_version": x.row_version,
+        },
+        "matches": x.matches.iter().map(|m| serde_json::json!({
+            "id": m.id,
+            "tier": m.tier,
+            "status": m.status,
+            "score": m.score,
+            "allocated_minor": m.allocated_minor,
+        })).collect::<Vec<_>>(),
+        "exception": x.exception.as_ref().map(|e| serde_json::json!({
+            "kind": e.kind,
+            "candidates": e.candidates,
+            "acknowledged_by": e.acknowledged_by.map(|by| x
+                .people
+                .get(&by)
+                .map_or(by.to_string(), Clone::clone)),
+            "acknowledged_at": e.acknowledged_at,
+        })),
+        "decisions": x.decisions.iter().map(|d| serde_json::json!({
+            "seq": d.seq,
+            "subject_kind": d.subject_kind,
+            "subject_id": d.subject_id,
+            "from_state": d.from_state,
+            "to_state": d.to_state,
+            "actor_kind": d.actor_kind,
+            "actor": explain_actor(x, d),
+            "reason_code": d.reason_code,
+            "engine_version": d.engine_version,
+            "decided_at": d.decided_at,
+            "evidence": serde_json::from_slice::<serde_json::Value>(&d.evidence)
+                .unwrap_or_else(|_| serde_json::Value::String(
+                    String::from_utf8_lossy(&d.evidence).into_owned())),
+        })).collect::<Vec<_>>(),
+    })
 }
 
 fn gen_statement(args: &[String]) -> anyhow::Result<ExitCode> {

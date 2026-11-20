@@ -37,6 +37,7 @@ fn help_lists_every_command_and_explains_each_one() {
             "db drop",
             "audit verify",
             "audit anchor",
+            "explain line",
         ] {
             assert!(text.contains(command), "{args:?} lacks {command}");
         }
@@ -49,6 +50,7 @@ fn help_lists_every_command_and_explains_each_one() {
         "audit verify",
         "audit anchor",
         "audit replay",
+        "explain line",
         "gen statement",
     ] {
         let words: Vec<&str> = topic.split(' ').collect();
