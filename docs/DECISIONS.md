@@ -885,6 +885,38 @@ conservative side.
   (`server_shed_responses`) separately from errors — a shed is measured, never
   called lost work and never called an error unless it outlives the retry bound.
   A `503` past the bound still answers as an error: persistent shedding is.
+- **D-076 — Rules and periods (migration 0011).** D-015's contract as typed
+  data: a `RulePredicate` is clauses over normalized fields — narration
+  (`equals`, `contains`, `starts_with`, `token_equals`, `regex`),
+  counterparty, amount range, account, document kind — and a `RuleAction`
+  (`assign_counterparty`, `exclude` with a reason code,
+  `prefer_document_kind`); a regex compiles only into a Thompson NFA run by
+  the linear-time PikeVM, capped at 10 KiB of compiled program
+  (`regex-automata`, already in the tree — no backtracking engine, no new
+  `regex` dependency). Stored values are normalized to the lines' own form
+  at write, and again at compile. A version moves `proposed` → `approved`
+  or `withdrawn` exactly once; `RCR01` refuses any content change, `RCR02`
+  any status move without its decision. `auto_apply` lives on the version,
+  exists only on `exclude`, and only the owner's mark sets it — refused in
+  the API before the database ever sees it. Automatic exclusions run inside
+  the import's own flip transaction: each matched line lands `excluded`
+  with a decision whose actor is `rule:{id}@v{n}` — atomic with the publish
+  it rode in on, so a crash mid-flip still leaves each line decided or
+  invisible. A period is client × account × month, `open` → `closed` →
+  `reopened`; `close` refuses by named count (`period_has_undecided_lines`,
+  `period_has_unacknowledged_exceptions`) and otherwise records the month's
+  decision digest and chain head on the period. The database locks the
+  month itself (`RCP02` refuses line writes, `RCP03` period state moves,
+  `RCP04` a move without its decision): an import into a closed month is
+  discarded `period_closed` with its decision and the upload answers `409
+  period_closed`; review mutations pre-check and answer the same named
+  refusal; `acknowledge` marks an exception in place — the line stays an
+  exception, the acknowledgement is the decision close needs. Re-evaluation
+  is bounded (500 rules, capped proposals) and only ever returns a diff —
+  a `re_evaluated` decision on the period, never a commit; a closed month
+  refuses it until the owner reopens the month with a reason, which is
+  itself a decision. Cost: a rule and a close are each a named act with a
+  named actor; nothing rewrites either silently.
 
 ## Open questions (blocked on the maintainer or an outside party)
 

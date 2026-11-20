@@ -14,11 +14,13 @@ pub mod decisions;
 pub mod error;
 pub mod imports;
 pub mod matching;
+pub mod periods;
 pub mod pool;
 pub mod profiles;
 pub mod replay;
 pub mod review;
 pub mod roles;
+pub mod rules;
 pub mod tenancy;
 #[cfg(feature = "test-support")]
 pub mod testing;

@@ -31,10 +31,15 @@ fn body<T>(payload: Result<Json<T>, JsonRejection>) -> Result<T, ApiError> {
     })
 }
 
-fn review_error(e: ReviewError) -> ApiError {
+pub(crate) fn review_error(e: ReviewError) -> ApiError {
     match e {
         ReviewError::NotFound => ApiError::not_found(),
         ReviewError::Conflict(message) => ApiError::new(StatusCode::CONFLICT, "conflict", message),
+        ReviewError::PeriodClosed => ApiError::new(
+            StatusCode::CONFLICT,
+            "period_closed",
+            "the line's period is closed",
+        ),
         ReviewError::Refused(message) => {
             ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, "refused", message)
         }

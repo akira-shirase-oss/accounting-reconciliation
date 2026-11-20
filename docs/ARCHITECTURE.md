@@ -61,8 +61,9 @@ record what R0 decided while building, D-060 to D-069 what R1 decided.
   amounts, plus named residuals; balanced exactly; status `proposed` →
   `committed` → `suspended` or `reversed`.
 - **Rule** and immutable **rule versions**: typed predicates over normalized
-  fields with an action (assign counterparty, set a match tier, exclude
-  with a reason); who proposed it, who approved it, from which correction.
+  fields with an action (assign counterparty, exclude with a reason,
+  prefer a document kind); who proposed it, who approved it, from which
+  correction.
 - **Period**: client × account × month, `open` → `closed` → `reopened`.
 - **Proposal**: the engine's or the model's suggestion, its candidate set,
   score breakdown or model answer, validation result and its decision.

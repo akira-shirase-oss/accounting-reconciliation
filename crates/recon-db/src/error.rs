@@ -44,6 +44,10 @@ pub enum DbError {
     /// emptied by a crash): the flip refuses rather than publish a partial import.
     #[error("staged rows are missing; the import was not published")]
     StagingIncomplete,
+    /// The file's lines would land in a closed period: the import stays `staging` until
+    /// an owner reopens the month or the file is replaced (D-015).
+    #[error("the file's lines fall in a closed period")]
+    PeriodClosed,
     /// The database could not be reached in time (pool timeout, connection refused, I/O).
     #[error("database unavailable")]
     Unavailable(#[source] sqlx::Error),
@@ -87,7 +91,7 @@ impl DbError {
 }
 
 /// The schema's custom SQLSTATEs and their names.
-const GUARDS: [(&str, &str); 23] = [
+const GUARDS: [(&str, &str); 28] = [
     ("RCA01", "decision_log_append_only"),
     ("RCA02", "no_decision_chain"),
     ("RCA03", "decision_already_recorded"),
@@ -111,6 +115,11 @@ const GUARDS: [(&str, &str); 23] = [
     ("RCM02", "match_needs_its_decision"),
     ("RCM03", "allocation_refused"),
     ("RCD03", "document_bookkeeping_refused"),
+    ("RCP02", "period_closed"),
+    ("RCP03", "period_immutable"),
+    ("RCP04", "period_needs_its_decision"),
+    ("RCR01", "rule_immutable"),
+    ("RCR02", "rule_needs_its_decision"),
 ];
 
 impl From<sqlx::Error> for DbError {
@@ -128,6 +137,10 @@ impl From<sqlx::Error> for DbError {
                     .code()
                     .map(std::borrow::Cow::into_owned)
                     .unwrap_or_default();
+                // The closed-period lock names its variant whichever layer trips it.
+                if code == "RCP02" {
+                    return Self::PeriodClosed;
+                }
                 if let Some((_, name)) = GUARDS.iter().find(|(c, _)| *c == code) {
                     return Self::Refused(name);
                 }

@@ -21,6 +21,7 @@ pub mod line;
 pub mod matching;
 pub mod money;
 pub mod refusal;
+pub mod rule;
 pub mod text;
 
 pub use auth::{Act, Role};

@@ -889,6 +889,31 @@ async fn flip_statement<H: FlipHook>(
         let earlier = get(pool, import.firm, ImportId::from_uuid(existing)).await?;
         return Ok(FlipOutcome::DuplicateFile(earlier));
     }
+    // A file whose lines would land in a closed month is refused by name (D-015): the
+    // import is discarded with its decision and may be re-uploaded once an owner
+    // reopens the period. The schema's line lock is the backstop; this names it.
+    let sql = format!(
+        "SELECT EXISTS(
+             SELECT 1 FROM {} s
+               JOIN recon.periods p
+                 ON p.firm_id = $1 AND p.client_id = $2 AND p.account_id = $3
+                AND p.month = date_trunc('month', s.booking_date)::date
+                AND p.status = 'closed'
+              WHERE s.firm_id = $1 AND s.import_id = $4)",
+        staging_table(import.kind())
+    );
+    let hits_closed: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+        .bind(dest.firm.as_uuid())
+        .bind(dest.client.as_uuid())
+        .bind(dest.account.as_uuid())
+        .bind(import.id.as_uuid())
+        .fetch_one(&mut *tx)
+        .await?;
+    if hits_closed {
+        drop(tx);
+        discard_for(pool, import, DiscardReason::PeriodClosed, actor).await?;
+        return Err(DbError::PeriodClosed);
+    }
     let plan = plan(&mut tx, dest, Rows::Staged).await?;
     if plan.removed > 0 {
         hold(&mut tx, &import, dest, summary, &plan, actor).await?;
@@ -902,6 +927,9 @@ async fn flip_statement<H: FlipHook>(
     let published = insert_lines(&mut tx, dest, Rows::Staged, rows_read).await?;
     hook.reached(FlipPoint::LinesInserted).await;
     delete_staging(&mut tx, &import).await?;
+    // Approved rules marked automatic by an owner exclude their lines in place,
+    // each with its rule decision (D-015) — before the import's own decision.
+    crate::rules::apply_exclusions(&mut tx, dest.firm, dest.client, import.id.as_uuid()).await?;
     let completion = Completion {
         summary_rows: summary.rows_read,
         file_hash: summary.file_hash,

@@ -147,6 +147,11 @@ impl ApiError {
                 "a matching job is already running for this client",
             )
             .retry_after(2),
+            DbError::PeriodClosed => Self::new(
+                StatusCode::CONFLICT,
+                "period_closed",
+                "the line's period is closed",
+            ),
             DbError::NotARevision => Self::new(
                 StatusCode::CONFLICT,
                 "not_a_revision",

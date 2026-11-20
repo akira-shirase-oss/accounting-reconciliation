@@ -127,6 +127,9 @@ pub enum DiscardReason {
     AccountBusy,
     /// A person rejected the revision this import was held as (D-009).
     RevisionRejected,
+    /// Its lines would land in a closed period (D-015); upload again after an owner
+    /// reopens the month.
+    PeriodClosed,
 }
 
 impl DiscardReason {
@@ -138,6 +141,7 @@ impl DiscardReason {
             Self::UploadFailed => "upload_failed",
             Self::AccountBusy => "account_busy",
             Self::RevisionRejected => "revision_rejected",
+            Self::PeriodClosed => "period_closed",
         }
     }
 }

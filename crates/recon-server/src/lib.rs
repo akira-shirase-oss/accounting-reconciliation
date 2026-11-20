@@ -12,6 +12,7 @@ pub mod handlers;
 pub mod matching;
 pub mod profiles;
 pub mod review;
+pub mod rules_periods;
 pub mod serve;
 pub mod state;
 pub mod tasks;
@@ -176,6 +177,42 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/v1/firms/{firm}/clients/{client}/lines/{line}/manual-match",
             post(review::manual_match),
+        )
+        .route(
+            "/v1/firms/{firm}/clients/{client}/lines/{line}/acknowledge",
+            post(rules_periods::acknowledge),
+        )
+        .route(
+            "/v1/firms/{firm}/clients/{client}/rules",
+            get(rules_periods::list_rules).post(rules_periods::create_rule),
+        )
+        .route(
+            "/v1/firms/{firm}/clients/{client}/rules/{rule}/versions",
+            post(rules_periods::propose_version),
+        )
+        .route(
+            "/v1/firms/{firm}/clients/{client}/rules/{rule}/versions/{version}/approve",
+            post(rules_periods::approve_version),
+        )
+        .route(
+            "/v1/firms/{firm}/clients/{client}/rules/{rule}/retire",
+            post(rules_periods::retire_rule),
+        )
+        .route(
+            "/v1/firms/{firm}/clients/{client}/accounts/{account}/periods",
+            get(rules_periods::list_periods),
+        )
+        .route(
+            "/v1/firms/{firm}/clients/{client}/accounts/{account}/periods/{month}/close",
+            post(rules_periods::close_period),
+        )
+        .route(
+            "/v1/firms/{firm}/clients/{client}/accounts/{account}/periods/{month}/reopen",
+            post(rules_periods::reopen_period),
+        )
+        .route(
+            "/v1/firms/{firm}/clients/{client}/accounts/{account}/periods/{month}/re-evaluate",
+            post(rules_periods::re_evaluate),
         )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),

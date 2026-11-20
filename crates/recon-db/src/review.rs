@@ -28,9 +28,50 @@ pub enum ReviewError {
     /// A semantic refusal the caller can fix (422).
     #[error("{0}")]
     Refused(&'static str),
+    /// The subject's period is closed — an owner must reopen it first (D-015).
+    #[error("the line's period is closed")]
+    PeriodClosed,
     /// The database itself.
     #[error(transparent)]
     Db(#[from] DbError),
+}
+
+/// `true` when any of `lines` falls in a closed period (the schema's own lock is the
+/// backstop; this names the refusal for the caller).
+async fn any_period_closed(
+    tx: &mut Transaction<'_, Postgres>,
+    firm: FirmId,
+    lines: &[Uuid],
+) -> Result<bool, ReviewError> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1 FROM recon.statement_lines l
+               JOIN recon.periods p
+                 ON p.firm_id = l.firm_id AND p.client_id = l.client_id
+                AND p.account_id = l.account_id
+                AND p.month = date_trunc('month', l.booking_date)::date
+                AND p.status = 'closed'
+              WHERE l.firm_id = $1 AND l.id = ANY($2))",
+    )
+    .bind(firm.as_uuid())
+    .bind(lines)
+    .fetch_one(&mut **tx)
+    .await?)
+}
+
+/// The line ids a match covers.
+async fn match_lines(
+    tx: &mut Transaction<'_, Postgres>,
+    firm: FirmId,
+    match_id: Uuid,
+) -> Result<Vec<Uuid>, ReviewError> {
+    Ok(sqlx::query_scalar(
+        "SELECT line_id FROM recon.match_lines WHERE firm_id = $1 AND match_id = $2",
+    )
+    .bind(firm.as_uuid())
+    .bind(match_id)
+    .fetch_all(&mut **tx)
+    .await?)
 }
 
 impl From<sqlx::Error> for ReviewError {
@@ -291,6 +332,10 @@ pub async fn approve(
     let m = lock_match(&mut tx, firm, client, match_id)
         .await?
         .ok_or(ReviewError::NotFound)?;
+    let covered = match_lines(&mut tx, firm, match_id).await?;
+    if any_period_closed(&mut tx, firm, &covered).await? {
+        return Err(ReviewError::PeriodClosed);
+    }
     still_proposed(&m, expected_version)?;
 
     let evidence_body = evidence(&ReviewEvidence {
@@ -427,6 +472,10 @@ pub async fn reject(
     let m = lock_match(&mut tx, firm, client, match_id)
         .await?
         .ok_or(ReviewError::NotFound)?;
+    let covered = match_lines(&mut tx, firm, match_id).await?;
+    if any_period_closed(&mut tx, firm, &covered).await? {
+        return Err(ReviewError::PeriodClosed);
+    }
     still_proposed(&m, expected_version)?;
     let moved = sqlx::query(
         "UPDATE recon.matches SET status = 'rejected', row_version = row_version + 1
@@ -543,6 +592,9 @@ pub async fn exclude(
     .ok_or(ReviewError::NotFound)?;
     let status: String = row.try_get("status")?;
     let version: i64 = row.try_get("row_version")?;
+    if any_period_closed(&mut tx, firm, &[line.as_uuid()]).await? {
+        return Err(ReviewError::PeriodClosed);
+    }
     if status == "proposed" {
         return Err(ReviewError::Refused(
             "the line has a proposal; decide the match first",
@@ -630,6 +682,9 @@ pub async fn manual_match(
     .await?
     .ok_or(ReviewError::NotFound)?;
     let status: String = row.try_get("status")?;
+    if any_period_closed(&mut tx, firm, &[line.as_uuid()]).await? {
+        return Err(ReviewError::PeriodClosed);
+    }
     if !matches!(status.as_str(), "unreviewed" | "exception") {
         return Err(ReviewError::Conflict(
             "only an unreviewed or exception line takes a manual match",
@@ -821,4 +876,76 @@ pub async fn manual_match(
         match_id,
         line_version,
     })
+}
+
+/// A reviewer acknowledges `line`'s exception in place (D-006: a period closes only
+/// once every exception carries a reviewer's acknowledgement). The line stays an
+/// exception — its kind is the history; the acknowledgement is a decision on it.
+pub async fn acknowledge(
+    pool: &PgPool,
+    firm: FirmId,
+    client: ClientId,
+    line: LineId,
+    user: Uuid,
+) -> Result<(), ReviewError> {
+    let mut tx = pool.begin().await?;
+    let status = sqlx::query_scalar::<_, String>(
+        "SELECT status FROM recon.statement_lines
+          WHERE firm_id = $1 AND client_id = $2 AND id = $3 FOR UPDATE",
+    )
+    .bind(firm.as_uuid())
+    .bind(client.as_uuid())
+    .bind(line.as_uuid())
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(ReviewError::NotFound)?;
+    if any_period_closed(&mut tx, firm, &[line.as_uuid()]).await? {
+        return Err(ReviewError::PeriodClosed);
+    }
+    if status != "exception" {
+        return Err(ReviewError::Conflict("only an exception is acknowledged"));
+    }
+    let marked = sqlx::query(
+        "UPDATE recon.line_exceptions
+            SET acknowledged_by = $3, acknowledged_at = now()
+          WHERE firm_id = $1 AND line_id = $2 AND acknowledged_at IS NULL",
+    )
+    .bind(firm.as_uuid())
+    .bind(line.as_uuid())
+    .bind(user)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if marked == 0 {
+        return Err(ReviewError::Conflict(
+            "the exception was already acknowledged",
+        ));
+    }
+    let kind: String = sqlx::query_scalar(
+        "SELECT kind FROM recon.line_exceptions WHERE firm_id = $1 AND line_id = $2",
+    )
+    .bind(firm.as_uuid())
+    .bind(line.as_uuid())
+    .fetch_one(&mut *tx)
+    .await?;
+    let body = evidence(&serde_json::json!({
+        "subject": line.as_uuid(),
+        "by": user,
+        "kind": kind,
+    }))?;
+    decide(
+        &mut tx,
+        firm,
+        client,
+        SubjectKind::Line,
+        line.as_uuid(),
+        Some("exception"),
+        "exception",
+        user,
+        "exception_acknowledged",
+        &body,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(())
 }
