@@ -109,7 +109,12 @@ The unit is one review request on the shared queue — a queue read or a
 decision; the full run's bar is at least 1,000,000 such requests (the
 workspace standard restated in the scenario's unit). Each client is seeded
 exactly as `r2-match` (a `gen-v3` month, its matching job drained — full:
-80 clients x 5,000 lines, smoke: 8 x 800), then `RECON_LOAD_REVIEWERS`
+80 clients x 12,500 lines = 1,000,000 lines, smoke: 8 x 800). The shape is
+asserted before anything is seeded: requests are emergent (queue reads,
+decisions, contention retries — 1.74 per line on run 44733750521, 3.39 on
+a smoke), and a full shape must clear a conservative 1.25 requests-per-line
+floor against the bar, so a too-small shape fails in seconds. Then
+`RECON_LOAD_REVIEWERS`
 (default 64, smoke included) real reviewers — created by the operator,
 TOTP-enrolled and signed in over the public auth routes — work every
 client's queue concurrently: approve or reject the proposed matches,

@@ -83,7 +83,7 @@ impl Plan {
         let (clients, files, lines) = match (scenario.as_str(), mode.as_str()) {
             ("r2-match", "full") => (200, 1, 5_000),
             ("r2-match", "smoke") => (10, 1, 1_000),
-            ("r3-review", "full") => (80, 1, 5_000),
+            ("r3-review", "full") => (80, 1, 12_500),
             ("r3-review", "smoke") => (8, 1, 800),
             (_, "full") => (200, 5, 1_000),
             (_, "smoke") => (20, 5, 500),
@@ -94,6 +94,22 @@ impl Plan {
             .ok()
             .and_then(|c| c.parse().ok())
             .unwrap_or(clients);
+        // The full review run's bar is 1,000,000 requests (END_GOAL's evidence plan).
+        // Requests are emergent — queue reads, decisions, contention retries — so the
+        // shape is asserted against the scenario's measured floor: run 44733750521
+        // issued 1.74 requests per line at 400,000 lines (and a smoke runs denser,
+        // 3.39) — 1.25 is the conservative bound the full shape must clear, so a
+        // too-small shape fails in seconds, before anything is seeded.
+        if scenario == "r3-review" && mode == "full" {
+            let total = u64::try_from(clients * files).unwrap_or(0) * u64::from(lines);
+            let floor = total as f64 * 1.25;
+            anyhow::ensure!(
+                floor >= 1_000_000.0,
+                "the r3-review full shape ({clients} clients × {files} file × {lines} \
+                 lines each = {total} lines) floors at {floor:.0} requests — under the \
+                 1,000,000 request bar; raise the shape"
+            );
+        }
         Ok(Self {
             scenario,
             mode,
@@ -152,6 +168,13 @@ async fn peak_rss(_pid: u32) -> Option<u64> {
     None
 }
 
+/// Transport retries the whole run made — the server's per-connection bounds close
+/// idle keep-alives (`serve.rs`'s `ConnectionLimits`), and a pooled request can land
+/// exactly on the close. Every mutating route is decision-idempotent, so one retry
+/// answers a counted `409`, never a duplicate decision — and the retry is recorded,
+/// never silent. A timeout is *not* retried: the server may still be working.
+static TRANSPORT_RETRIES: AtomicUsize = AtomicUsize::new(0);
+
 /// The backpressure contract (D-075): a `503` is the server's honest "busy" and
 /// always carries `Retry-After` — the client sleeps it and retries, and every shed
 /// response is counted, never called an error. Only a request still shed after the
@@ -161,27 +184,33 @@ async fn send(
     shed: &AtomicUsize,
 ) -> Result<reqwest::Response, reqwest::Error> {
     let mut sheds = 0_u32;
+    let mut retried = false;
     loop {
         // The clone keeps `req` alive for the next attempt; an unclonable body
         // (a stream) is sent once — there is no honest retry for it.
         let Some(builder) = req.try_clone() else {
             return req.send().await;
         };
-        let r = builder.send().await;
-        let wait = match &r {
+        match builder.send().await {
             Ok(resp) if resp.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE && sheds < 20 => {
-                resp.headers()
+                let wait = resp
+                    .headers()
                     .get(reqwest::header::RETRY_AFTER)
                     .and_then(|v| v.to_str().ok())
                     .and_then(|v| v.parse::<u64>().ok())
                     .unwrap_or(1)
-                    .clamp(1, 30)
+                    .clamp(1, 30);
+                sheds += 1;
+                shed.fetch_add(1, Ordering::Relaxed);
+                tokio::time::sleep(Duration::from_secs(wait)).await;
             }
-            _ => return r,
-        };
-        sheds += 1;
-        shed.fetch_add(1, Ordering::Relaxed);
-        tokio::time::sleep(Duration::from_secs(wait)).await;
+            Ok(resp) => return Ok(resp),
+            Err(e) if !retried && !e.is_timeout() => {
+                retried = true;
+                TRANSPORT_RETRIES.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(e) => return Err(e),
+        }
     }
 }
 
@@ -351,7 +380,10 @@ async fn main() -> anyhow::Result<()> {
             .await?;
 
     let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(120))
+        // Longer than the server's own request deadline (RECON_REQUEST_TIMEOUT_MS,
+        // default 150 s — the spawned server inherits it), so a genuinely slow
+        // request answers with a real status instead of a client-side timeout.
+        .timeout(Duration::from_secs(180))
         .build()?;
     // Every 503 the server sheds, counted across the whole run (D-075).
     let shed = Arc::new(AtomicUsize::new(0));
@@ -644,6 +676,7 @@ async fn main() -> anyhow::Result<()> {
                 "max": latencies.last().copied().unwrap_or(0.0).round(),
             },
             "errors": errors.len(),
+            "transport_retries": TRANSPORT_RETRIES.load(Ordering::Relaxed),
             "account_busy_retries": busy.load(Ordering::Relaxed),
             "server_shed_responses": shed.load(Ordering::Relaxed),
             "rows_read": rows_read, "rows_per_s": rows_per_s.round(),
@@ -1158,6 +1191,7 @@ async fn r2_match(
             },
             "jobs_completed": job_latencies.len(), "jobs_failed": jobs_failed,
             "errors": errors.len(),
+            "transport_retries": TRANSPORT_RETRIES.load(Ordering::Relaxed),
             "server_shed_responses": shed.load(Ordering::Relaxed),
             "first_errors": errors.iter().take(5).collect::<Vec<_>>(),
             "jobs_never_admitted": truth.len().saturating_sub(
@@ -1333,8 +1367,33 @@ async fn person_call(
             let body = r.json::<Value>().await.unwrap_or(Value::Null);
             (status, body, sent.elapsed().as_secs_f64() * 1_000.0)
         }
-        Err(_) => (0, Value::Null, sent.elapsed().as_secs_f64() * 1_000.0),
+        // Status 0 carries the transport error's kind and message, so a run's
+        // first_errors classify themselves (timeout, connect, request, ...).
+        Err(e) => {
+            let kind = if e.is_timeout() {
+                "timeout"
+            } else if e.is_connect() {
+                "connect"
+            } else if e.is_request() {
+                "request"
+            } else {
+                "transport"
+            };
+            (
+                0,
+                json!({"transport_error": format!("{kind}: {e}")}),
+                sent.elapsed().as_secs_f64() * 1_000.0,
+            )
+        }
     }
+}
+
+/// The transport detail a status-0 answer carries; empty for a real HTTP status.
+fn transport_detail(body: &Value) -> String {
+    body["transport_error"]
+        .as_str()
+        .map(|d| format!(" ({d})"))
+        .unwrap_or_default()
 }
 
 /// The open document nearest the line: same currency, same sign, closest |open| to
@@ -1452,11 +1511,10 @@ async fn reviewer_work(
                     continue;
                 }
                 if status != 200 {
-                    stats
-                        .lock()
-                        .await
-                        .errors
-                        .push(format!("{me} queue {client}: {status}"));
+                    stats.lock().await.errors.push(format!(
+                        "{me} queue {client}: {status}{}",
+                        transport_detail(&body)
+                    ));
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     continue;
                 }
@@ -1484,7 +1542,7 @@ async fn reviewer_work(
                         let doc = pick_document(&pool, &firm, client, amount, &currency)
                             .await
                             .unwrap_or(None);
-                        let (status, _, ms) = match doc {
+                        let (status, body, ms) = match doc {
                             Some((doc, residual)) => {
                                 let residuals = if residual == 0 {
                                     json!([])
@@ -1529,7 +1587,10 @@ async fn reviewer_work(
                             }
                             409 => s.conflicts += 1,
                             422 => s.refusals += 1,
-                            other => s.errors.push(format!("{me} orphan {line}: {other}")),
+                            other => s.errors.push(format!(
+                                "{me} orphan {line}: {other}{}",
+                                transport_detail(&body)
+                            )),
                         }
                         drop(s);
                     }
@@ -1620,7 +1681,7 @@ async fn reviewer_work(
                         )
                     }
                 };
-                let (status, _, ms) =
+                let (status, body, ms) =
                     person_call(&http, &reviewer, "POST", &url, Some(payload), &shed).await;
                 let mut s = stats.lock().await;
                 s.requests += 1;
@@ -1668,7 +1729,9 @@ async fn reviewer_work(
                         }
                         continue;
                     }
-                    other => s.errors.push(format!("{me} {action}: {other}")),
+                    other => s
+                        .errors
+                        .push(format!("{me} {action}: {other}{}", transport_detail(&body))),
                 }
                 drop(s);
             }
@@ -2006,6 +2069,7 @@ async fn r3_review(
             "reauthentications": stats.reauths,
             "action_latency_ms": action_ms,
             "errors": errors.len() + stats.errors.len(),
+            "transport_retries": TRANSPORT_RETRIES.load(Ordering::Relaxed),
             "first_errors": errors.iter().chain(stats.errors.iter()).take(5).collect::<Vec<_>>(),
             "truth_seed": { "t1_matched": m_total, "proposed": p_total, "exception": e_total },
             "database": {
