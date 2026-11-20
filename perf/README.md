@@ -89,8 +89,14 @@ job drive p99 (first cursor to complete; queue time excluded) at most
 pinned set in memory), zero errors — and the capacity target of 2,000
 lines/s, the original bar, recorded in `capacity_target` and reported
 unmet on shared hardware until a dedicated host proves it. The tripwire
-is not capacity. Smoke (10 clients x 1,000 lines): at least 300 lines/s,
-drive p99 at most 60,000 ms.
+is not capacity. The green evidence is CI run 44658108510
+(`perf/results/ci-44658108510/`, commit a7646a9): 200 jobs complete, 0
+failed, 0 errors, 0 duplicate decisions, 700,316 T1-committed matches,
+249,834 proposals, 49,850 line exceptions at 1,794 lines/s (drive p50
+11.2 s, p99 25.6 s) — `capacity_target` unmet there, an observation on
+the shared runner as the file itself says, not a failure. Smoke (10
+clients x 1,000 lines): at least 300 lines/s, drive p99 at most
+60,000 ms.
 
 ```sh
 MODE=full scripts/load.sh r2-match    # perf/results/r2-match-full-<stamp>.json (CI)
