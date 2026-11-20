@@ -34,7 +34,16 @@ fn body<T>(payload: Result<Json<T>, JsonRejection>) -> Result<T, ApiError> {
 pub(crate) fn review_error(e: ReviewError) -> ApiError {
     match e {
         ReviewError::NotFound => ApiError::not_found(),
-        ReviewError::Conflict(message) => ApiError::new(StatusCode::CONFLICT, "conflict", message),
+        ReviewError::Conflict(message, winner) => {
+            let mut error = ApiError::new(StatusCode::CONFLICT, "conflict", message);
+            if let Some(winner) = winner {
+                error = error.with(
+                    "winner",
+                    serde_json::to_value(&winner).unwrap_or(serde_json::Value::Null),
+                );
+            }
+            error
+        }
         ReviewError::PeriodClosed => ApiError::new(
             StatusCode::CONFLICT,
             "period_closed",

@@ -99,6 +99,7 @@ fn now() -> u64 {
         .as_secs()
 }
 
+#[derive(Clone)]
 struct Seed {
     firm: String,
     client: String,
@@ -148,7 +149,22 @@ async fn enrolled(
     seed: &Seed,
     role: &str,
 ) -> (String, String, String) {
-    let email = format!("{role}@example.test");
+    enrolled_tag(state, admin, seed, role, "").await
+}
+
+/// `enrolled` with a distinguishing tag — for tests needing many users of one role.
+async fn enrolled_tag(
+    state: &AppState,
+    admin: &PgPool,
+    seed: &Seed,
+    role: &str,
+    tag: &str,
+) -> (String, String, String) {
+    let email = if tag.is_empty() {
+        format!("{role}@example.test")
+    } else {
+        format!("{role}-{tag}@example.test")
+    };
     let (s, body) = call(
         state,
         operator(post_json(
@@ -343,15 +359,20 @@ async fn line_by_amount(db: &PgPool, seed: &Seed, minor: i64) -> (String, i64) {
     (id.to_string(), version)
 }
 
-/// The concurrent-conflicting-approvals gate: N approvers race one proposed match at
-/// the same row version — exactly one commits, the rest answer 409.
+/// Failure case 7: 32 distinct reviewers race to approve one proposed match at the
+/// same row version — exactly one commits; every loser answers `409 conflict` naming
+/// the winning decision; the document's allocation stays within its amount.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one contract fixture, one concurrent storm, one set of invariants"
+)]
 #[tokio::test]
 async fn concurrent_conflicting_approvals_admit_one() {
     let db = TestDb::new().await;
     let state = checked(&db);
     let seed = seed(&state).await;
     run_reviewable_job(&state, &seed).await;
-    let (token, csrf, _) = enrolled(&state, &db.pool, &seed, "reviewer").await;
+    let (token, _csrf, _) = enrolled(&state, &db.pool, &seed, "reviewer").await;
     let items = queue(&state, &seed, &token).await;
     let proposal = items
         .iter()
@@ -360,16 +381,19 @@ async fn concurrent_conflicting_approvals_admit_one() {
     let match_id = proposal["id"].as_str().unwrap().to_owned();
     let version = proposal["row_version"].as_i64().unwrap();
 
+    // 32 reviewers — the contract's concurrency — each with their own session.
+    let mut reviewers = Vec::with_capacity(32);
+    for n in 0..32 {
+        reviewers.push(enrolled_tag(&state, &db.pool, &seed, "reviewer", &n.to_string()).await);
+    }
     let mut tasks = tokio::task::JoinSet::new();
-    for _ in 0..8 {
+    for (token, csrf, user) in reviewers {
         let state = state.clone();
         let seed_client = seed.client.clone();
         let seed_firm = seed.firm.clone();
-        let token = token.clone();
-        let csrf = csrf.clone();
         let match_id = match_id.clone();
         tasks.spawn(async move {
-            call(
+            let (status, body) = call(
                 &state,
                 session(
                     post_json(
@@ -382,31 +406,44 @@ async fn concurrent_conflicting_approvals_admit_one() {
                     &csrf,
                 ),
             )
-            .await
-            .0
+            .await;
+            (status, body, user)
         });
     }
     let mut ok = 0;
-    let mut conflict = 0;
-    while let Some(status) = tasks.join_next().await {
-        match status.unwrap() {
-            StatusCode::OK => ok += 1,
-            StatusCode::CONFLICT => conflict += 1,
-            other => panic!("an approval answered {other}"),
+    let mut losers = Vec::new();
+    let mut winner_user = String::new();
+    while let Some(outcome) = tasks.join_next().await {
+        let (status, body, user) = outcome.unwrap();
+        match status {
+            StatusCode::OK => {
+                ok += 1;
+                winner_user = user;
+            }
+            StatusCode::CONFLICT => losers.push(body),
+            other => panic!("an approval answered {other}: {body}"),
         }
     }
-    assert_eq!((ok, conflict), (1, 7), "exactly one approval may commit");
+    assert_eq!(
+        (ok, losers.len()),
+        (1, 31),
+        "exactly one approval may commit"
+    );
 
-    let (status, match_status, committed): (String, String, i64) = sqlx::query_as(
+    // The winning decision is the one that moved the match to `committed`.
+    let (status, match_status, committed, decision): (String, String, i64, Uuid) = sqlx::query_as(
         "SELECT m.status, l.status,
-                (SELECT count(*) FROM recon.decision_log d
-                  WHERE d.firm_id = m.firm_id AND d.subject_kind = 'match'
-                    AND d.subject_id = m.id AND d.to_state = 'committed')
-           FROM recon.matches m
-           JOIN recon.statement_lines l ON l.firm_id = m.firm_id
-             AND l.id = (SELECT line_id FROM recon.match_lines ml
-                          WHERE ml.firm_id = m.firm_id AND ml.match_id = m.id LIMIT 1)
-          WHERE m.firm_id = $1 AND m.id = $2",
+                    (SELECT count(*) FROM recon.decision_log d
+                      WHERE d.firm_id = m.firm_id AND d.subject_kind = 'match'
+                        AND d.subject_id = m.id AND d.to_state = 'committed'),
+                    (SELECT d.id FROM recon.decision_log d
+                      WHERE d.firm_id = m.firm_id AND d.subject_kind = 'match'
+                        AND d.subject_id = m.id AND d.to_state = 'committed')
+               FROM recon.matches m
+               JOIN recon.statement_lines l ON l.firm_id = m.firm_id
+                 AND l.id = (SELECT line_id FROM recon.match_lines ml
+                              WHERE ml.firm_id = m.firm_id AND ml.match_id = m.id LIMIT 1)
+              WHERE m.firm_id = $1 AND m.id = $2",
     )
     .bind(Uuid::parse_str(&seed.firm).unwrap())
     .bind(Uuid::parse_str(&match_id).unwrap())
@@ -417,6 +454,247 @@ async fn concurrent_conflicting_approvals_admit_one() {
         (status.as_str(), match_status.as_str(), committed),
         ("committed", "matched", 1)
     );
+
+    // Every loser's 409 names that winning decision — the contract's exact words.
+    for loser in &losers {
+        let error = &loser["error"];
+        assert_eq!(error["code"].as_str().unwrap(), "conflict", "{loser}");
+        let winner = &error["winner"];
+        assert_eq!(
+            winner["decision"].as_str().unwrap(),
+            decision.to_string(),
+            "the 409 names the winning decision: {loser}"
+        );
+        assert_eq!(winner["to_state"].as_str().unwrap(), "committed");
+        assert_eq!(winner["actor_ref"].as_str().unwrap(), winner_user);
+        assert!(winner["seq"].as_i64().unwrap() >= 1, "{loser}");
+    }
+
+    // The document the winning match allocated never exceeds its amount.
+    let (allocated, amount): (i64, i64) = sqlx::query_as(
+        "SELECT d.allocated_minor, d.amount_minor FROM recon.documents d
+          WHERE d.firm_id = $1 AND d.id IN
+                (SELECT md.document_id FROM recon.match_documents md
+                  WHERE md.firm_id = $1 AND md.match_id = $2)",
+    )
+    .bind(Uuid::parse_str(&seed.firm).unwrap())
+    .bind(Uuid::parse_str(&match_id).unwrap())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(allocated, amount, "allocated at most the document amount");
+}
+
+/// Failure case 7's other arm: racing manual matches that would share one line or
+/// over-allocate one document. The schema refuses two live proposals on a line, so
+/// the race is at creation: 16 reviewers on one line, 8+8 on two lines over one
+/// document — one winner per arm, every loser a `409` naming the winning decision,
+/// no document allocated beyond its amount (the raw-SQL half is
+/// `recon_db`'s `documents_refuse_over_allocation_for_raw_sql`).
+#[expect(
+    clippy::too_many_lines,
+    reason = "one contract fixture, one concurrent storm, one set of invariants"
+)]
+#[tokio::test]
+async fn concurrent_manual_matches_share_line_and_document() {
+    let db = TestDb::new().await;
+    let state = checked(&db);
+    let seed = seed(&state).await;
+    let statement = "booking_date,value_date,amount,currency,narration,reference,counterparty,balance_after\n\
+        2026-03-05,,-4.99,USD,SUPPLIER PAYMENT ONE,,Acme Ltd,\n\
+        2026-03-06,,-2.00,USD,SUPPLIER PAYMENT TWO,,Acme Ltd,\n\
+        2026-03-07,,-2.00,USD,SUPPLIER PAYMENT THREE,,Acme Ltd,\n";
+    let (s, body) = call(
+        &state,
+        operator(upload(
+            &format!("/v1/firms/{}/accounts/{}/imports", seed.firm, seed.account),
+            statement,
+        )),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{body}");
+    let documents = "kind,number,issue_date,due_date,amount,currency,counterparty,description\n\
+        purchase_bill,INV-A,2026-03-01,2026-03-31,-4.99,USD,Acme Ltd,\n\
+        purchase_bill,INV-B,2026-03-01,2026-03-31,-2.00,USD,Acme Ltd,\n";
+    let (s, body) = call(
+        &state,
+        operator(upload(
+            &format!(
+                "/v1/firms/{}/clients/{}/document-imports",
+                seed.firm, seed.client
+            ),
+            documents,
+        )),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{body}");
+    let firm = Uuid::parse_str(&seed.firm).unwrap();
+    let client = Uuid::parse_str(&seed.client).unwrap();
+    let (line_a, _) = line_by_amount(&db.pool, &seed, -499).await;
+    // The two -2.00 lines, told apart by booking date.
+    let lines_bc: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM recon.statement_lines
+          WHERE firm_id = $1 AND client_id = $2 AND amount_minor = -200
+          ORDER BY booking_date",
+    )
+    .bind(firm)
+    .bind(client)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    let [line_b, line_c]: [Uuid; 2] = lines_bc.try_into().unwrap();
+    let doc_a: Uuid = sqlx::query_scalar(
+        "SELECT id FROM recon.documents
+          WHERE firm_id = $1 AND client_id = $2 AND number_norm = 'INV-A'",
+    )
+    .bind(firm)
+    .bind(client)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let doc_b: Uuid = sqlx::query_scalar(
+        "SELECT id FROM recon.documents
+          WHERE firm_id = $1 AND client_id = $2 AND number_norm = 'INV-B'",
+    )
+    .bind(firm)
+    .bind(client)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+
+    // 32 reviewers: 16 race line A, 8 race line B and 8 race line C — B and C's
+    // arms both want the one document.
+    let mut tasks = tokio::task::JoinSet::new();
+    for n in 0..32 {
+        let (token, csrf, _) =
+            enrolled_tag(&state, &db.pool, &seed, "reviewer", &n.to_string()).await;
+        let state = state.clone();
+        let seed = seed.clone();
+        let (line, document) = if n < 16 {
+            (line_a.clone(), doc_a)
+        } else if n < 24 {
+            (line_b.to_string(), doc_b)
+        } else {
+            (line_c.to_string(), doc_b)
+        };
+        tasks.spawn(async move {
+            let (status, body) = call(
+                &state,
+                session(
+                    post_json(
+                        &format!(
+                            "/v1/firms/{}/clients/{}/lines/{line}/manual-match",
+                            seed.firm, seed.client
+                        ),
+                        &json!({"documents": [document], "residuals": []}),
+                    ),
+                    &token,
+                    &csrf,
+                ),
+            )
+            .await;
+            (status, body, line)
+        });
+    }
+    let mut created = 0;
+    let mut losers = Vec::new();
+    while let Some(outcome) = tasks.join_next().await {
+        let (status, body, line) = outcome.unwrap();
+        match status {
+            StatusCode::CREATED => created += 1,
+            StatusCode::CONFLICT => losers.push((body, line)),
+            other => panic!("a manual match answered {other}: {body}"),
+        }
+    }
+    assert_eq!(
+        (created, losers.len()),
+        (2, 30),
+        "one winner per arm — the shared line and the shared document"
+    );
+
+    // The winning decisions: each winning line's unreviewed→proposed move and the
+    // proposal decisions of the matches holding INV-A and INV-B.
+    let line_decisions: Vec<(Uuid, Uuid)> = sqlx::query_as(
+        "SELECT subject_id, id FROM recon.decision_log
+          WHERE firm_id = $1 AND subject_kind = 'line' AND to_state = 'proposed'",
+    )
+    .bind(firm)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    let winning_lines: Vec<Uuid> = line_decisions.iter().map(|(l, _)| *l).collect();
+    assert_eq!(winning_lines.len(), 2, "{line_decisions:?}");
+    let holder_decisions: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT d.id FROM recon.decision_log d
+          WHERE d.firm_id = $1 AND d.subject_kind = 'match' AND d.to_state = 'proposed'
+            AND d.subject_id IN
+                (SELECT md.match_id FROM recon.match_documents md
+                  WHERE md.firm_id = $1 AND md.document_id IN ($2, $3))",
+    )
+    .bind(firm)
+    .bind(doc_a)
+    .bind(doc_b)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(holder_decisions.len(), 2, "{holder_decisions:?}");
+
+    // The INV-B holder's own proposal decision — the winner the losing line's
+    // reviewers are told about.
+    let doc_b_winner: Uuid = sqlx::query_scalar(
+        "SELECT d.id FROM recon.decision_log d
+          WHERE d.firm_id = $1 AND d.subject_kind = 'match' AND d.to_state = 'proposed'
+            AND d.subject_id =
+                (SELECT md.match_id FROM recon.match_documents md
+                  WHERE md.firm_id = $1 AND md.document_id = $2)",
+    )
+    .bind(firm)
+    .bind(doc_b)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+
+    // Every loser's 409 names a winning decision: the same-line losers name their
+    // line's `proposed` move; the losing document arm names the match that holds it.
+    for (loser, line) in &losers {
+        let error = &loser["error"];
+        assert_eq!(error["code"].as_str().unwrap(), "conflict", "{loser}");
+        let winner = &error["winner"];
+        let named: Uuid = winner["decision"].as_str().unwrap().parse().unwrap();
+        let line_uuid = Uuid::parse_str(line).unwrap();
+        let expected = line_decisions
+            .iter()
+            .find(|(l, _)| *l == line_uuid)
+            .map_or(doc_b_winner, |(_, d)| *d);
+        assert_eq!(
+            named, expected,
+            "the 409 names the winning decision: {loser}"
+        );
+        assert_eq!(winner["to_state"].as_str().unwrap(), "proposed");
+        assert!(winner["seq"].as_i64().unwrap() >= 1, "{loser}");
+    }
+
+    // Invariants: one live proposal per contested line; no document past its amount.
+    let live_per_line: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM recon.match_lines ml
+           JOIN recon.matches m ON m.firm_id = ml.firm_id AND m.id = ml.match_id
+          WHERE ml.firm_id = $1 AND ml.line_id = ANY($2) AND m.status IN ('proposed','committed')",
+    )
+    .bind(firm)
+    .bind([Uuid::parse_str(&line_a).unwrap(), line_b, line_c])
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(live_per_line, 2, "one live match per contested line");
+    let over: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM recon.documents
+          WHERE firm_id = $1 AND abs(allocated_minor) > abs(amount_minor)",
+    )
+    .bind(firm)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(over, 0, "no document allocated beyond its amount");
 }
 
 /// The four-eyes flow: a manual match proposes `four_eyes`; the preparer cannot

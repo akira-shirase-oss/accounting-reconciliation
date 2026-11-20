@@ -16,15 +16,31 @@ use uuid::Uuid;
 use crate::decisions::{self, NewDecision};
 use crate::error::DbError;
 
+/// The decision a conflicting review names as the winner — failure case 7's
+/// requirement: a loser learns not only that the state moved but which recorded
+/// decision moved it.
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
+pub struct Winner {
+    /// The winning decision's id and its chain position.
+    pub decision: Uuid,
+    pub seq: i64,
+    /// Who recorded it, the state it moved the subject to and its reason code.
+    pub actor_kind: String,
+    pub actor_ref: String,
+    pub to_state: String,
+    pub reason_code: String,
+}
+
 /// What a review call found wrong.
 #[derive(Debug, thiserror::Error)]
 pub enum ReviewError {
     /// The subject does not exist in this firm and client.
     #[error("not found")]
     NotFound,
-    /// The state moved since the caller read it — the optimistic-conflict answer (409).
+    /// The state moved since the caller read it — the optimistic-conflict answer
+    /// (409), naming the winning decision when the subject has one.
     #[error("{0}")]
-    Conflict(&'static str),
+    Conflict(&'static str, Option<Box<Winner>>),
     /// A semantic refusal the caller can fix (422).
     #[error("{0}")]
     Refused(&'static str),
@@ -57,6 +73,30 @@ async fn any_period_closed(
     .bind(lines)
     .fetch_one(&mut **tx)
     .await?)
+}
+
+/// The subject's latest recorded decision — the winner a conflicting call names.
+/// `None` when the subject has no decision yet (a stale read before any write).
+async fn winner_of(
+    tx: &mut Transaction<'_, Postgres>,
+    firm: FirmId,
+    client: ClientId,
+    kind: SubjectKind,
+    subject: Uuid,
+) -> Result<Option<Box<Winner>>, ReviewError> {
+    Ok(sqlx::query_as::<_, Winner>(
+        "SELECT id AS decision, seq, actor_kind, actor_ref, to_state, reason_code
+           FROM recon.decision_log
+          WHERE firm_id = $1 AND client_id = $2 AND subject_kind = $3 AND subject_id = $4
+          ORDER BY seq DESC LIMIT 1",
+    )
+    .bind(firm.as_uuid())
+    .bind(client.as_uuid())
+    .bind(kind.code())
+    .bind(subject)
+    .fetch_optional(&mut **tx)
+    .await?
+    .map(Box::new))
 }
 
 /// The line ids a match covers.
@@ -303,12 +343,25 @@ async fn lock_match(
     .transpose()
 }
 
-fn still_proposed(m: &LockedMatch, expected_version: i64) -> Result<(), ReviewError> {
+async fn still_proposed(
+    tx: &mut Transaction<'_, Postgres>,
+    firm: FirmId,
+    client: ClientId,
+    m: &LockedMatch,
+    match_id: Uuid,
+    expected_version: i64,
+) -> Result<(), ReviewError> {
     if m.status != "proposed" {
-        return Err(ReviewError::Conflict("the match was already decided"));
+        return Err(ReviewError::Conflict(
+            "the match was already decided",
+            winner_of(tx, firm, client, SubjectKind::Match, match_id).await?,
+        ));
     }
     if m.row_version != expected_version {
-        return Err(ReviewError::Conflict("the match changed; reload it"));
+        return Err(ReviewError::Conflict(
+            "the match changed; reload it",
+            winner_of(tx, firm, client, SubjectKind::Match, match_id).await?,
+        ));
     }
     Ok(())
 }
@@ -336,7 +389,7 @@ pub async fn approve(
     if any_period_closed(&mut tx, firm, &covered).await? {
         return Err(ReviewError::PeriodClosed);
     }
-    still_proposed(&m, expected_version)?;
+    still_proposed(&mut tx, firm, client, &m, match_id, expected_version).await?;
 
     let evidence_body = evidence(&ReviewEvidence {
         subject: match_id,
@@ -397,7 +450,10 @@ pub async fn approve(
     .await?
     .rows_affected();
     if moved != 1 {
-        return Err(ReviewError::Conflict("the match changed; reload it"));
+        return Err(ReviewError::Conflict(
+            "the match changed; reload it",
+            winner_of(&mut tx, firm, client, SubjectKind::Match, match_id).await?,
+        ));
     }
     let lines = sqlx::query(
         "UPDATE recon.statement_lines l SET status = 'matched', row_version = l.row_version + 1
@@ -476,7 +532,7 @@ pub async fn reject(
     if any_period_closed(&mut tx, firm, &covered).await? {
         return Err(ReviewError::PeriodClosed);
     }
-    still_proposed(&m, expected_version)?;
+    still_proposed(&mut tx, firm, client, &m, match_id, expected_version).await?;
     let moved = sqlx::query(
         "UPDATE recon.matches SET status = 'rejected', row_version = row_version + 1
           WHERE firm_id = $1 AND client_id = $2 AND id = $3 AND status = 'proposed'
@@ -490,7 +546,10 @@ pub async fn reject(
     .await?
     .rows_affected();
     if moved != 1 {
-        return Err(ReviewError::Conflict("the match changed; reload it"));
+        return Err(ReviewError::Conflict(
+            "the match changed; reload it",
+            winner_of(&mut tx, firm, client, SubjectKind::Match, match_id).await?,
+        ));
     }
     // The match is finished; deleting its document rows returns their allocated parts.
     sqlx::query("DELETE FROM recon.match_documents WHERE firm_id = $1 AND match_id = $2")
@@ -601,10 +660,16 @@ pub async fn exclude(
         ));
     }
     if !matches!(status.as_str(), "unreviewed" | "exception") {
-        return Err(ReviewError::Conflict("the line was already decided"));
+        return Err(ReviewError::Conflict(
+            "the line was already decided",
+            winner_of(&mut tx, firm, client, SubjectKind::Line, line.as_uuid()).await?,
+        ));
     }
     if version != expected_version {
-        return Err(ReviewError::Conflict("the line changed; reload it"));
+        return Err(ReviewError::Conflict(
+            "the line changed; reload it",
+            winner_of(&mut tx, firm, client, SubjectKind::Line, line.as_uuid()).await?,
+        ));
     }
     let from = if status == "exception" {
         "exception"
@@ -688,6 +753,7 @@ pub async fn manual_match(
     if !matches!(status.as_str(), "unreviewed" | "exception") {
         return Err(ReviewError::Conflict(
             "only an unreviewed or exception line takes a manual match",
+            winner_of(&mut tx, firm, client, SubjectKind::Line, line.as_uuid()).await?,
         ));
     }
     let currency = Currency::from_code(row.try_get::<&str, _>("currency")?)
@@ -716,7 +782,28 @@ pub async fn manual_match(
         }
         let open = d.try_get::<i64, _>("amount_minor")? - d.try_get::<i64, _>("allocated_minor")?;
         if open == 0 {
-            return Err(ReviewError::Refused("a document is fully allocated"));
+            // A live match holds the whole document — the loser of the
+            // over-allocation race is told which decision holds it (case 7).
+            let holder: Option<Uuid> = sqlx::query_scalar(
+                "SELECT md.match_id FROM recon.match_documents md
+                   JOIN recon.matches m
+                     ON m.firm_id = md.firm_id AND m.id = md.match_id
+                  WHERE md.firm_id = $1 AND md.client_id = $2 AND md.document_id = $3
+                    AND m.status IN ('proposed', 'committed')
+                  ORDER BY md.match_id LIMIT 1",
+            )
+            .bind(firm.as_uuid())
+            .bind(client.as_uuid())
+            .bind(d.try_get::<Uuid, _>("id")?)
+            .fetch_optional(&mut *tx)
+            .await?;
+            return Err(match holder {
+                Some(m) => ReviewError::Conflict(
+                    "a document is fully allocated",
+                    winner_of(&mut tx, firm, client, SubjectKind::Match, m).await?,
+                ),
+                None => ReviewError::Refused("a document is fully allocated"),
+            });
         }
         doc_allocs.push(DocumentAllocation {
             document: DocumentId::from_uuid(d.try_get("id")?),
@@ -903,7 +990,10 @@ pub async fn acknowledge(
         return Err(ReviewError::PeriodClosed);
     }
     if status != "exception" {
-        return Err(ReviewError::Conflict("only an exception is acknowledged"));
+        return Err(ReviewError::Conflict(
+            "only an exception is acknowledged",
+            winner_of(&mut tx, firm, client, SubjectKind::Line, line.as_uuid()).await?,
+        ));
     }
     let marked = sqlx::query(
         "UPDATE recon.line_exceptions
@@ -919,6 +1009,7 @@ pub async fn acknowledge(
     if marked == 0 {
         return Err(ReviewError::Conflict(
             "the exception was already acknowledged",
+            winner_of(&mut tx, firm, client, SubjectKind::Line, line.as_uuid()).await?,
         ));
     }
     let kind: String = sqlx::query_scalar(
