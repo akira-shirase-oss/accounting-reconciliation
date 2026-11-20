@@ -21,11 +21,31 @@ async fn server(extra: &[(&str, &str)]) -> Server {
         ("RECON_REQUEST_TIMEOUT_MS", "2000"),
     ];
     env.extend_from_slice(extra);
-    let server = Server::spawn(UNREACHABLE, &env);
+    let mut server = Server::spawn(UNREACHABLE, &env);
     let target = addr(&server);
-    let deadline = Instant::now() + Duration::from_secs(60);
+    // The definite readiness signal: the server writes `listening` to its log the
+    // moment the socket is bound (main.rs); acceptance follows in microseconds.
+    // Waiting on the wall clock alone for a bound socket is how this probe flaked
+    // under load, so the bound here is generous — a busy machine is not a finding.
+    let bound = Instant::now() + Duration::from_secs(180);
+    loop {
+        let log = std::fs::read_to_string(&server.log).unwrap_or_default();
+        if log.contains("listening") {
+            break;
+        }
+        if let Ok(Some(status)) = server.child.try_wait() {
+            panic!("the server exited ({status}) before listening; log: {log}");
+        }
+        assert!(
+            Instant::now() < bound,
+            "the server never logged `listening`; log: {log}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // Bound, the probe itself is the honest check: one raw request must be answered.
     // A raw probe with Connection: close, so no pooled client connection keeps holding a
     // permit while a test counts connections.
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if let Ok(mut s) = TcpStream::connect(&target).await
             && s.write_all(b"GET /healthz HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
