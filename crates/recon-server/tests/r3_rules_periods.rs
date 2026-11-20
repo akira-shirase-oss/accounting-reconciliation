@@ -630,6 +630,191 @@ async fn a_period_locks_until_an_owner_reopens_it() {
     assert_eq!(s, StatusCode::OK, "{body}");
 }
 
+/// Failure case 5, end to end: a rule change never rewrites a past decision — the
+/// closed month's recorded proof (digest, chain head, chain seq) and every earlier
+/// record's hash survive a new rule version byte-for-byte, and the new version only
+/// reaches work that lands after it.
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the end-to-end digest check walks import -> close -> rule change -> import"
+)]
+async fn a_rule_change_never_rewrites_a_closed_months_proof() {
+    let db = TestDb::new().await;
+    let state = checked(&db);
+    let seed = seed(&state).await;
+    let (rt, rc, _) = enrolled(&state, &db.pool, &seed, "reviewer").await;
+    let (ot, oc, _) = enrolled(&state, &db.pool, &seed, "owner").await;
+
+    // v1: narrations containing "bank fee" exclude themselves at import.
+    let (s, body) = call(
+        &state,
+        session(
+            post_json(
+                &rules_path(&seed),
+                &exclude_rule("fees", "bank fee", "non_business"),
+            ),
+            &rt,
+            &rc,
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{body}");
+    let rule = body["rule"]["id"].as_str().unwrap().to_owned();
+    let (s, body) = call(
+        &state,
+        session(
+            post_json(
+                &format!("{}/{rule}/versions/1/approve", rules_path(&seed)),
+                &json!({"auto_apply": true}),
+            ),
+            &ot,
+            &oc,
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+
+    // March imports under v1: both lines carry the tag and land excluded.
+    let (s, body) = upload_statement(&state, &seed, &statement(&[2, 3], "BANK FEE")).await;
+    assert_eq!(s, StatusCode::CREATED, "{body}");
+    for (_, status, _) in lines(&db.pool, &seed).await {
+        assert_eq!(status, "excluded");
+    }
+
+    // The month closes; its proof is the recorded digest, chain seq and chain head.
+    let (s, body) = call(
+        &state,
+        session(
+            post_json(&period_path(&seed, "close"), &json!({})),
+            &rt,
+            &rc,
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+
+    let firm = Uuid::parse_str(&seed.firm).unwrap();
+    let client = Uuid::parse_str(&seed.client).unwrap();
+    let account = Uuid::parse_str(&seed.account).unwrap();
+    let before: (Vec<u8>, i64, Vec<u8>, i64) = sqlx::query_as(
+        "SELECT digest, chain_seq, chain_head, row_version FROM recon.periods
+          WHERE firm_id = $1 AND account_id = $2 AND month = '2026-03-01'",
+    )
+    .bind(firm)
+    .bind(account)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    // And the whole chain so far: every record hash, in order.
+    let hashes_before: Vec<String> = sqlx::query_scalar(
+        "SELECT encode(record_hash, 'hex') FROM recon.decision_log
+          WHERE firm_id = $1 AND client_id = $2 ORDER BY seq",
+    )
+    .bind(firm)
+    .bind(client)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert!(hashes_before.len() >= 4);
+
+    // The rule changes: v2 now excludes "office supplies" instead.
+    let (s, body) = call(
+        &state,
+        session(
+            post_json(
+                &format!("{}/{rule}/versions", rules_path(&seed)),
+                &json!({
+                    "predicate": {"narration": {"op": "contains", "value": "office"}},
+                    "action": {"kind": "exclude", "reason": "non_business"},
+                }),
+            ),
+            &rt,
+            &rc,
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{body}");
+    let (s, body) = call(
+        &state,
+        session(
+            post_json(
+                &format!("{}/{rule}/versions/2/approve", rules_path(&seed)),
+                &json!({"auto_apply": true}),
+            ),
+            &ot,
+            &oc,
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+
+    // The closed month's proof is byte-for-byte what was recorded at close…
+    let after: (Vec<u8>, i64, Vec<u8>, i64) = sqlx::query_as(
+        "SELECT digest, chain_seq, chain_head, row_version FROM recon.periods
+          WHERE firm_id = $1 AND account_id = $2 AND month = '2026-03-01'",
+    )
+    .bind(firm)
+    .bind(account)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        before, after,
+        "a rule change rewrote the closed month's proof"
+    );
+
+    // …and every earlier record's hash is untouched; the log only grew.
+    let hashes_after: Vec<String> = sqlx::query_scalar(
+        "SELECT encode(record_hash, 'hex') FROM recon.decision_log
+          WHERE firm_id = $1 AND client_id = $2 ORDER BY seq",
+    )
+    .bind(firm)
+    .bind(client)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert!(hashes_after.len() > hashes_before.len());
+    assert_eq!(&hashes_after[..hashes_before.len()], &hashes_before[..]);
+
+    // April imports under v2: "office" excludes, the old predicate no longer applies
+    // — the change reaches only what lands after it.
+    let csv = "booking_date,value_date,amount,currency,narration,reference,counterparty,balance_after\n\
+        2026-04-02,,-1.00,USD,BANK FEE 02,REF-1,Big Bank,\n\
+        2026-04-03,,-4.20,USD,OFFICE SUPPLIES,REF-2,Staples,\n";
+    let (s, body) = upload_statement(&state, &seed, csv).await;
+    assert_eq!(s, StatusCode::CREATED, "{body}");
+
+    let got = lines(&db.pool, &seed).await;
+    assert_eq!(got.len(), 4);
+    assert_eq!(got[2].1, "unreviewed", "{got:?}");
+    assert_eq!(got[3].1, "excluded", "{got:?}");
+    let actor: String = sqlx::query_scalar(
+        "SELECT actor_ref FROM recon.decision_log
+          WHERE firm_id = $1 AND subject_kind = 'line' AND subject_id = $2
+            AND to_state = 'excluded'",
+    )
+    .bind(firm)
+    .bind(Uuid::parse_str(&got[3].0).unwrap())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(actor, format!("rule:{rule}@v2"));
+
+    // And March's rule decision still names v1 — the past keeps its actor.
+    let actor: String = sqlx::query_scalar(
+        "SELECT actor_ref FROM recon.decision_log
+          WHERE firm_id = $1 AND subject_kind = 'line' AND subject_id = $2
+            AND to_state = 'excluded'",
+    )
+    .bind(firm)
+    .bind(Uuid::parse_str(&got[0].0).unwrap())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(actor, format!("rule:{rule}@v1"));
+}
+
 /// A month holding an unacknowledged exception does not close; a reviewer's
 /// acknowledgement in place (the line stays an exception) is what it takes (D-006).
 #[tokio::test]
