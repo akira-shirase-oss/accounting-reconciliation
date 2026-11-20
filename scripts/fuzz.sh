@@ -10,7 +10,7 @@ cd "$(dirname "$0")/.."
 
 toolchain="${FUZZ_TOOLCHAIN:-nightly-2026-09-06}"
 seconds="${FUZZ_SECONDS:-60}"
-targets=(statement-csv statement-profile ofx documents amounts-and-dates decode)
+targets=(statement-csv statement-profile ofx documents amounts-and-dates decode model-answer anchor-file rule-predicate)
 
 for target in "${targets[@]}"; do
   corpus="fuzz/corpus/${target}"
@@ -19,6 +19,7 @@ for target in "${targets[@]}"; do
   case "$target" in
     ofx) cp fixtures/ofx/*.ofx fixtures/hostile-files/ofx-*.ofx "$corpus"/ ;;
     statement-csv | decode) cp fixtures/hostile-files/csv-*.csv "$corpus"/ ;;
+    model-answer) cp crates/recon-model/fixtures/model-wrong-match/*.json "$corpus"/ ;;
   esac
 done
 

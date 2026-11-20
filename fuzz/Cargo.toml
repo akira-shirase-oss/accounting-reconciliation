@@ -16,6 +16,8 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4.13"
 recon-domain = { path = "../crates/recon-domain" }
 recon-import = { path = "../crates/recon-import" }
+recon-model = { path = "../crates/recon-model" }
+serde_json = "1.0.154"
 uuid = "1.29"
 
 [workspace]
@@ -62,6 +64,27 @@ bench = false
 [[bin]]
 name = "decode"
 path = "fuzz_targets/decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "model-answer"
+path = "fuzz_targets/model_answer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "anchor-file"
+path = "fuzz_targets/anchor_file.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rule-predicate"
+path = "fuzz_targets/rule_predicate.rs"
 test = false
 doc = false
 bench = false

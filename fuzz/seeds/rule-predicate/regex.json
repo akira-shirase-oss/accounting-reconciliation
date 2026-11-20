@@ -1,0 +1,1 @@
+{"narration":{"op":"regex","value":"fee[0-9]+\\s*(USD|EUR)?"}}
