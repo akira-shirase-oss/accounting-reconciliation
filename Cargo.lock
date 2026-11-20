@@ -1291,6 +1291,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "recon-model"
+version = "0.1.0"
+dependencies = [
+ "recon-domain",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "recon-server"
 version = "0.1.0"
 dependencies = [

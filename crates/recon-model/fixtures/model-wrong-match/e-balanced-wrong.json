@@ -1,0 +1,1 @@
+{"kind":"proposal","allocations":[{"document":"{b}","amount_minor":4215,"currency":"USD"}],"residual":null,"reason":"INV-2 matches the counterparty and amount (it is the wrong twin — balanced, so this stays a proposal for a person to judge)"}

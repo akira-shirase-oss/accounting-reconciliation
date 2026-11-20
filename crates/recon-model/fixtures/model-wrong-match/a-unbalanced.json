@@ -1,0 +1,1 @@
+{"kind":"proposal","allocations":[{"document":"{a}","amount_minor":4000,"currency":"USD"}],"residual":null,"reason":"invoice INV-1 covers it (it does not — 40.00 against 42.15)"}
