@@ -36,6 +36,9 @@ pub enum ProposeError {
     Unrecorded,
     /// The answer bytes were not the schema.
     Malformed,
+    /// The job's call budget was already spent — no call was made (failure
+    /// case 9's `model_budget_exhausted`).
+    Budget,
 }
 
 impl ProposeError {
@@ -45,6 +48,7 @@ impl ProposeError {
             Self::Unavailable => "unavailable",
             Self::Unrecorded => "unrecorded",
             Self::Malformed => "malformed",
+            Self::Budget => "budget",
         }
     }
 }

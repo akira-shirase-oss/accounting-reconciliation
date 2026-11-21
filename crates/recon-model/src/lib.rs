@@ -6,15 +6,17 @@
 //!
 //! The port is one trait, [`Proposer`], with three adapters: the recorded-response
 //! adapter here (CI, drills and load runs), and the OpenAI-compatible and loopback
-//! adapters that arrive with the egress plumbing (D-024).
+//! wire adapters in [`http`] with the D-024 egress plumbing.
 
 mod answer;
+pub mod http;
 mod port;
 mod recorded;
 mod request;
 mod validate;
 
 pub use answer::{Allocation, Answer, AnswerError, ResidualAnswer};
+pub use http::{Budget, Endpoint, EndpointError, HttpProposer};
 pub use port::{BoxFuture, ProposeError, Proposer};
 pub use recorded::RecordedProposer;
 pub use request::{Candidate, Data, LineFacts, ProposeRequest};
