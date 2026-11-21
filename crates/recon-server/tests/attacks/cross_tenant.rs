@@ -20,7 +20,9 @@ async fn another_firms_routes_answer_404_to_this_session() {
         format!("/v1/firms/{}/clients/{}/rules", rig.firm, rig.client),
     ] {
         let (status, body) = get(&rig.server.base, &path, Some(&session_b)).await;
-        assert!(status == 403 || status == 404, "{path}: {status} {body}");
+        // The firm check answers first and by name: another firm's routes are
+        // 404, never a 403 leak of which firm exists.
+        assert!(status == 404, "{path}: {status} {body}");
         assert!(
             body["client"].is_null() && body["items"].is_null() && body["lines"].is_null(),
             "{path} returned data: {body}"

@@ -34,6 +34,7 @@ use std::time::{Duration, Instant};
 
 use common::{
     GENERATED_CONTENT, Proxy, Server, TOKEN, assert_log_clean, http, post_json, tenant, upload,
+    upload_raw,
 };
 use recon_cli::generate::{MatchSpec, Rng, StatementSpec, match_set, statement};
 use recon_db::testing::{APP_PASSWORD, TestDb};
@@ -185,23 +186,49 @@ async fn upload_honouring_retry(
     point: &str,
 ) -> (u16, Value) {
     for attempt in 0..8 {
-        let answered = upload(base, firm, account, file.to_vec())
-            .await
-            .unwrap_or((0, Value::Null));
-        let transient = matches!(answered.0, 503)
-            || answered
-                .1
-                .get("error")
-                .and_then(|e| e.get("code"))
-                .and_then(Value::as_str)
-                .is_some_and(|c| c == "database_unavailable" || c == "overloaded");
+        let (status, retry_after, body) = match upload_raw(base, firm, account, file.to_vec()).await
+        {
+            Ok(r) => {
+                let hint = r
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned);
+                (
+                    r.status().as_u16(),
+                    hint,
+                    r.json().await.unwrap_or(Value::Null),
+                )
+            }
+            Err(_) => (0, None, Value::Null),
+        };
+        let code = body
+            .get("error")
+            .and_then(|e| e.get("code"))
+            .and_then(Value::as_str);
+        // `database_unavailable` is a fatal answer, not a transient one: it
+        // names the internals, so the caller must see it, not retry past it.
+        if code == Some("database_unavailable") {
+            return (status, body);
+        }
+        let transient = status == 503 || code == Some("overloaded");
         if !transient || attempt == 7 {
             if attempt > 0 {
                 eprintln!("kill-mid-import: {point}: upload answered after {attempt} retries");
             }
-            return answered;
+            return (status, body);
         }
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        // The 503 contract carries its hint — the drill honours it rather than
+        // sleeping a guessed second.
+        let hint = retry_after
+            .as_deref()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|s| *s >= 1);
+        assert!(
+            hint.is_some(),
+            "{point}: a transient 503 must carry a numeric Retry-After: {status} {body}"
+        );
+        tokio::time::sleep(Duration::from_secs(hint.unwrap().min(8))).await;
     }
     unreachable!()
 }

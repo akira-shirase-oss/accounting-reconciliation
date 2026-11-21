@@ -32,6 +32,18 @@ fuzz_target!(|data: &[u8]| {
             document_kind: "sales_invoice".to_owned(),
         },
     ] {
-        let _ = CompiledPredicate::compile(&predicate, &action);
+        if let Ok(mut compiled) = CompiledPredicate::compile(&predicate, &action) {
+            // Compile alone proves nothing: run the PikeVM against the input so a
+            // match-time blow-up is a crash, not a pass. One line built from the
+            // same bytes is enough — the bound is per-narration.
+            let haystack = String::from_utf8_lossy(data);
+            let facts = recon_domain::rule::LineFacts {
+                narration: &haystack,
+                counterparty: Some(&haystack),
+                amount_minor: 0,
+                account: uuid::Uuid::nil(),
+            };
+            let _ = compiled.matches(&facts);
+        }
     }
 });

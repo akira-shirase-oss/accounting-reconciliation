@@ -42,6 +42,22 @@ fn rule_error(e: rules::RuleError) -> ApiError {
         rules::RuleError::Conflict(message) => {
             ApiError::new(StatusCode::CONFLICT, "conflict", message)
         }
+        rules::RuleError::Busy => ApiError::new(
+            StatusCode::CONFLICT,
+            "rules_busy",
+            "the client's rule set is being written; nothing changed, try again shortly",
+        )
+        .retry_after(2),
+        rules::RuleError::Limit => ApiError::new(
+            StatusCode::CONFLICT,
+            "rule_limit",
+            "the client's rule limit is reached; retire a rule to free a slot",
+        ),
+        rules::RuleError::VersionCap => ApiError::new(
+            StatusCode::CONFLICT,
+            "version_cap",
+            "the rule's version history is bounded; create a new rule",
+        ),
         rules::RuleError::Retired => {
             ApiError::new(StatusCode::CONFLICT, "rule_retired", "the rule is retired")
         }

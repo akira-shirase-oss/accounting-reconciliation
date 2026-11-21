@@ -1,0 +1,12 @@
+{
+  "scenario": "n6-exclusion-trigger-cost",
+  "commit": "b3bbf3b",
+  "machine": "arm64 macOS (development observation)",
+  "rows": 1120,
+  "measurements_ms": {
+    "flip_with_auto_exclude_rule": 357.7,
+    "flip_no_rule": 125.0,
+    "periods_lock_lines_1120_ids": 5.0
+  },
+  "note": "Auto-exclusion adds ~233 ms per 1120 excluded rows (~0.21 ms/line) for the two statement-level trigger passes over the flip's writes; periods_lock_lines scans the ids once at ~4.5 us/id. Measured by the ignored test n6_measure_the_exclusion_trigger_cost; rerun with --ignored --nocapture."
+}

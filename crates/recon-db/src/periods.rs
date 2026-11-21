@@ -181,6 +181,23 @@ async fn ensure(
 
 /// `ensure` without the row lock: the period is created when missing, but the read
 /// takes no `FOR UPDATE` so a caller may hold the row across a long evaluation
+async fn lock_chain_head(
+    tx: &mut PgConnection,
+    firm: FirmId,
+    client: ClientId,
+) -> Result<(), PeriodError> {
+    // The chain trigger locks chain_heads first on every decision insert, so
+    // every path that will write decisions takes the same lock first — before
+    // the period row — to keep one lock order and no cycle (D-077). The table
+    // is not granted to the app role; the definer function carries the lock.
+    sqlx::query("SELECT recon.chain_heads_lock($1, $2)")
+        .bind(firm.as_uuid())
+        .bind(client.as_uuid())
+        .execute(&mut *tx)
+        .await?;
+    Ok(())
+}
+
 /// (N2 — `re_evaluate` locks only to write its decision).
 async fn ensure_unlocked(
     conn: &mut PgConnection,
@@ -331,6 +348,7 @@ pub async fn close(
     if !crate::imports::try_lock(&mut tx, account.as_uuid(), crate::imports::ACCOUNT_LOCK).await? {
         return Err(PeriodError::AccountBusy);
     }
+    lock_chain_head(&mut tx, firm, client).await?;
     let p = ensure(&mut tx, firm, client, account, month).await?;
     let from = p.status.clone();
     if from == "closed" {
@@ -455,6 +473,7 @@ pub async fn reopen(
     if !account_exists(&mut tx, firm, client, account).await? {
         return Err(PeriodError::NotFound);
     }
+    lock_chain_head(&mut tx, firm, client).await?;
     let p = ensure(&mut tx, firm, client, account, month).await?;
     if p.status != "closed" {
         return Err(PeriodError::Conflict("the period is not closed"));
@@ -557,12 +576,10 @@ pub async fn re_evaluate(
     };
     // Phase 2 — evaluate outside any transaction, deadline-bound; the row lock is
     // not held while the blocking worker runs (N2).
-    let (compiled, proposals, truncated) = tokio::time::timeout(
-        RE_EVALUATION_DEADLINE,
-        run_evaluation(compiled, &lines),
-    )
-    .await
-    .map_err(|_| PeriodError::EvaluationTooLarge)??;
+    let (compiled, proposals, truncated) =
+        tokio::time::timeout(RE_EVALUATION_DEADLINE, run_evaluation(compiled, &lines))
+            .await
+            .map_err(|_| PeriodError::EvaluationTooLarge)??;
     let rule_versions: Vec<serde_json::Value> = compiled
         .iter()
         .map(|(id, v, _, _)| serde_json::json!({"rule": id, "version": v}))
@@ -577,6 +594,7 @@ pub async fn re_evaluate(
     // Phase 3 — lock only to write the decision; a close may have landed while the
     // evaluation ran, so the status is checked again under the lock.
     let mut tx = pool.begin().await?;
+    lock_chain_head(&mut tx, firm, client).await?;
     let p = ensure(&mut tx, firm, client, account, month).await?;
     if p.status == "closed" {
         return Err(PeriodError::Closed);
@@ -614,13 +632,11 @@ static RE_EVALUATION_PERMITS: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<Uuid, std::sync::Arc<tokio::sync::Semaphore>>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
-fn re_evaluation_permit(
-    firm: FirmId,
-) -> Result<tokio::sync::OwnedSemaphorePermit, PeriodError> {
+fn re_evaluation_permit(firm: FirmId) -> Result<tokio::sync::OwnedSemaphorePermit, PeriodError> {
     let semaphore = {
         let mut map = RE_EVALUATION_PERMITS
             .lock()
-            .unwrap_or_else(|p| p.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         map.entry(firm.as_uuid())
             .or_insert_with(|| {
                 std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_RE_EVALUATIONS_PER_FIRM))

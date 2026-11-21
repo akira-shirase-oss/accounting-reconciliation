@@ -68,6 +68,12 @@ pub enum RuleError {
     Invalid(&'static str),
     /// The version is already decided (or the client holds the limit).
     Conflict(&'static str),
+    /// The client's rule set is being written; retry shortly.
+    Busy,
+    /// The client's rule cap is reached.
+    Limit,
+    /// The rule's version history is bounded.
+    VersionCap,
     /// The rule is retired.
     Retired,
     /// Storage.
@@ -186,17 +192,17 @@ pub async fn create(
     }
     let mut tx = pool.begin().await?;
     if !crate::imports::try_lock(&mut tx, client.as_uuid(), RULES_LOCK).await? {
-        return Err(RuleError::Conflict("the client's rule set is busy"));
+        return Err(RuleError::Busy);
     }
     let count: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM recon.rules WHERE firm_id = $1 AND client_id = $2",
+        "SELECT count(*) FROM recon.rules WHERE firm_id = $1 AND client_id = $2 AND status <> 'retired'",
     )
     .bind(firm.as_uuid())
     .bind(client.as_uuid())
     .fetch_one(&mut *tx)
     .await?;
     if count >= MAX_RULES_PER_CLIENT {
-        return Err(RuleError::Conflict("the client's rule limit is reached"));
+        return Err(RuleError::Limit);
     }
     let id = Uuid::now_v7();
     sqlx::query("INSERT INTO recon.rules (firm_id, id, client_id, name) VALUES ($1, $2, $3, $4)")
@@ -306,7 +312,7 @@ pub async fn propose_version(
         .unwrap_or(0)
         .saturating_add(1);
     if version > MAX_VERSIONS_PER_RULE {
-        return Err(RuleError::Conflict("the rule's version history is bounded"));
+        return Err(RuleError::VersionCap);
     }
     insert_version(
         &mut tx, firm, client, rule, version, user, &predicate, &action,
@@ -634,8 +640,17 @@ pub async fn apply_exclusions(
     if matched.is_empty() {
         return Ok(0);
     }
-    // One bulk state move and one bulk decision insert (N1): the same
-    // commit-time state as per-line writes, two round trips, in line order.
+    write_exclusions(conn, firm, client, matched).await
+}
+
+/// One bulk state move and one bulk decision insert (N1): the same
+/// commit-time state as per-line writes, two round trips, in line order.
+async fn write_exclusions(
+    conn: &mut PgConnection,
+    firm: FirmId,
+    client: ClientId,
+    matched: Vec<(Uuid, Uuid, i32, String)>,
+) -> Result<u32, DbError> {
     let line_ids: Vec<Uuid> = matched.iter().map(|m| m.0).collect();
     sqlx::query(
         "UPDATE recon.statement_lines SET status = 'excluded', row_version = row_version + 1

@@ -107,12 +107,16 @@ async fn a_drip_fed_body_dies_at_the_idle_deadline() {
     // the answer is the signal, not a sleep — with a read timeout that fails
     // the test when the deadline didn't fire. EOF/silence is a wedge here, not
     // a refusal: `upload_stalled` is the contract.
+    // Bound the WHOLE wait, not a single read: short per-read timeouts inside a
+    // total deadline (the 500 ms idle bound plus slack), so a refusal delivered
+    // across several packets still counts and silence still fails by name.
     stream
-        .set_read_timeout(Some(std::time::Duration::from_millis(1500)))
+        .set_read_timeout(Some(std::time::Duration::from_millis(200)))
         .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1500);
     let mut received = Vec::new();
     let mut buf = [0_u8; 1024];
-    loop {
+    while std::time::Instant::now() < deadline {
         match std::io::Read::read(&mut stream, &mut buf) {
             Ok(0) => break,
             Ok(n) => {
@@ -121,9 +125,10 @@ async fn a_drip_fed_body_dies_at_the_idle_deadline() {
                     break;
                 }
             }
-            Err(e) => panic!(
-                "no answer inside the idle deadline — the drip-fed body wedged the worker: {e}"
-            ),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(e) => panic!("the stalled upload's socket broke: {e}"),
         }
     }
     assert!(

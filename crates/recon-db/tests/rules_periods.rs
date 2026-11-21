@@ -1062,7 +1062,7 @@ async fn a_rules_versions_are_capped() {
     )
     .await;
     assert!(
-        matches!(refused, Err(rules::RuleError::Conflict(_))),
+        matches!(refused, Err(rules::RuleError::VersionCap)),
         "the cap+1'th proposal answered {refused:?} — the version history must be bounded"
     );
     let listed = rules::list(&db.pool, account.firm, account.client)
@@ -1160,7 +1160,7 @@ async fn a_create_refuses_while_the_clients_rule_lock_is_held() {
     )
     .await;
     assert!(
-        matches!(refused, Err(rules::RuleError::Conflict(_))),
+        matches!(refused, Err(rules::RuleError::Busy)),
         "a create under the held lock answered {refused:?} — it must refuse busy"
     );
     tx.rollback().await.unwrap();
@@ -1278,17 +1278,27 @@ async fn an_import_over_the_evaluation_budget_is_refused_by_name() {
         )
         .await
         .unwrap();
-        rules::approve(&db.pool, account.firm, account.client, rule.id, 1, user, true)
-            .await
-            .unwrap();
+        rules::approve(
+            &db.pool,
+            account.firm,
+            account.client,
+            rule.id,
+            1,
+            user,
+            true,
+        )
+        .await
+        .unwrap();
     }
     // 2,000 lines of ~4 KiB narrations ≈ 8 MiB searched × 20 rules > 128 MiB.
     let narration = "x".repeat(4 * 1024);
     let mut csv = String::new();
     for i in 0..2_000 {
-        csv.push_str(&format!(
-            "2026-03-01,,-1.00,USD,{narration},REF-20260301-{i},Acme Ltd,\n"
-        ));
+        use std::fmt::Write as _;
+        let _ = writeln!(
+            csv,
+            "2026-03-01,,-1.00,USD,{narration},REF-20260301-{i},Acme Ltd,"
+        );
     }
     match import(&db.pool, &account, &csv).await {
         Err(recon_db::DbError::EvaluationTooLarge) => {}
@@ -1324,16 +1334,26 @@ async fn a_re_evaluation_does_not_stall_writes_to_the_month() {
         )
         .await
         .unwrap();
-        rules::approve(&db.pool, account.firm, account.client, rule.id, 1, user, true)
-            .await
-            .unwrap();
+        rules::approve(
+            &db.pool,
+            account.firm,
+            account.client,
+            rule.id,
+            1,
+            user,
+            true,
+        )
+        .await
+        .unwrap();
     }
     let narration = "x".repeat(4 * 1024);
     let mut csv = String::new();
     for i in 0..250 {
-        csv.push_str(&format!(
-            "2026-03-01,,-1.00,USD,{narration},REF-20260301-{i},Acme Ltd,\n"
-        ));
+        use std::fmt::Write as _;
+        let _ = writeln!(
+            csv,
+            "2026-03-01,,-1.00,USD,{narration},REF-20260301-{i},Acme Ltd,"
+        );
     }
     import(&db.pool, &account, &csv).await.unwrap().complete();
 
@@ -1484,8 +1504,8 @@ async fn the_closed_period_guards_refuse_writes() {
         .unwrap()
         .complete();
     let lines = lines_in(&db.pool, &account, "unreviewed").await;
-    let line = lines[0];
-    let line2 = lines[1];
+    let match_line = lines[0];
+    let alloc_line = lines[1];
 
     // Rows the guards resolve through, built while the month is open.
     let admin = db.admin_pool().await;
@@ -1497,7 +1517,7 @@ async fn the_closed_period_guards_refuse_writes() {
     .bind(account.firm.as_uuid())
     .bind(account.client.as_uuid())
     .bind(match_id)
-    .bind(line)
+    .bind(match_line)
     .execute(&db.pool)
     .await
     .unwrap();
@@ -1576,7 +1596,7 @@ async fn the_closed_period_guards_refuse_writes() {
             &recon_db::decisions::NewDecision {
                 client: account.client,
                 subject_kind: SubjectKind::Line,
-                subject_id: line,
+                subject_id: match_line,
                 from_state: Some("matched"),
                 to_state: "excluded",
                 actor_kind: ActorKind::Person,
@@ -1603,7 +1623,7 @@ async fn the_closed_period_guards_refuse_writes() {
             &recon_db::decisions::NewDecision {
                 client: account.client,
                 subject_kind: SubjectKind::Line,
-                subject_id: line,
+                subject_id: match_line,
                 from_state: Some("matched"),
                 to_state: "excluded",
                 actor_kind: ActorKind::Person,
@@ -1627,7 +1647,7 @@ async fn the_closed_period_guards_refuse_writes() {
         .bind(account.firm.as_uuid())
         .bind(account.client.as_uuid())
         .bind(match2)
-        .bind(line2),
+        .bind(alloc_line),
         "match_lines_period_guard_insert",
         "recon.match_lines"
     );
@@ -1690,7 +1710,7 @@ async fn the_closed_period_guards_refuse_writes() {
         )
         .bind(account.firm.as_uuid())
         .bind(account.client.as_uuid())
-        .bind(line2)
+        .bind(alloc_line)
         .bind(match2)
         .bind(vec![doc]),
         "proposals_period_guard_insert",
@@ -1704,7 +1724,7 @@ async fn the_closed_period_guards_refuse_writes() {
     .bind(account.firm.as_uuid())
     .bind(account.client.as_uuid())
     .bind(match2)
-    .bind(line2)
+    .bind(alloc_line)
     .execute(&admin)
     .await
     .unwrap();
@@ -1736,7 +1756,7 @@ async fn the_closed_period_guards_refuse_writes() {
     )
     .bind(account.firm.as_uuid())
     .bind(account.client.as_uuid())
-    .bind(line2)
+    .bind(alloc_line)
     .bind(match2)
     .bind(vec![doc])
     .execute(&admin)
@@ -1756,12 +1776,12 @@ async fn reject_match(
             SET status = 'rejected', row_version = row_version + 1
           WHERE firm_id = $1 AND id = $2",
     )
-        .bind(firm.as_uuid())
-        .bind(id)
-        .execute(&mut **tx)
-        .await?;
+    .bind(firm.as_uuid())
+    .bind(id)
+    .execute(&mut **tx)
+    .await?;
     recon_db::decisions::insert(
-        &mut **tx,
+        tx,
         firm,
         &recon_db::decisions::NewDecision {
             client,
@@ -1777,4 +1797,169 @@ async fn reject_match(
     )
     .await?;
     Ok(())
+}
+
+/// N5 — the decision-chain lock precedes the period lock on every path that
+/// writes decisions, so a writer holding `chain_heads` and reaching for the
+/// period cannot deadlock with `re_evaluate` (which used to take them in the
+/// opposite order → 40P01 → 503).
+#[tokio::test]
+async fn the_chain_lock_orders_before_the_period_so_no_deadlock() {
+    let db = TestDb::new().await;
+    let account = tenant(&db.pool).await;
+    import(&db.pool, &account, &dated_rows(2026, 3, &[1], "FEE"))
+        .await
+        .unwrap()
+        .complete();
+    let line = lines_in(&db.pool, &account, "unreviewed").await[0];
+    let user = owner(&db.pool, account.firm, "owner").await;
+
+    // Writer order (the chain trigger's): chain_heads FOR UPDATE, then the
+    // period via periods_lock_lines' FOR KEY SHARE.
+    let mut w = db.pool.begin().await.unwrap();
+    sqlx::query("SELECT recon.chain_heads_lock($1, $2)")
+        .bind(account.firm.as_uuid())
+        .bind(account.client.as_uuid())
+        .execute(&mut *w)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let eval = tokio::spawn({
+        let pool = db.pool.clone();
+        async move {
+            periods::re_evaluate(
+                &pool,
+                account.firm,
+                account.client,
+                account.id,
+                march(),
+                user,
+            )
+            .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Now reach for the period the way a writer does. With the old order the
+    // re_evaluate holds the period FOR UPDATE and waits on chain_heads while
+    // this waits on the period — the deadlock detector kills one of them.
+    let reached = sqlx::query("SELECT recon.periods_lock_lines($1, $2::uuid[])")
+        .bind(account.firm.as_uuid())
+        .bind(vec![line])
+        .execute(&mut *w)
+        .await;
+    assert!(reached.is_ok(), "the writer deadlocked: {reached:?}");
+    w.commit().await.unwrap();
+    eval.await.unwrap().expect("re_evaluate deadlocked");
+}
+
+/// N7 — retired rules hold no capacity: a client at the active cap is refused
+/// `rule_limit`, but retiring a rule frees the slot.
+#[tokio::test]
+async fn a_retired_rule_frees_its_cap_slot() {
+    let db = TestDb::new().await;
+    let account = tenant(&db.pool).await;
+    let user = owner(&db.pool, account.firm, "owner").await;
+    for i in 0..recon_db::rules::MAX_RULES_PER_CLIENT {
+        sqlx::query("INSERT INTO recon.rules (firm_id, id, client_id, name, status) VALUES ($1, $2, $3, $4, 'active')")
+            .bind(account.firm.as_uuid())
+            .bind(Uuid::now_v7())
+            .bind(account.client.as_uuid())
+            .bind(format!("r{i}"))
+            .execute(&db.pool)
+            .await
+            .unwrap();
+    }
+    let (predicate, action) = fee_rule();
+    let refused = rules::create(
+        &db.pool,
+        account.firm,
+        account.client,
+        user,
+        "cap",
+        &predicate,
+        &action,
+    )
+    .await;
+    assert!(
+        matches!(refused, Err(rules::RuleError::Limit)),
+        "{refused:?}"
+    );
+    let r0: Uuid = sqlx::query_scalar(
+        "SELECT id FROM recon.rules WHERE firm_id=$1 AND client_id=$2 AND name='r0'",
+    )
+    .bind(account.firm.as_uuid())
+    .bind(account.client.as_uuid())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    rules::retire(&db.pool, account.firm, account.client, r0, user)
+        .await
+        .unwrap();
+    rules::create(
+        &db.pool,
+        account.firm,
+        account.client,
+        user,
+        "cap",
+        &predicate,
+        &action,
+    )
+    .await
+    .expect("a retired rule must free its cap slot");
+}
+
+/// N6 — the trigger hot path measured: an all-excluded import runs two
+/// statement-level trigger passes per line-write statement; the flip's total
+/// is compared with a no-rule import of the same size, plus a direct
+/// `periods_lock_lines` call over the import's ids. Run with --ignored
+/// --nocapture; numbers are recorded under perf/results/.
+#[tokio::test]
+#[ignore = "measurement; run by hand, recorded under perf/results"]
+async fn n6_measure_the_exclusion_trigger_cost() {
+    let db = TestDb::new().await;
+    let days: Vec<u32> = (1..=28).collect();
+    // Same file twice: once with an auto-apply exclude rule, once without.
+    let mut body = String::new();
+    for round in 0..40 {
+        for d in &days {
+            use std::fmt::Write as _;
+            let _ = writeln!(
+                body,
+                "2026-03-{d:02},,-1.{:02},USD,BANK FEE CHARGE {d},{d}{round}X,BANK,",
+                round % 100
+            );
+        }
+    }
+    let ruled = tenant(&db.pool).await;
+    let user = owner(&db.pool, ruled.firm, "owner").await;
+    let (p, a) = fee_rule();
+    let rule = rules::create(&db.pool, ruled.firm, ruled.client, user, "fee", &p, &a)
+        .await
+        .unwrap();
+    rules::approve(&db.pool, ruled.firm, ruled.client, rule.id, 1, user, true)
+        .await
+        .unwrap();
+    let start = std::time::Instant::now();
+    let imported = import(&db.pool, &ruled, &body).await.unwrap().complete();
+    let with_rule = start.elapsed();
+    let ids = lines_in(&db.pool, &ruled, "excluded").await;
+    assert_eq!(ids.len(), 1120, "{imported:?}");
+
+    let plain = tenant(&db.pool).await;
+    let start = std::time::Instant::now();
+    import(&db.pool, &plain, &body).await.unwrap().complete();
+    let without_rule = start.elapsed();
+
+    let start = std::time::Instant::now();
+    sqlx::query("SELECT recon.periods_lock_lines($1, $2::uuid[])")
+        .bind(ruled.firm.as_uuid())
+        .bind(ids.clone())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let lock_scan = start.elapsed();
+    eprintln!(
+        "N6 measurement: rows=1120 flip_with_auto_exclude={with_rule:?} \
+         flip_no_rule={without_rule:?} periods_lock_lines_1120_ids={lock_scan:?}"
+    );
 }

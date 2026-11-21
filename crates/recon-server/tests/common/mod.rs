@@ -203,6 +203,23 @@ pub async fn upload(
     Ok((status, r.json().await.unwrap_or(Value::Null)))
 }
 
+/// [`upload`] without the body parse, for callers that need the response headers
+/// (the drills assert `Retry-After`).
+pub async fn upload_raw(
+    base: &str,
+    firm: &str,
+    account: &str,
+    body: Vec<u8>,
+) -> Result<reqwest::Response, reqwest::Error> {
+    http()
+        .post(format!("{base}/v1/firms/{firm}/accounts/{account}/imports"))
+        .bearer_auth(TOKEN)
+        .header("content-type", "text/csv")
+        .body(body)
+        .send()
+        .await
+}
+
 /// Fails if the log holds any of `forbidden` (D-025): tokens, narrations, counterparties,
 /// references, amounts.
 pub fn assert_log_clean(log: &std::path::Path, forbidden: &[&str]) {

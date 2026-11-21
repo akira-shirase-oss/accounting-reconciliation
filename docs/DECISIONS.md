@@ -927,11 +927,15 @@ conservative side.
   tables, proposals, and line/match-subject decisions — runs a
   statement-level transition-table trigger that upserts the touched
   `(firm, client, account, month)` periods, locks them `FOR KEY SHARE` in
-  one sorted order, and raises `RCP02` if any is closed. `FOR KEY SHARE`
-  never conflicts with itself, and a close locks exactly one row, so the
-  scheme cannot deadlock; a write either lands before the close's lock
-  (the digest sees it) or waits and is refused — the stored digest cannot
-  miss a decision that landed. A rule create takes the client's `7264`
+  one sorted order, and raises `RCP02` if any is closed. The lock order
+  across the whole scheme is fixed: the decision-chain trigger takes
+  `chain_heads FOR UPDATE` first, and writers then reach the period — so
+  every path that writes decisions (close, reopen, re-evaluate) takes
+  `chain_heads` before the period row too, keeping one order and no cycle;
+  `re_evaluate`'s phase 3 and `close`/`reopen` all lock the chain head
+  ahead of `ensure`'s `FOR UPDATE`. A write either lands before the
+  close's lock (the digest sees it) or waits and is refused — the stored
+  digest cannot miss a decision that landed. A rule create takes the client's `7264`
   advisory lock around its count+insert so racing creates cannot pass
   `MAX_RULES_PER_CLIENT`; versions are capped at `MAX_VERSIONS_PER_RULE`
   (100) and `list` bounded to them. Regex rule predicates compile with a

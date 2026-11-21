@@ -140,15 +140,6 @@ MUTANTS = {
         }""",
         """        let _ = firm;
         Ok(())""",
-        AUTH,
-        """        if !store::is_assigned(pool, self.firm, self.user, client).await? {
-            return Err(ApiError::new(
-                StatusCode::FORBIDDEN,
-                "forbidden",
-                "the client is not assigned to this user",
-            ));
-        }""",
-        """        let _ = client;""",
     ),
     # The operator token arrives as a fabricated person session, and the
     # fabricated person passes the client-assignment check too — the confused
@@ -318,14 +309,15 @@ MUTANTS = {
         "#[serde(deny_unknown_fields)]\npub struct NewAccount {",
         "pub struct NewAccount {",
     ),
-    # Narration content is interpreted (validated as instructions): a URL in it is refused.
+    # Narration content is interpreted as instructions: a URL in it is dialed —
+    # the recording listener sees the connection the inert-string rule prevents.
     "metadata_addresses_in_content_are_inert_strings": (
         PROFILE,
         """        let narration_norm = normalize(narration_raw);
         if narration_norm.is_empty() {""",
         """        let narration_norm = normalize(narration_raw);
-        if narration_norm.contains("://") {
-            return Err(refuse(RefusalCode::MissingRequiredField, Field::Narration));
+        if let Some(rest) = narration_raw.strip_prefix("http://") {
+            let _ = std::net::TcpStream::connect(rest.split('/').next().unwrap_or(""));
         }
         if narration_norm.is_empty() {""",
     ),
