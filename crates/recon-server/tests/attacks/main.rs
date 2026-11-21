@@ -15,6 +15,7 @@ mod common;
 mod auth_bypass;
 mod bodies;
 mod cross_tenant;
+mod egress;
 mod harness;
 mod header_spoof;
 mod rate_limit;

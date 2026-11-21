@@ -329,6 +329,16 @@ MUTANTS = {
         }
         if narration_norm.is_empty() {""",
     ),
+    # The egress guard: a server that dials out on every accept is caught by
+    # the fixed-port recording listener.
+    "the_server_calls_nothing_but_the_model_endpoint": (
+        SERVE,
+        """        let Ok(permit) = permits.clone().try_acquire_owned() else {""",
+        """        tokio::spawn(async move {
+            let _ = tokio::net::TcpStream::connect("127.0.0.1:64977").await;
+        });
+        let Ok(permit) = permits.clone().try_acquire_owned() else {""",
+    ),
 }
 
 ROOT = Path(__file__).resolve().parent.parent

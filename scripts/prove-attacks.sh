@@ -2,7 +2,7 @@
 # Mutation proof for the attack suite (workspace rule, 2026-11-20): every
 # attack test must be proved to fail without the protection it asserts.
 #
-# For each of the 17 tests, `attacks-mutants.py` applies a named mutant that
+# For each of the 18 tests, `attacks-mutants.py` applies a named mutant that
 # removes or weakens exactly that protection; the test binary must compile
 # (a mutant that breaks the build is a broken mutant, not a proof), and the
 # test must fail. A test that stays green under its mutant is a survivor —
