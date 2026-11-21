@@ -131,11 +131,11 @@ async fn metadata_addresses_in_content_are_inert_strings() {
         "booking_date,value_date,amount,currency,narration,reference,counterparty,balance_after\n\
          2026-04-02,,-1.00,USD,{url},REF-1,Big Bank,\n"
     );
-    let (status, _) =
+    let (status, refusal) =
         crate::common::upload(&rig.server.base, &rig.firm, &rig.account, csv.into_bytes())
             .await
             .unwrap();
-    assert_eq!(status, 201);
+    assert_eq!(status, 201, "{refusal}");
     // It imported as a line (a string), and a queue read serves the string
     // back — nothing was fetched. The store holds it VERBATIM.
     let (status, body) = get(
