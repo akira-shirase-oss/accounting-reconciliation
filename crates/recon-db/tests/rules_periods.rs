@@ -21,12 +21,12 @@ use recon_db::testing::TestDb;
 use recon_db::{imports, periods, review, rules};
 use recon_domain::auth::Role;
 use recon_domain::decision::{DecisionRecord, SubjectKind};
-use recon_domain::line::{ExceptionKind, ExcludeReason};
+use recon_domain::line::{ActorKind, ExceptionKind, ExcludeReason};
 use recon_domain::matching::{
     BalancedMatch, DocumentAllocation, LineAllocation, ScoreBreakdown, Tier,
 };
 use recon_domain::rule::{RuleAction, RulePredicate, TextMatch, TextOp};
-use recon_domain::{Currency, DocumentId, FirmId, LineId, Money, UserId};
+use recon_domain::{ClientId, Currency, DocumentId, FirmId, LineId, Money, UserId};
 use serde_json::Value;
 use sqlx::PgPool;
 use time::Date;
@@ -42,6 +42,39 @@ fn usd(minor: i64) -> Money {
 
 fn march() -> Date {
     Date::from_calendar_date(2026, time::Month::March, 1).unwrap()
+}
+
+/// A bare `proposed` match — RCM02 requires its decision in the same transaction.
+async fn insert_match(pool: &PgPool, firm: FirmId, client: ClientId) -> Uuid {
+    let mut tx = pool.begin().await.unwrap();
+    let id: Uuid = sqlx::query_scalar(
+        "INSERT INTO recon.matches (firm_id, client_id, tier, status, currency)
+         VALUES ($1, $2, 't1', 'proposed', 'USD') RETURNING id",
+    )
+    .bind(firm.as_uuid())
+    .bind(client.as_uuid())
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    recon_db::decisions::insert(
+        &mut tx,
+        firm,
+        &recon_db::decisions::NewDecision {
+            client,
+            subject_kind: SubjectKind::Match,
+            subject_id: id,
+            from_state: None,
+            to_state: "proposed",
+            actor_kind: ActorKind::Person,
+            actor_ref: "test",
+            reason_code: "test",
+            evidence: b"{}",
+        },
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    id
 }
 
 fn april() -> Date {
@@ -1222,4 +1255,526 @@ async fn a_close_waits_on_an_in_flight_acknowledgement() {
     a.commit().await.unwrap();
     close.await.unwrap().unwrap();
     db.cleanup().await;
+}
+
+/// N1: the flip's automatic exclusions run under the same evaluation bound as
+/// re-evaluation — a file whose lines × rules exceed it is refused by name,
+/// never run unbounded on the flip's worker.
+#[tokio::test]
+async fn an_import_over_the_evaluation_budget_is_refused_by_name() {
+    let db = TestDb::new().await;
+    let account = tenant(&db.pool).await;
+    let user = owner(&db.pool, account.firm, "owner").await;
+    let (predicate, action) = fee_rule();
+    for i in 0..20 {
+        let rule = rules::create(
+            &db.pool,
+            account.firm,
+            account.client,
+            user,
+            &format!("rule {i}"),
+            &predicate,
+            &action,
+        )
+        .await
+        .unwrap();
+        rules::approve(&db.pool, account.firm, account.client, rule.id, 1, user, true)
+            .await
+            .unwrap();
+    }
+    // 2,000 lines of ~4 KiB narrations ≈ 8 MiB searched × 20 rules > 128 MiB.
+    let narration = "x".repeat(4 * 1024);
+    let mut csv = String::new();
+    for i in 0..2_000 {
+        csv.push_str(&format!(
+            "2026-03-01,,-1.00,USD,{narration},REF-20260301-{i},Acme Ltd,\n"
+        ));
+    }
+    match import(&db.pool, &account, &csv).await {
+        Err(recon_db::DbError::EvaluationTooLarge) => {}
+        Err(err) => panic!("the over-budget import was refused as {err:?}"),
+        Ok(outcome) => panic!("the over-budget import was accepted: {outcome:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_re_evaluation_does_not_stall_writes_to_the_month() {
+    let db = TestDb::new().await;
+    let account = tenant(&db.pool).await;
+    let user = owner(&db.pool, account.firm, "owner").await;
+    // Non-literal regex rules make the evaluation phase seconds long while
+    // staying under the searched-bytes budget: ~1 MiB of narrations × 4 rules.
+    for i in 0..4 {
+        let rule = rules::create(
+            &db.pool,
+            account.firm,
+            account.client,
+            user,
+            &format!("rule {i}"),
+            &RulePredicate {
+                narration: Some(TextMatch {
+                    op: TextOp::Regex,
+                    value: format!("nomatch{i}|[a-z]+q?zz{i}"),
+                }),
+                ..RulePredicate::default()
+            },
+            &RuleAction::Exclude {
+                reason: "probe".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        rules::approve(&db.pool, account.firm, account.client, rule.id, 1, user, true)
+            .await
+            .unwrap();
+    }
+    let narration = "x".repeat(4 * 1024);
+    let mut csv = String::new();
+    for i in 0..250 {
+        csv.push_str(&format!(
+            "2026-03-01,,-1.00,USD,{narration},REF-20260301-{i},Acme Ltd,\n"
+        ));
+    }
+    import(&db.pool, &account, &csv).await.unwrap().complete();
+
+    // The evaluation's own cost, measured uncontended.
+    let start = std::time::Instant::now();
+    periods::re_evaluate(
+        &db.pool,
+        account.firm,
+        account.client,
+        account.id,
+        march(),
+        user,
+    )
+    .await
+    .unwrap();
+    let evaluation = start.elapsed();
+    assert!(
+        evaluation > Duration::from_millis(400),
+        "the evaluation must be observable: {evaluation:?}"
+    );
+
+    // An ordinary writer holds the period row for 1.2 s while a second
+    // re-evaluation runs. If the row lock spans the evaluation (the old shape)
+    // the call serializes hold + eval ≈ E + 1.2 s; if the lock is taken only to
+    // write the decision, the eval overlaps the hold ≈ E.
+    let mut hold = db.pool.begin().await.unwrap();
+    sqlx::query(
+        "SELECT id FROM recon.periods
+          WHERE firm_id = $1 AND client_id = $2 AND account_id = $3 AND month = $4
+          FOR UPDATE",
+    )
+    .bind(account.firm.as_uuid())
+    .bind(account.client.as_uuid())
+    .bind(account.id.as_uuid())
+    .bind(march())
+    .fetch_one(&mut *hold)
+    .await
+    .unwrap();
+    let start = std::time::Instant::now();
+    let running = tokio::spawn({
+        let pool = db.pool.clone();
+        async move {
+            periods::re_evaluate(
+                &pool,
+                account.firm,
+                account.client,
+                account.id,
+                march(),
+                user,
+            )
+            .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    hold.commit().await.unwrap();
+    running.await.unwrap().unwrap();
+    let elapsed = start.elapsed();
+    // New shape: the eval overlaps the hold → elapsed ≈ max(E, 1.2 s). Old
+    // shape: the lock spans the eval → elapsed ≈ E + 1.2 s. The bound
+    // 0.75·(E + hold) separates them whenever E is within (hold/3, 3·hold).
+    assert!(
+        elapsed < (evaluation + Duration::from_millis(1_200)).mul_f64(0.75),
+        "the re-evaluation stalled behind a writer for the whole evaluation: \
+         {elapsed:?} vs solo {evaluation:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_period_write_waits_while_the_months_lock_is_held() {
+    let db = TestDb::new().await;
+    let account = tenant(&db.pool).await;
+    import(&db.pool, &account, &dated_rows(2026, 3, &[1], "FEE"))
+        .await
+        .unwrap()
+        .complete();
+    let line = lines_in(&db.pool, &account, "unreviewed").await[0];
+
+    // Baseline: resolving the line's period on the unlocked row is
+    // milliseconds. Without the FOR KEY SHARE the held call below takes the
+    // same time — it would check the period status without waiting on it.
+    let start = std::time::Instant::now();
+    sqlx::query("SELECT recon.periods_lock_lines($1, $2::uuid[])")
+        .bind(account.firm.as_uuid())
+        .bind(vec![line])
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let baseline = start.elapsed();
+    assert!(baseline < Duration::from_millis(500), "{baseline:?}");
+
+    let mut hold = db.pool.begin().await.unwrap();
+    sqlx::query(
+        "SELECT id FROM recon.periods
+          WHERE firm_id = $1 AND client_id = $2 AND account_id = $3 AND month = $4
+          FOR UPDATE",
+    )
+    .bind(account.firm.as_uuid())
+    .bind(account.client.as_uuid())
+    .bind(account.id.as_uuid())
+    .bind(march())
+    .fetch_one(&mut *hold)
+    .await
+    .unwrap();
+    let start = std::time::Instant::now();
+    let write = tokio::spawn({
+        let pool = db.pool.clone();
+        async move {
+            sqlx::query("SELECT recon.periods_lock_lines($1, $2::uuid[])")
+                .bind(account.firm.as_uuid())
+                .bind(vec![line])
+                .execute(&pool)
+                .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    hold.commit().await.unwrap();
+    write.await.unwrap().unwrap();
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(700),
+        "the period write did not wait on the month's lock ({elapsed:?} vs baseline {baseline:?})"
+    );
+}
+
+/// One guarded write: refused while the month is closed, accepted once its own
+/// trigger is dropped — the drop is the proof the guard is the refusing layer.
+macro_rules! guard {
+    ($admin:expr, $write:expr, $trigger:literal, $table:literal) => {{
+        let err = $write.execute($admin).await.unwrap_err();
+        assert!(
+            format!("{err:?}").to_lowercase().contains("closed"),
+            "the write was not refused by the closed-period guard: {err:?}"
+        );
+        sqlx::query(concat!("DROP TRIGGER ", $trigger, " ON ", $table))
+            .execute($admin)
+            .await
+            .unwrap();
+    }};
+}
+
+#[tokio::test]
+async fn the_closed_period_guards_refuse_writes() {
+    let db = TestDb::new().await;
+    let account = tenant(&db.pool).await;
+    let user = owner(&db.pool, account.firm, "owner").await;
+    import(&db.pool, &account, &dated_rows(2026, 3, &[1, 2], "FEE"))
+        .await
+        .unwrap()
+        .complete();
+    let lines = lines_in(&db.pool, &account, "unreviewed").await;
+    let line = lines[0];
+    let line2 = lines[1];
+
+    // Rows the guards resolve through, built while the month is open.
+    let admin = db.admin_pool().await;
+    let match_id = insert_match(&db.pool, account.firm, account.client).await;
+    sqlx::query(
+        "INSERT INTO recon.match_lines (firm_id, client_id, match_id, line_id, amount_minor)
+         VALUES ($1, $2, $3, $4, -100)",
+    )
+    .bind(account.firm.as_uuid())
+    .bind(account.client.as_uuid())
+    .bind(match_id)
+    .bind(line)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    import_documents(
+        &db.pool,
+        &account,
+        "receipt,R-1,2026-03-05,,1.00,USD,Acme Ltd,\n",
+    )
+    .await
+    .unwrap()
+    .complete();
+    let doc: Uuid = sqlx::query_scalar(
+        "SELECT id FROM recon.documents WHERE firm_id = $1 AND client_id = $2 LIMIT 1",
+    )
+    .bind(account.firm.as_uuid())
+    .bind(account.client.as_uuid())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let match2 = insert_match(&db.pool, account.firm, account.client).await;
+
+    // The writes must stay domain-valid to reach the period guard (an allocation
+    // needs an unreviewed line), so the month is marked closed directly — a real
+    // close would refuse on the still-unreviewed line.
+    let mut tx = db.pool.begin().await.unwrap();
+    sqlx::query(
+        "UPDATE recon.periods
+            SET status = 'closed', closed_by = $5, closed_at = now(),
+                row_version = row_version + 1, chain_seq = 0,
+                digest = decode(repeat('00', 32), 'hex'),
+                chain_head = decode(repeat('00', 32), 'hex')
+          WHERE firm_id = $1 AND client_id = $2 AND account_id = $3 AND month = $4",
+    )
+    .bind(account.firm.as_uuid())
+    .bind(account.client.as_uuid())
+    .bind(account.id.as_uuid())
+    .bind(march())
+    .bind(user.as_uuid())
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    let period_id: Uuid =
+        sqlx::query_scalar("SELECT id FROM recon.periods WHERE firm_id = $1 AND client_id = $2 AND account_id = $3 AND month = $4")
+            .bind(account.firm.as_uuid())
+            .bind(account.client.as_uuid())
+            .bind(account.id.as_uuid())
+            .bind(march())
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+    recon_db::decisions::insert(
+        &mut tx,
+        account.firm,
+        &recon_db::decisions::NewDecision {
+            client: account.client,
+            subject_kind: SubjectKind::Period,
+            subject_id: period_id,
+            from_state: Some("open"),
+            to_state: "closed",
+            actor_kind: ActorKind::Person,
+            actor_ref: "test",
+            reason_code: "test",
+            evidence: b"{}",
+        },
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    // decision_log insert: a line-subject decision is a write on the period too.
+    {
+        let mut tx = db.pool.begin().await.unwrap();
+        let err = recon_db::decisions::insert(
+            &mut tx,
+            account.firm,
+            &recon_db::decisions::NewDecision {
+                client: account.client,
+                subject_kind: SubjectKind::Line,
+                subject_id: line,
+                from_state: Some("matched"),
+                to_state: "excluded",
+                actor_kind: ActorKind::Person,
+                actor_ref: "test",
+                reason_code: "test",
+                evidence: b"{}",
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{err:?}").to_lowercase().contains("closed"),
+            "the line decision was not refused by the closed-period guard: {err:?}"
+        );
+        tx.rollback().await.unwrap();
+        sqlx::query("DROP TRIGGER decision_log_period_guard_insert ON recon.decision_log")
+            .execute(&admin)
+            .await
+            .unwrap();
+        let mut tx = db.pool.begin().await.unwrap();
+        recon_db::decisions::insert(
+            &mut tx,
+            account.firm,
+            &recon_db::decisions::NewDecision {
+                client: account.client,
+                subject_kind: SubjectKind::Line,
+                subject_id: line,
+                from_state: Some("matched"),
+                to_state: "excluded",
+                actor_kind: ActorKind::Person,
+                actor_ref: "test",
+                reason_code: "test",
+                evidence: b"{}",
+            },
+        )
+        .await
+        .unwrap();
+        tx.rollback().await.unwrap();
+    }
+
+    // match_lines insert: a new allocation into the closed month.
+    guard!(
+        &admin,
+        sqlx::query(
+            "INSERT INTO recon.match_lines (firm_id, client_id, match_id, line_id, amount_minor)
+             VALUES ($1, $2, $3, $4, -100)",
+        )
+        .bind(account.firm.as_uuid())
+        .bind(account.client.as_uuid())
+        .bind(match2)
+        .bind(line2),
+        "match_lines_period_guard_insert",
+        "recon.match_lines"
+    );
+    // matches update: a status change resolves through its allocations — and
+    // takes its own decision (RCM01/RCM02) to stay domain-valid.
+    {
+        let mut tx = admin.begin().await.unwrap();
+        let err = reject_match(&mut tx, account.firm, account.client, match_id)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:?}").to_lowercase().contains("closed"),
+            "the match update was not refused by the closed-period guard: {err:?}"
+        );
+        tx.rollback().await.unwrap();
+        sqlx::query("DROP TRIGGER matches_period_guard_update ON recon.matches")
+            .execute(&admin)
+            .await
+            .unwrap();
+        let mut tx = admin.begin().await.unwrap();
+        reject_match(&mut tx, account.firm, account.client, match_id)
+            .await
+            .unwrap();
+        tx.rollback().await.unwrap();
+    }
+    // match_documents insert.
+    guard!(
+        &admin,
+        sqlx::query(
+            "INSERT INTO recon.match_documents (firm_id, client_id, match_id, document_id, amount_minor)
+             VALUES ($1, $2, $3, $4, 100)",
+        )
+        .bind(account.firm.as_uuid())
+        .bind(account.client.as_uuid())
+        .bind(match_id)
+        .bind(doc),
+        "match_documents_period_guard_insert",
+        "recon.match_documents"
+    );
+    // match_residuals insert.
+    guard!(
+        &admin,
+        sqlx::query(
+            "INSERT INTO recon.match_residuals (firm_id, client_id, match_id, code, amount_minor)
+             VALUES ($1, $2, $3, 'rounding', 1)",
+        )
+        .bind(account.firm.as_uuid())
+        .bind(account.client.as_uuid())
+        .bind(match_id),
+        "match_residuals_period_guard_insert",
+        "recon.match_residuals"
+    );
+    // proposals insert.
+    guard!(
+        &admin,
+        sqlx::query(
+            "INSERT INTO recon.proposals
+                 (firm_id, client_id, line_id, match_id, actor, engine_version, candidates)
+             VALUES ($1, $2, $3, $4, 'engine', 'test', $5)",
+        )
+        .bind(account.firm.as_uuid())
+        .bind(account.client.as_uuid())
+        .bind(line2)
+        .bind(match2)
+        .bind(vec![doc]),
+        "proposals_period_guard_insert",
+        "recon.proposals"
+    );
+    // Every write the guard refused now lands — proving the trigger was the wall.
+    sqlx::query(
+        "INSERT INTO recon.match_lines (firm_id, client_id, match_id, line_id, amount_minor)
+         VALUES ($1, $2, $3, $4, -100)",
+    )
+    .bind(account.firm.as_uuid())
+    .bind(account.client.as_uuid())
+    .bind(match2)
+    .bind(line2)
+    .execute(&admin)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO recon.match_documents (firm_id, client_id, match_id, document_id, amount_minor)
+         VALUES ($1, $2, $3, $4, 100)",
+    )
+    .bind(account.firm.as_uuid())
+    .bind(account.client.as_uuid())
+    .bind(match_id)
+    .bind(doc)
+    .execute(&admin)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO recon.match_residuals (firm_id, client_id, match_id, code, amount_minor)
+         VALUES ($1, $2, $3, 'rounding', 1)",
+    )
+    .bind(account.firm.as_uuid())
+    .bind(account.client.as_uuid())
+    .bind(match_id)
+    .execute(&admin)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO recon.proposals
+             (firm_id, client_id, line_id, match_id, actor, engine_version, candidates)
+         VALUES ($1, $2, $3, $4, 'engine', 'test', $5)",
+    )
+    .bind(account.firm.as_uuid())
+    .bind(account.client.as_uuid())
+    .bind(line2)
+    .bind(match2)
+    .bind(vec![doc])
+    .execute(&admin)
+    .await
+    .unwrap();
+}
+
+/// A domain-valid status change on a match — the update plus its decision.
+async fn reject_match(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    firm: FirmId,
+    client: ClientId,
+    id: Uuid,
+) -> Result<(), recon_db::DbError> {
+    sqlx::query(
+        "UPDATE recon.matches
+            SET status = 'rejected', row_version = row_version + 1
+          WHERE firm_id = $1 AND id = $2",
+    )
+        .bind(firm.as_uuid())
+        .bind(id)
+        .execute(&mut **tx)
+        .await?;
+    recon_db::decisions::insert(
+        &mut **tx,
+        firm,
+        &recon_db::decisions::NewDecision {
+            client,
+            subject_kind: SubjectKind::Match,
+            subject_id: id,
+            from_state: Some("proposed"),
+            to_state: "rejected",
+            actor_kind: ActorKind::Person,
+            actor_ref: "test",
+            reason_code: "test",
+            evidence: b"{}",
+        },
+    )
+    .await?;
+    Ok(())
 }

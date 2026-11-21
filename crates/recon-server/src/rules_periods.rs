@@ -78,6 +78,12 @@ fn period_error(e: periods::PeriodError) -> ApiError {
             "an import into this account is being published; nothing changed, try again shortly",
         )
         .retry_after(2),
+        periods::PeriodError::ReEvaluationBusy => ApiError::new(
+            StatusCode::CONFLICT,
+            "re_evaluation_busy",
+            "a re-evaluation is already running for this firm; try again shortly",
+        )
+        .retry_after(2),
         periods::PeriodError::EvaluationTooLarge => ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
             "period_evaluation_too_large",

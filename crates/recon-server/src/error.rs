@@ -152,6 +152,11 @@ impl ApiError {
                 "period_closed",
                 "the line's period is closed",
             ),
+            DbError::EvaluationTooLarge => Self::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "import_evaluation_too_large",
+                "the file's lines under the client's automatic rules exceed the evaluation bound; split the file or retire some automatic rules",
+            ),
             DbError::NotARevision => Self::new(
                 StatusCode::CONFLICT,
                 "not_a_revision",

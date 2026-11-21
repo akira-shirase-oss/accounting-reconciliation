@@ -571,8 +571,8 @@ pub async fn apply_exclusions(
     for (rule_id, version, predicate, action) in &rules {
         // A stored predicate was validated at write; a mismatch is a defect.
         compiled.push((
-            rule_id,
-            version,
+            *rule_id,
+            *version,
             CompiledPredicate::compile(predicate, action)
                 .map_err(|e| DbError::Inconsistent(format!("stored rule: {e}")))?,
             action.clone(),
@@ -588,58 +588,95 @@ pub async fn apply_exclusions(
     .bind(import)
     .fetch_all(&mut *conn)
     .await?;
-    let mut applied = 0u32;
+    // The work bound (N1): the same lines × rules × bytes budget re-evaluation
+    // carries, checked before the search runs on a blocking worker — the flip's
+    // transaction holds the account lock, so an unbounded search would stall
+    // the account and a Tokio worker alike.
+    let mut owned: Vec<(Uuid, String, Option<String>, i64, Uuid)> = Vec::with_capacity(lines.len());
+    let mut searched_bytes: u64 = 0;
     for line in &lines {
-        let counterparty: Option<String> = line.try_get("counterparty_norm")?;
         let narration: String = line.try_get("narration_norm")?;
-        let facts = rule::LineFacts {
-            narration: &narration,
-            counterparty: counterparty.as_deref(),
-            amount_minor: line.try_get("amount_minor")?,
-            account: line.try_get("account_id")?,
-        };
-        let mut matched = None;
-        for entry in &mut compiled {
-            if entry.2.matches(&facts) {
-                matched = Some(entry);
-                break;
+        searched_bytes = searched_bytes.saturating_add(narration.len() as u64);
+        owned.push((
+            line.try_get("id")?,
+            narration,
+            line.try_get("counterparty_norm")?,
+            line.try_get("amount_minor")?,
+            line.try_get("account_id")?,
+        ));
+    }
+    if rule::evaluation_too_big(searched_bytes, compiled.len()) {
+        return Err(DbError::EvaluationTooLarge);
+    }
+    let matched = tokio::task::spawn_blocking(move || {
+        let mut compiled = compiled;
+        let mut matched: Vec<(Uuid, Uuid, i32, String)> = Vec::new();
+        for (id, narration, counterparty, amount_minor, account) in &owned {
+            let facts = rule::LineFacts {
+                narration,
+                counterparty: counterparty.as_deref(),
+                amount_minor: *amount_minor,
+                account: *account,
+            };
+            for entry in &mut compiled {
+                if entry.2.matches(&facts) {
+                    if let RuleAction::Exclude { reason } = &entry.3 {
+                        matched.push((*id, entry.0, entry.1, reason.clone()));
+                    }
+                    break; // first matching rule wins
+                }
             }
         }
-        let Some((rule_id, version, _, action)) = matched else {
-            continue;
-        };
-        let RuleAction::Exclude { reason } = action else {
-            continue; // auto-apply rows are exclusions by definition
-        };
-        let line_id: Uuid = line.try_get("id")?;
-        sqlx::query(
-            "UPDATE recon.statement_lines SET status = 'excluded', row_version = row_version + 1
-              WHERE firm_id = $1 AND id = $2 AND status = 'unreviewed'",
-        )
-        .bind(firm.as_uuid())
-        .bind(line_id)
-        .execute(&mut *conn)
-        .await?;
-        let body = evidence(&serde_json::json!({
-            "rule": rule_id, "version": version,
-        }))?;
-        decisions::insert(
-            conn,
-            firm,
-            &NewDecision {
-                client,
-                subject_kind: SubjectKind::Line,
-                subject_id: line_id,
-                from_state: Some("unreviewed"),
-                to_state: "excluded",
-                actor_kind: ActorKind::Rule,
-                actor_ref: &format!("rule:{rule_id}@v{version}"),
-                reason_code: reason,
-                evidence: &body,
-            },
-        )
-        .await?;
-        applied = applied.saturating_add(1);
+        matched
+    })
+    .await
+    .map_err(|e| DbError::Inconsistent(format!("exclusion worker: {e}")))?;
+    if matched.is_empty() {
+        return Ok(0);
     }
-    Ok(applied)
+    // One bulk state move and one bulk decision insert (N1): the same
+    // commit-time state as per-line writes, two round trips, in line order.
+    let line_ids: Vec<Uuid> = matched.iter().map(|m| m.0).collect();
+    sqlx::query(
+        "UPDATE recon.statement_lines SET status = 'excluded', row_version = row_version + 1
+          WHERE firm_id = $1 AND id = ANY($2) AND status = 'unreviewed'",
+    )
+    .bind(firm.as_uuid())
+    .bind(&line_ids)
+    .execute(&mut *conn)
+    .await?;
+    let mut ids = Vec::with_capacity(matched.len());
+    let mut subjects = Vec::with_capacity(matched.len());
+    let mut refs = Vec::with_capacity(matched.len());
+    let mut reasons = Vec::with_capacity(matched.len());
+    let mut evidences = Vec::with_capacity(matched.len());
+    for (line_id, rule_id, version, reason) in &matched {
+        ids.push(Uuid::now_v7());
+        subjects.push(*line_id);
+        refs.push(format!("rule:{rule_id}@v{version}"));
+        reasons.push(reason.clone());
+        evidences.push(evidence(&serde_json::json!({
+            "rule": rule_id, "version": version,
+        }))?);
+    }
+    sqlx::query(
+        "INSERT INTO recon.decision_log
+             (firm_id, client_id, id, subject_kind, subject_id, from_state, to_state,
+              actor_kind, actor_ref, reason_code, evidence, engine_version)
+         SELECT $1, $2, d.id, 'line', d.subject_id, 'unreviewed', 'excluded',
+                'rule', d.actor_ref, d.reason_code, d.evidence, $3
+           FROM unnest($4::uuid[], $5::uuid[], $6::text[], $7::text[], $8::bytea[])
+                AS d(id, subject_id, actor_ref, reason_code, evidence)",
+    )
+    .bind(firm.as_uuid())
+    .bind(client.as_uuid())
+    .bind(decisions::engine_version())
+    .bind(&ids)
+    .bind(&subjects)
+    .bind(&refs)
+    .bind(&reasons)
+    .bind(&evidences)
+    .execute(&mut *conn)
+    .await?;
+    Ok(u32::try_from(matched.len()).unwrap_or(u32::MAX))
 }

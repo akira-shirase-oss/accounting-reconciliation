@@ -48,6 +48,10 @@ pub enum DbError {
     /// an owner reopens the month or the file is replaced (D-015).
     #[error("the file's lines fall in a closed period")]
     PeriodClosed,
+    /// The import's automatic-exclusion evaluation exceeds the work bound: the file is
+    /// refused by name rather than run unbounded on the flip's worker (N1).
+    #[error("the import's rule evaluation exceeds its work bound")]
+    EvaluationTooLarge,
     /// The database could not be reached in time (pool timeout, connection refused, I/O).
     #[error("database unavailable")]
     Unavailable(#[source] sqlx::Error),

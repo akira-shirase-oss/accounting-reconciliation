@@ -362,7 +362,11 @@ if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "list"
     if cmd == "list":
         print("\n".join(MUTANTS))
+    elif cmd == "files":
+        entry = MUTANTS[sys.argv[2]]
+        triples = entry[:-1] if entry[-1] is True else entry
+        print("\n".join(dict.fromkeys(triples[::3])))
     elif cmd == "apply":
         apply(sys.argv[2])
     else:
-        sys.exit(f"usage: {sys.argv[0]} list | apply <mutant>")
+        sys.exit(f"usage: {sys.argv[0]} list | files <mutant> | apply <mutant>")

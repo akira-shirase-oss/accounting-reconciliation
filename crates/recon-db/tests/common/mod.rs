@@ -89,6 +89,7 @@ pub fn month_rows(first: u32, n: u32) -> String {
     out
 }
 
+#[derive(Debug)]
 pub enum Imported {
     Flipped(FlipOutcome),
     Refused(ImportRecord),

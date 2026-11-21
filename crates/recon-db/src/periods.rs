@@ -94,6 +94,9 @@ pub enum PeriodError {
     AccountBusy,
     /// The re-evaluation would scan more work than the bound allows (S1-2).
     EvaluationTooLarge,
+    /// Another re-evaluation of this firm is already running — the per-firm cap
+    /// bounds the blocking CPU one caller can burn (N2).
+    ReEvaluationBusy,
     /// Storage.
     Db(DbError),
 }
@@ -166,6 +169,39 @@ async fn ensure(
         "SELECT id, status, digest, chain_seq, chain_head, row_version, month FROM recon.periods
           WHERE firm_id = $1 AND client_id = $2 AND account_id = $3 AND month = $4
           FOR UPDATE",
+    )
+    .bind(firm.as_uuid())
+    .bind(client.as_uuid())
+    .bind(account.as_uuid())
+    .bind(month)
+    .fetch_one(&mut *conn)
+    .await?;
+    period(&row).map_err(PeriodError::Db)
+}
+
+/// `ensure` without the row lock: the period is created when missing, but the read
+/// takes no `FOR UPDATE` so a caller may hold the row across a long evaluation
+/// (N2 — `re_evaluate` locks only to write its decision).
+async fn ensure_unlocked(
+    conn: &mut PgConnection,
+    firm: FirmId,
+    client: ClientId,
+    account: AccountId,
+    month: Date,
+) -> Result<Period, PeriodError> {
+    sqlx::query(
+        "INSERT INTO recon.periods (firm_id, client_id, account_id, month)
+         VALUES ($1, $2, $3, $4) ON CONFLICT (firm_id, client_id, account_id, month) DO NOTHING",
+    )
+    .bind(firm.as_uuid())
+    .bind(client.as_uuid())
+    .bind(account.as_uuid())
+    .bind(month)
+    .execute(&mut *conn)
+    .await?;
+    let row = sqlx::query(
+        "SELECT id, status, digest, chain_seq, chain_head, row_version, month FROM recon.periods
+          WHERE firm_id = $1 AND client_id = $2 AND account_id = $3 AND month = $4",
     )
     .bind(firm.as_uuid())
     .bind(client.as_uuid())
@@ -477,42 +513,56 @@ pub async fn re_evaluate(
     month: Date,
     user: UserId,
 ) -> Result<ReEvaluation, PeriodError> {
-    let mut tx = pool.begin().await?;
-    if !account_exists(&mut tx, firm, client, account).await? {
-        return Err(PeriodError::NotFound);
-    }
-    let p = ensure(&mut tx, firm, client, account, month).await?;
-    if p.status == "closed" {
-        return Err(PeriodError::Closed);
-    }
-    let rules = active_rules(&mut tx, firm, client, false).await?;
-    let mut compiled = Vec::with_capacity(rules.len());
-    for (rule_id, version, predicate, action) in &rules {
-        compiled.push((
-            *rule_id,
-            *version,
-            CompiledPredicate::compile(predicate, action)
-                .map_err(|e| DbError::Inconsistent(format!("stored rule: {e}")))?,
-            action.clone(),
-        ));
-    }
-    let lines = sqlx::query(
-        "SELECT id, narration_norm, counterparty_norm, amount_minor, account_id
-           FROM recon.statement_lines l
-          WHERE l.firm_id = $1 AND l.client_id = $2 AND l.account_id = $3
-            AND date_trunc('month', l.booking_date)::date = $4
-            AND l.status IN ('unreviewed', 'exception')
-          ORDER BY l.booking_date, l.row_no
-          LIMIT $5",
+    let _permit = re_evaluation_permit(firm)?;
+    // Phase 1 — short read transaction, no row lock: the month's rules and lines
+    // are copied out so the evaluation runs against a snapshot.
+    let (compiled, lines) = {
+        let mut tx = pool.begin().await?;
+        if !account_exists(&mut tx, firm, client, account).await? {
+            return Err(PeriodError::NotFound);
+        }
+        let p = ensure_unlocked(&mut tx, firm, client, account, month).await?;
+        if p.status == "closed" {
+            return Err(PeriodError::Closed);
+        }
+        let rules = active_rules(&mut tx, firm, client, false).await?;
+        let mut compiled = Vec::with_capacity(rules.len());
+        for (rule_id, version, predicate, action) in &rules {
+            compiled.push((
+                *rule_id,
+                *version,
+                CompiledPredicate::compile(predicate, action)
+                    .map_err(|e| DbError::Inconsistent(format!("stored rule: {e}")))?,
+                action.clone(),
+            ));
+        }
+        let lines = sqlx::query(
+            "SELECT id, narration_norm, counterparty_norm, amount_minor, account_id
+               FROM recon.statement_lines l
+              WHERE l.firm_id = $1 AND l.client_id = $2 AND l.account_id = $3
+                AND date_trunc('month', l.booking_date)::date = $4
+                AND l.status IN ('unreviewed', 'exception')
+              ORDER BY l.booking_date, l.row_no
+              LIMIT $5",
+        )
+        .bind(firm.as_uuid())
+        .bind(client.as_uuid())
+        .bind(account.as_uuid())
+        .bind(month)
+        .bind(MAX_EVALUATED_LINES)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        (compiled, lines)
+    };
+    // Phase 2 — evaluate outside any transaction, deadline-bound; the row lock is
+    // not held while the blocking worker runs (N2).
+    let (compiled, proposals, truncated) = tokio::time::timeout(
+        RE_EVALUATION_DEADLINE,
+        run_evaluation(compiled, &lines),
     )
-    .bind(firm.as_uuid())
-    .bind(client.as_uuid())
-    .bind(account.as_uuid())
-    .bind(month)
-    .bind(MAX_EVALUATED_LINES)
-    .fetch_all(&mut *tx)
-    .await?;
-    let (compiled, proposals, truncated) = run_evaluation(compiled, &lines).await?;
+    .await
+    .map_err(|_| PeriodError::EvaluationTooLarge)??;
     let rule_versions: Vec<serde_json::Value> = compiled
         .iter()
         .map(|(id, v, _, _)| serde_json::json!({"rule": id, "version": v}))
@@ -524,6 +574,13 @@ pub async fn re_evaluate(
         "proposals": proposals.len(),
         "truncated": truncated,
     }))?;
+    // Phase 3 — lock only to write the decision; a close may have landed while the
+    // evaluation ran, so the status is checked again under the lock.
+    let mut tx = pool.begin().await?;
+    let p = ensure(&mut tx, firm, client, account, month).await?;
+    if p.status == "closed" {
+        return Err(PeriodError::Closed);
+    }
     decide(
         &mut tx,
         firm,
@@ -544,6 +601,35 @@ pub async fn re_evaluate(
         proposals,
         truncated,
     })
+}
+
+/// Most re-evaluations one firm may run at once — the work runs on a blocking
+/// worker, so the cap bounds the CPU any one tenant can burn (N2).
+const MAX_RE_EVALUATIONS_PER_FIRM: usize = 1;
+/// The evaluation phase's wall-clock bound — a deadline alongside the searched-
+/// bytes budget, since regex cost is not linear in bytes alone (N2).
+const RE_EVALUATION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
+/// Per-firm re-evaluation semaphores (created on demand, one per firm).
+static RE_EVALUATION_PERMITS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<Uuid, std::sync::Arc<tokio::sync::Semaphore>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+fn re_evaluation_permit(
+    firm: FirmId,
+) -> Result<tokio::sync::OwnedSemaphorePermit, PeriodError> {
+    let semaphore = {
+        let mut map = RE_EVALUATION_PERMITS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        map.entry(firm.as_uuid())
+            .or_insert_with(|| {
+                std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_RE_EVALUATIONS_PER_FIRM))
+            })
+            .clone()
+    };
+    semaphore
+        .try_acquire_owned()
+        .map_err(|_| PeriodError::ReEvaluationBusy)
 }
 
 /// The compiled form of one active rule for [`run_evaluation`].
