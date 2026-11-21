@@ -1411,11 +1411,12 @@ async fn a_re_evaluation_does_not_stall_writes_to_the_month() {
     hold.commit().await.unwrap();
     running.await.unwrap().unwrap();
     let elapsed = start.elapsed();
-    // New shape: the eval overlaps the hold → elapsed ≈ max(E, 1.2 s). Old
-    // shape: the lock spans the eval → elapsed ≈ E + 1.2 s. The bound
-    // 0.75·(E + hold) separates them whenever E is within (hold/3, 3·hold).
+    // New shape: the eval overlaps the hold → elapsed ≈ max(E, hold). Old
+    // shape: the lock spans the eval → elapsed ≈ E + hold. The bound
+    // E + hold/2 separates them for any E > hold/2 and tolerates the jitter
+    // a loaded test host adds to both runs.
     assert!(
-        elapsed < (evaluation + Duration::from_millis(1_200)).mul_f64(0.75),
+        elapsed < evaluation + Duration::from_millis(600),
         "the re-evaluation stalled behind a writer for the whole evaluation: \
          {elapsed:?} vs solo {evaluation:?}"
     );
