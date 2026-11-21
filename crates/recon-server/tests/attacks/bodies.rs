@@ -40,22 +40,32 @@ async fn a_body_past_the_cap_is_refused() {
         .header("expect", "100-continue")
         .body(body)
         .send()
-        .await
-        .unwrap();
-    assert_eq!(
-        r.status(),
-        413,
-        "the oversized body answered {}",
-        r.status()
-    );
-    // The named refusal, not just any 4xx: `file_too_large` is the contract a
-    // client can act on — anything else means some other check fired first.
-    let body: serde_json::Value = r.json().await.unwrap();
-    assert_eq!(
-        body["error"]["code"].as_str().unwrap_or(""),
-        "file_too_large",
-        "the refusal code: {body}"
-    );
+        .await;
+    let body: Option<serde_json::Value> = match r {
+        Ok(r) => {
+            assert_eq!(
+                r.status(),
+                413,
+                "the oversized body answered {}",
+                r.status()
+            );
+            Some(r.json().await.unwrap())
+        }
+        // Under load the 413 + connection-drop can land while reqwest is still
+        // writing the 50 MiB — the reset is the refusal reaching the wire; there
+        // is no body to read, and the staged-nothing check below still applies.
+        Err(e) if e.to_string().contains("Connection reset") => None,
+        Err(e) => panic!("the oversized upload failed oddly: {e}"),
+    };
+    if let Some(body) = body {
+        // The named refusal, not just any 4xx: `file_too_large` is the contract
+        // a client can act on — anything else means some other check fired first.
+        assert_eq!(
+            body["error"]["code"].as_str().unwrap_or(""),
+            "file_too_large",
+            "the refusal code: {body}"
+        );
+    }
     // The stored-state check: nothing was staged or imported.
     let (imports, lines): (i64, i64) = sqlx::query_as(
         "SELECT
