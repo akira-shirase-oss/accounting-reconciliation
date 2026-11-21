@@ -173,6 +173,39 @@ async fn reference_digest(file: &Arc<Vec<u8>>, rows: i64) -> String {
     digest
 }
 
+/// The resume's upload, honouring the 503's `Retry-After`: the server's prompt
+/// refusal is the contract (db-down asserts it is prompt), and the caller retrying
+/// it is the designed answer. Bounded: eight tries at the hinted second, then the
+/// last answer stands for the assertion to judge.
+async fn upload_honouring_retry(
+    base: &str,
+    firm: &str,
+    account: &str,
+    file: &Arc<Vec<u8>>,
+    point: &str,
+) -> (u16, Value) {
+    for attempt in 0..8 {
+        let answered = upload(base, firm, account, file.to_vec())
+            .await
+            .unwrap_or((0, Value::Null));
+        let transient = matches!(answered.0, 503)
+            || answered
+                .1
+                .get("error")
+                .and_then(|e| e.get("code"))
+                .and_then(Value::as_str)
+                .is_some_and(|c| c == "database_unavailable" || c == "overloaded");
+        if !transient || attempt == 7 {
+            if attempt > 0 {
+                eprintln!("kill-mid-import: {point}: upload answered after {attempt} retries");
+            }
+            return answered;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    unreachable!()
+}
+
 async fn kill_at(point: String, file: Arc<Vec<u8>>, rows: i64, reference: Arc<String>) {
     let db = TestDb::new().await;
     fixed_tenant(&db).await;
@@ -221,12 +254,13 @@ async fn kill_at(point: String, file: Arc<Vec<u8>>, rows: i64, reference: Arc<St
         );
     }
 
-    // A fresh process: the re-run completes exactly once.
+    // A fresh process: the re-run completes exactly once. A 503 database_unavailable
+    // (or overloaded) on a just-resumed server is the designed prompt refusal — it
+    // carries Retry-After, and the re-run is the caller meant to honour it: retry,
+    // bounded, never silently (a first-answer 503 made this flake at load ~500).
     let server = Server::start(&db.app_url(), &KILL_ENV).await;
     let (firm, account) = firm_path();
-    let (status, body) = upload(&server.base, &firm, &account, file.to_vec())
-        .await
-        .unwrap();
+    let (status, body) = upload_honouring_retry(&server.base, &firm, &account, &file, &point).await;
     if point == "after_commit" {
         assert_eq!(
             (status, body["duplicate_file"].as_bool()),
