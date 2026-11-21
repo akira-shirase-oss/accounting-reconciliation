@@ -58,4 +58,14 @@ async fn the_sign_in_back_off_locks_and_stays_locked() {
     )
     .await;
     assert_eq!(status, 429, "the address key did not hold: {body}");
+
+    // The store agrees no refused attempt minted anything: the only session is
+    // the owner's, enrolled before the attack.
+    let sessions: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM recon.sessions WHERE firm_id = $1")
+            .bind(uuid::Uuid::parse_str(&rig.firm).unwrap())
+            .fetch_one(&rig.db.pool)
+            .await
+            .unwrap();
+    assert_eq!(sessions, 1, "a locked sign-in still wrote a session");
 }

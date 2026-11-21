@@ -50,16 +50,20 @@ async fn a_host_header_lie_changes_nothing() {
 #[tokio::test]
 async fn a_spoofed_client_ip_does_not_beat_the_sign_in_back_off() {
     let rig = Rig::start().await;
-    let email = format!("attacker-{}@example.test", &rig.firm[..8]);
-    let sign_in = json!({"firm": rig.firm, "email": email, "password": "wrong-password-1"});
-    // Hammer until the lock answers, claiming a different client IP every time:
-    // the throttle must not be evadable by header tricks.
+    // Real credential stuffing rotates BOTH the account and the claimed client
+    // IP — the throttle's address key must see through the header lies and lock
+    // the real peer anyway. (Rotating the email is what isolates the address
+    // key: one email would lock on the account key either way.)
     let mut locked = false;
     for i in 0..32 {
         let r = http()
             .post(format!("{}/v1/auth/sign-in", rig.server.base))
             .header("x-forwarded-for", format!("10.9.8.{i}"))
-            .json(&sign_in)
+            .json(&json!({
+                "firm": rig.firm,
+                "email": format!("stuffed-{i}-{}@example.test", &rig.firm[..8]),
+                "password": "wrong-password-1",
+            }))
             .send()
             .await
             .unwrap();
@@ -69,4 +73,12 @@ async fn a_spoofed_client_ip_does_not_beat_the_sign_in_back_off() {
         }
     }
     assert!(locked, "32 forged-IP attempts never hit the back-off");
+    // No refused attempt created a session.
+    let sessions: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM recon.sessions WHERE firm_id = $1")
+            .bind(uuid::Uuid::parse_str(&rig.firm).unwrap())
+            .fetch_one(&rig.db.pool)
+            .await
+            .unwrap();
+    assert_eq!(sessions, 0, "a hammered sign-in minted a session");
 }

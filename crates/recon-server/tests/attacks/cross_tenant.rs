@@ -41,12 +41,24 @@ async fn another_firms_routes_answer_404_to_this_session() {
         status == 401 || status == 403 || status == 404,
         "B's session planted a user in firm A: {status} {body}"
     );
+    // The stored-state check: firm A holds no planted user.
+    let planted: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM recon.users WHERE firm_id = $1 AND email = 'planted@example.test'",
+    )
+    .bind(uuid::Uuid::parse_str(&rig.firm).unwrap())
+    .fetch_one(&rig.db.pool)
+    .await
+    .unwrap();
+    assert_eq!(planted, 0, "the planted user exists in firm A's store");
 }
 
 #[tokio::test]
 async fn the_operator_token_is_not_a_session() {
     let rig = Rig::start().await;
-    // The operator credential on a session route is not a confused deputy.
+    // The operator credential on a person-only route is not a confused deputy
+    // (rules are a person's act; D-041 is transitional, not an identity). Note
+    // the operator legitimately manages users — this probe takes a route only a
+    // person may use.
     let (status, body) = post_json(
         &rig.server.base,
         &format!("/v1/firms/{}/clients/{}/rules", rig.firm, rig.client),
@@ -58,4 +70,11 @@ async fn the_operator_token_is_not_a_session() {
     )
     .await;
     assert!(status == 401 || status == 403, "{status} {body}");
+    // The store agrees: no rule exists by that act.
+    let rules: i64 = sqlx::query_scalar("SELECT count(*) FROM recon.rules WHERE firm_id = $1")
+        .bind(uuid::Uuid::parse_str(&rig.firm).unwrap())
+        .fetch_one(&rig.db.pool)
+        .await
+        .unwrap();
+    assert_eq!(rules, 0, "the operator credential wrote a rule");
 }

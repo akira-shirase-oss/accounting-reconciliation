@@ -104,4 +104,13 @@ async fn a_replayed_sign_in_pending_token_is_dead() {
         s2 == 401 || s2 == 404 || s2 == 410,
         "replayed pending: {body}"
     );
+    // The store agrees: the replay minted no third session (enrol's plus the
+    // second sign-in's are the two).
+    let sessions: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM recon.sessions WHERE firm_id = $1")
+            .bind(uuid::Uuid::parse_str(&rig.firm).unwrap())
+            .fetch_one(&rig.db.pool)
+            .await
+            .unwrap();
+    assert_eq!(sessions, 2, "the pending replay wrote a third session");
 }

@@ -62,6 +62,20 @@ async fn a_url_in_a_schema_field_is_refused_or_inert() {
             r.status()
         );
     }
+    // The stored-state check: the refused bodies created nothing — one firm,
+    // one client, one account, exactly as `tenant` made them.
+    let (firms, clients, accounts): (i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM recon.firms), (SELECT count(*) FROM recon.clients),
+                (SELECT count(*) FROM recon.accounts)",
+    )
+    .fetch_one(&rig.db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        (firms, clients, accounts),
+        (1, 1, 1),
+        "a refused create wrote a row"
+    );
 }
 
 #[tokio::test]
@@ -80,7 +94,8 @@ async fn metadata_addresses_in_content_are_inert_strings() {
             .unwrap();
     assert_eq!(status, 201);
     // The only assertion needed: it imported as a line (a string), and a queue
-    // read serves the string back — nothing was fetched.
+    // read serves the string back — nothing was fetched. The store holds it
+    // VERBATIM: content stayed data, never instructions.
     let (status, body) = get(
         &rig.server.base,
         &format!("/v1/firms/{}/clients/{}/review-queue", rig.firm, rig.client),
@@ -88,4 +103,15 @@ async fn metadata_addresses_in_content_are_inert_strings() {
     )
     .await;
     assert_eq!(status, 200, "{body}");
+    let stored: String = sqlx::query_scalar(
+        "SELECT narration_raw FROM recon.statement_lines WHERE firm_id = $1 LIMIT 1",
+    )
+    .bind(uuid::Uuid::parse_str(&rig.firm).unwrap())
+    .fetch_one(&rig.db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        stored, METADATA,
+        "the narration was interpreted, not stored"
+    );
 }
