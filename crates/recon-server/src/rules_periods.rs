@@ -72,6 +72,17 @@ fn period_error(e: periods::PeriodError) -> ApiError {
             "exceptions in the month lack a reviewer's acknowledgement",
         )
         .with("count", json!(count)),
+        periods::PeriodError::AccountBusy => ApiError::new(
+            StatusCode::CONFLICT,
+            "account_busy",
+            "an import into this account is being published; nothing changed, try again shortly",
+        )
+        .retry_after(2),
+        periods::PeriodError::EvaluationTooLarge => ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "period_evaluation_too_large",
+            "re-evaluating the month would scan more work than the bound allows; split the rules or the month",
+        ),
         periods::PeriodError::ReasonRequired => ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
             "reason_required",

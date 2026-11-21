@@ -89,6 +89,11 @@ pub enum PeriodError {
     Unacknowledged(i64),
     /// Reopening takes a non-empty reason.
     ReasonRequired,
+    /// The account's flip holds its advisory lock — the close would race the
+    /// lines it is publishing; refuse, let the caller retry (S1-1, D-076).
+    AccountBusy,
+    /// The re-evaluation would scan more work than the bound allows (S1-2).
+    EvaluationTooLarge,
     /// Storage.
     Db(DbError),
 }
@@ -283,6 +288,12 @@ pub async fn close(
     let mut tx = pool.begin().await?;
     if !account_exists(&mut tx, firm, client, account).await? {
         return Err(PeriodError::NotFound);
+    }
+    // Serialize with an in-flight flip before touching the period row — the same
+    // order the flip takes (advisory lock, then the period), so neither can wait
+    // on the other forever and neither commits past the other (S1-1, D-076).
+    if !crate::imports::try_lock(&mut tx, account.as_uuid(), crate::imports::ACCOUNT_LOCK).await? {
+        return Err(PeriodError::AccountBusy);
     }
     let p = ensure(&mut tx, firm, client, account, month).await?;
     let from = p.status.clone();
@@ -501,33 +512,57 @@ pub async fn re_evaluate(
     .bind(MAX_EVALUATED_LINES)
     .fetch_all(&mut *tx)
     .await?;
-    let mut proposals = Vec::new();
-    let mut truncated = false;
-    'lines: for line in &lines {
-        let counterparty: Option<String> = line.try_get("counterparty_norm")?;
+    // The lines × rules × bytes bound (S1-2): PikeVM cost is linear in the
+    // searched narration bytes, so the bound counts the real work and the
+    // refusal names it. 10k lines of 8 KiB narrations under a handful of rules
+    // would otherwise wedge a Tokio worker while the row lock is held.
+    let mut owned: Vec<(Uuid, String, Option<String>, i64, Uuid)> =
+        Vec::with_capacity(lines.len());
+    let mut searched_bytes: u64 = 0;
+    for line in &lines {
         let narration: String = line.try_get("narration_norm")?;
-        let facts = rule::LineFacts {
-            narration: &narration,
-            counterparty: counterparty.as_deref(),
-            amount_minor: line.try_get("amount_minor")?,
-            account: line.try_get("account_id")?,
-        };
-        for (rule_id, version, predicate, action) in &mut compiled {
-            if predicate.matches(&facts) {
-                if proposals.len() >= MAX_PROPOSALS {
-                    truncated = true;
-                    break 'lines;
+        searched_bytes = searched_bytes.saturating_add(narration.len() as u64);
+        owned.push((
+            line.try_get("id")?,
+            narration,
+            line.try_get("counterparty_norm")?,
+            line.try_get("amount_minor")?,
+            line.try_get("account_id")?,
+        ));
+    }
+    if rule::evaluation_too_big(searched_bytes, compiled.len()) {
+        return Err(PeriodError::EvaluationTooLarge);
+    }
+    let (compiled, proposals, truncated) = tokio::task::spawn_blocking(move || {
+        let mut proposals = Vec::new();
+        let mut truncated = false;
+        'lines: for (id, narration, counterparty, amount_minor, account) in &owned {
+            let facts = rule::LineFacts {
+                narration,
+                counterparty: counterparty.as_deref(),
+                amount_minor: *amount_minor,
+                account: *account,
+            };
+            for (rule_id, version, predicate, action) in &mut compiled {
+                if predicate.matches(&facts) {
+                    if proposals.len() >= MAX_PROPOSALS {
+                        truncated = true;
+                        break 'lines;
+                    }
+                    proposals.push(RuleProposal {
+                        line: *id,
+                        rule: *rule_id,
+                        version: *version,
+                        action: action.clone(),
+                    });
+                    break; // first matching rule wins
                 }
-                proposals.push(RuleProposal {
-                    line: line.try_get("id")?,
-                    rule: *rule_id,
-                    version: *version,
-                    action: action.clone(),
-                });
-                break; // first matching rule wins
             }
         }
-    }
+        (compiled, proposals, truncated)
+    })
+    .await
+    .map_err(|e| DbError::Inconsistent(format!("re-evaluation worker: {e}")))?;
     let rule_versions: Vec<serde_json::Value> = compiled
         .iter()
         .map(|(id, v, _, _)| serde_json::json!({"rule": id, "version": v}))

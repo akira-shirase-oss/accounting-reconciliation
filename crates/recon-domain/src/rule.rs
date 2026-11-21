@@ -5,6 +5,8 @@
 //! program — the database stores the typed data, this module compiles and evaluates it.
 
 use regex_automata::nfa::thompson::pikevm::{Cache, PikeVM};
+use regex_automata::nfa::thompson::{self};
+use regex_automata::util::syntax;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -15,6 +17,18 @@ use crate::text::normalize;
 pub const MAX_VALUE_BYTES: usize = 200;
 /// The most compiled program a regex predicate may build to (D-015).
 pub const REGEX_COMPILED_LIMIT: usize = 10 * 1024;
+/// The most nested groups/classes a regex predicate may use — bounds parse depth.
+pub const REGEX_NEST_LIMIT: u32 = 32;
+/// The most narration bytes × predicates one re-evaluation may scan — the
+/// PikeVM cost is linear in searched bytes, so the bound counts the real work
+/// (S1-2).
+pub const MAX_EVALUATION_WORK_BYTES: u64 = 128 * 1024 * 1024;
+
+/// `true` when scanning `line_bytes` of narrations under `predicates` rules
+/// exceeds the re-evaluation bound — the caller refuses by name.
+pub fn evaluation_too_big(line_bytes: u64, predicates: usize) -> bool {
+    line_bytes.saturating_mul(predicates as u64) > MAX_EVALUATION_WORK_BYTES
+}
 
 /// What a text clause does to a normalized field (D-015).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -193,7 +207,11 @@ pub fn check(predicate: &RulePredicate, action: &RuleAction) -> Result<(), RuleE
 /// right whatever the caller handed it.
 pub fn normalize_rule(predicate: &mut RulePredicate, action: &mut RuleAction) {
     if let Some(m) = &mut predicate.narration {
-        m.value = normalize(&m.value);
+        // A regex's source is its semantics: normalizing would invert `\d` into
+        // `\D` (S2-3). `compile` matches it case-insensitively instead.
+        if m.op != TextOp::Regex {
+            m.value = normalize(&m.value);
+        }
     }
     if let Some(c) = &mut predicate.counterparty {
         *c = normalize(c);
@@ -234,7 +252,27 @@ impl CompiledPredicate {
         check(&normalized, &action)?;
         let (regex, cache) = match &normalized.narration {
             Some(m) if m.op == TextOp::Regex => {
-                let vm = PikeVM::new(&m.value).map_err(|_| RuleError::RegexInvalid)?;
+                // The NFA cap must bound the build itself, not be tested after it
+                // (S1-2): a nested quantifier expands past the cap inside a few
+                // source bytes. The regex source is never normalized, so the VM is
+                // case-insensitive — `\d` stays `\d` (S2-3).
+                let vm = PikeVM::builder()
+                    .syntax(
+                        syntax::Config::new()
+                            .case_insensitive(true)
+                            .nest_limit(REGEX_NEST_LIMIT),
+                    )
+                    .thompson(
+                        thompson::Config::new().nfa_size_limit(Some(REGEX_COMPILED_LIMIT)),
+                    )
+                    .build(&m.value)
+                    .map_err(|e| {
+                        if e.size_limit().is_some() {
+                            RuleError::RegexTooBig
+                        } else {
+                            RuleError::RegexInvalid
+                        }
+                    })?;
                 if vm.get_nfa().memory_usage() > REGEX_COMPILED_LIMIT {
                     return Err(RuleError::RegexTooBig);
                 }
@@ -449,6 +487,71 @@ mod tests {
         let Err(RuleError::RegexTooBig) = CompiledPredicate::compile(&huge, &action) else {
             panic!("a too-big regex must refuse by name");
         };
+    }
+
+    #[test]
+    fn a_regex_nfa_is_bounded_while_it_builds() {
+        // S1-2: the cap must bound the NFA as it compiles, not after — this
+        // pattern expands to ~10^9 states inside 25 bytes, under the 200-byte cap.
+        let action = RuleAction::Exclude {
+            reason: "out_of_scope".to_owned(),
+        };
+        let bomb = RulePredicate {
+            narration: Some(TextMatch {
+                op: TextOp::Regex,
+                value: "((a{1000}){1000}){1000}".to_owned(),
+            }),
+            ..RulePredicate::default()
+        };
+        let Err(RuleError::RegexTooBig) = CompiledPredicate::compile(&bomb, &action) else {
+            panic!("a regex that expands past the NFA cap must refuse by name");
+        };
+    }
+
+    #[test]
+    fn a_regex_keeps_its_escapes_and_stays_case_insensitive() {
+        // S2-3: uppercasing a regex inverts \d \s \w \b into their opposites.
+        // The source is stored verbatim; the compiled VM is case-insensitive.
+        let mut predicate = RulePredicate {
+            narration: Some(TextMatch {
+                op: TextOp::Regex,
+                value: "^atm\\s\\d+".to_owned(),
+            }),
+            ..RulePredicate::default()
+        };
+        let mut action = RuleAction::Exclude {
+            reason: "out_of_scope".to_owned(),
+        };
+        normalize_rule(&mut predicate, &mut action);
+        assert_eq!(
+            predicate.narration.as_ref().unwrap().value,
+            "^atm\\s\\d+",
+            "normalizing must not rewrite a regex's escapes"
+        );
+        let mut compiled = CompiledPredicate::compile(&predicate, &action).unwrap();
+        assert!(compiled.matches(&facts("ATM 1234 FEE", None, -100)));
+        assert!(compiled.matches(&facts("atm 9", None, -100)));
+        assert!(!compiled.matches(&facts("ATM FEE", None, -100)));
+        // \b survives: a word boundary does not match inside a word.
+        let boundary = RulePredicate {
+            narration: Some(TextMatch {
+                op: TextOp::Regex,
+                value: "\\bfee\\b".to_owned(),
+            }),
+            ..RulePredicate::default()
+        };
+        let mut compiled = CompiledPredicate::compile(&boundary, &action).unwrap();
+        assert!(compiled.matches(&facts("BANK FEE", None, -100)));
+        assert!(!compiled.matches(&facts("FEES", None, -100)));
+    }
+
+    #[test]
+    fn the_evaluation_work_bound_counts_lines_times_rules_times_bytes() {
+        // S1-2: the bound is on searched bytes — a small month under a few rules
+        // passes, the same month under hundreds refuses.
+        assert!(!evaluation_too_big(10_000 * 200, 20));
+        assert!(evaluation_too_big(10_000 * 8 * 1024, 2));
+        assert!(evaluation_too_big(u64::MAX, usize::MAX));
     }
 
     #[test]

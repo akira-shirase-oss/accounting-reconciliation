@@ -142,24 +142,7 @@ pub async fn import_bytes(
     account: &Account,
     bytes: &[u8],
 ) -> Result<Imported, DbError> {
-    let mut parser = StatementParser::new(AccountContext {
-        account: account.id,
-        currency: account.currency,
-    });
-    let mut lines = vec![];
-    let mut staging = imports::begin(pool, account, LEASE).await?;
-    for chunk in bytes.chunks(64 * 1024) {
-        parser
-            .push(chunk, &mut |l| lines.push(l))
-            .expect("file-level refusal in a db test");
-        while lines.len() >= STAGING_BATCH_ROWS {
-            let batch: Vec<_> = lines.drain(..STAGING_BATCH_ROWS).collect();
-            imports::stage(pool, &mut staging, &batch, LEASE).await?;
-        }
-    }
-    let summary = parser
-        .finish(&mut |l| lines.push(l))
-        .expect("file-level refusal in a db test");
+    let (staging, summary) = staged(pool, account, bytes).await?;
     if !summary.is_clean() {
         let record = imports::refuse(
             pool,
@@ -178,11 +161,42 @@ pub async fn import_bytes(
         .await?;
         return Ok(Imported::Refused(record));
     }
-    for batch in lines.chunks(STAGING_BATCH_ROWS) {
-        imports::stage(pool, &mut staging, batch, LEASE).await?;
-    }
     let outcome = imports::flip(pool, staging, &summary, OPERATOR, &NoHook, FLIP_TIMEOUT).await?;
     Ok(Imported::Flipped(outcome))
+}
+
+/// Parses `bytes` the way `import_bytes` does and stages every clean line: the
+/// live `staging` import and the parser's summary — everything [`imports::flip`]
+/// needs, minus the flip itself (concurrency tests drive it).
+pub async fn staged(
+    pool: &PgPool,
+    account: &Account,
+    bytes: &[u8],
+) -> Result<(imports::StagingImport, recon_import::ParseSummary), DbError> {
+    let mut parser = StatementParser::new(AccountContext {
+        account: account.id,
+        currency: account.currency,
+    });
+    let mut lines = vec![];
+    let mut staging = imports::begin(pool, account, LEASE).await?;
+    for chunk in bytes.chunks(64 * 1024) {
+        parser
+            .push(chunk, &mut |l| lines.push(l))
+            .expect("file-level refusal in a db test");
+        while lines.len() >= STAGING_BATCH_ROWS {
+            let batch: Vec<_> = lines.drain(..STAGING_BATCH_ROWS).collect();
+            imports::stage(pool, &mut staging, &batch, LEASE).await?;
+        }
+    }
+    let summary = parser
+        .finish(&mut |l| lines.push(l))
+        .expect("file-level refusal in a db test");
+    if summary.is_clean() {
+        for batch in lines.chunks(STAGING_BATCH_ROWS) {
+            imports::stage(pool, &mut staging, batch, LEASE).await?;
+        }
+    }
+    Ok((staging, summary))
 }
 
 /// Imports a document file with the built-in profile, the way the server does.

@@ -762,7 +762,11 @@ async fn flip_transaction(
 
 /// Serializes flips into one account (or one client's documents), refusing at once when
 /// another holds it (D-053).
-async fn try_lock(conn: &mut PgConnection, key: Uuid, space: i64) -> Result<bool, DbError> {
+pub(crate) async fn try_lock(
+    conn: &mut PgConnection,
+    key: Uuid,
+    space: i64,
+) -> Result<bool, DbError> {
     Ok(sqlx::query_scalar(
         "SELECT pg_catalog.pg_try_advisory_xact_lock(pg_catalog.hashtextextended($1::text, $2))",
     )
@@ -772,7 +776,7 @@ async fn try_lock(conn: &mut PgConnection, key: Uuid, space: i64) -> Result<bool
     .await?)
 }
 
-const ACCOUNT_LOCK: i64 = 7262;
+pub(crate) const ACCOUNT_LOCK: i64 = 7262;
 const CLIENT_DOCUMENTS_LOCK: i64 = 7263;
 
 /// Publishes a clean, fully staged file (see the module docs). `flip_timeout` bounds every

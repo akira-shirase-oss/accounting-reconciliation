@@ -18,7 +18,7 @@ use common::{import, import_documents, month_rows, rows, tenant};
 use recon_db::matching::{self, Decided, DecidedLine, Start};
 use recon_db::tenancy::Account;
 use recon_db::testing::TestDb;
-use recon_db::{periods, review, rules};
+use recon_db::{imports, periods, review, rules};
 use recon_domain::auth::Role;
 use recon_domain::decision::{DecisionRecord, SubjectKind};
 use recon_domain::line::{ExceptionKind, ExcludeReason};
@@ -914,5 +914,66 @@ async fn rules_and_periods_keep_their_tenant() {
         periods::PeriodError::NotFound
     ));
     common::replay_ok(&db, account.firm).await;
+    db.cleanup().await;
+}
+
+/// S1-1 (failure case 1's race): a flip in flight holds the account's advisory
+/// lock; a close racing it is refused busy — never commits a digest the
+/// in-flight lines are absent from. Two real connections; a [`imports::FlipHook`]
+/// holds the flip inside its transaction at [`imports::FlipPoint::LinesInserted`].
+#[tokio::test]
+async fn a_close_during_a_flip_is_refused_busy() {
+    struct Gate {
+        reached: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+    impl imports::FlipHook for Gate {
+        async fn reached(&self, point: imports::FlipPoint) {
+            if matches!(point, imports::FlipPoint::LinesInserted) {
+                self.reached.notify_one();
+                self.release.notified().await;
+            }
+        }
+    }
+    let db = TestDb::new().await;
+    let account = tenant(&db.pool).await;
+    let user = owner(&db.pool, account.firm, "owner").await;
+    let body = format!("{}{}", common::HEADER, dated_rows(2026, 3, &[1, 2], "FEE"));
+    let (staging, summary) = common::staged(&db.pool, &account, body.as_bytes())
+        .await
+        .unwrap();
+    let gate = std::sync::Arc::new(Gate {
+        reached: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    let flip = {
+        let pool = db.pool.clone();
+        let gate = std::sync::Arc::clone(&gate);
+        tokio::spawn(async move {
+            imports::flip(&pool, staging, &summary, common::OPERATOR, &*gate, common::FLIP_TIMEOUT)
+                .await
+        })
+    };
+    gate.reached.notified().await;
+    let refused = periods::close(
+        &db.pool,
+        account.firm,
+        account.client,
+        account.id,
+        march(),
+        user,
+    )
+    .await;
+    let Err(refused) = refused else {
+        panic!("a close raced an in-flight flip and committed — the busy refusal is missing");
+    };
+    assert!(
+        matches!(refused, periods::PeriodError::AccountBusy),
+        "a close raced an in-flight flip and answered {refused:?} — it must refuse busy, \
+         never commit a digest the new lines are absent from"
+    );
+    gate.release.notify_one();
+    flip.await.unwrap().unwrap();
+    assert_eq!(lines_in(&db.pool, &account, "unreviewed").await.len(), 2);
     db.cleanup().await;
 }
