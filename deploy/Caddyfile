@@ -26,6 +26,10 @@ recon.example.com {
 		transport http {
 			dial_timeout 5s
 			response_header_timeout 170s
+			# The server's head bound (10 s) also closes idle keep-alive
+			# connections; pool upstreams below it so a reuse never races
+			# the server's close into a reset (D-078).
+			keepalive 5s
 		}
 	}
 	header {

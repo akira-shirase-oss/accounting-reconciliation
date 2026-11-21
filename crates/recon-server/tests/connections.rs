@@ -321,6 +321,71 @@ async fn non_reading_clients_cannot_hold_connection_slots() {
     server.stop().await;
 }
 
+/// The keep-alive reuse race (D-078): the head bound also closes an idle
+/// connection, and a client racing that close with a reuse — a pooled upstream
+/// that writes without peeking — must read a whole response or a clean close.
+/// A reset or a truncated response is the 502/status-0 the workspace rule
+/// forbids (Go's readLoopPeekFailLocked; Caddy's upstream 502).
+#[tokio::test]
+async fn a_reuse_past_the_idle_bound_never_answers_a_reset() {
+    let server = server(&[("RECON_HEADER_READ_TIMEOUT_MS", "500")]).await;
+    let mut stream = TcpStream::connect(addr(&server)).await.unwrap();
+    stream
+        .write_all(b"GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n")
+        .await
+        .unwrap();
+    let mut first = [0_u8; 2048];
+    let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut first))
+        .await
+        .expect("no first answer")
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&first[..n]).starts_with("HTTP/1.1 200"),
+        "the live connection did not answer"
+    );
+
+    // Idle well past the bound: the timer has closed the connection — the FIN
+    // is already on the wire when a racy client reuses.
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    stream
+        .write_all(b"GET /healthz HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        .await
+        .expect("the stale write was refused at the socket");
+
+    let mut second = Vec::new();
+    let mut buf = [0_u8; 4096];
+    let mut reset = None;
+    let mut stalled = false;
+    loop {
+        match tokio::time::timeout(Duration::from_secs(4), stream.read(&mut buf)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => second.extend_from_slice(&buf[..n]),
+            Ok(Err(e)) => {
+                reset = Some(e);
+                break;
+            }
+            Err(_) => {
+                stalled = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        reset.is_none(),
+        "the reuse was answered a reset mid-request: {reset:?}"
+    );
+    assert!(
+        !stalled || !second.is_empty(),
+        "the reuse wedged — no answer, no close inside the deadline"
+    );
+    let text = String::from_utf8_lossy(&second);
+    assert!(
+        second.is_empty() || (text.contains("HTTP/1.1 200") && text.trim_end().ends_with('}')),
+        "the reuse answered a truncated response: {text}"
+    );
+    server.stop().await;
+}
+
 /// Pipelined requests past the per-connection cap: the limiting response says
 /// `Connection: close` and nothing after it is answered on that connection.
 #[tokio::test]

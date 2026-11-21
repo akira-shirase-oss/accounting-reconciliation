@@ -942,6 +942,21 @@ conservative side.
   not the preparer's `Resolve`. And `57014` (statement timeout) is named
   `overloaded`, not `database_unavailable`: a cancelled statement is
   contention, the database is up.
+- **D-078 — Idle keep-alive bounds live client-side, below the server's
+  head bound.** Hyper's `header_read_timeout` bounds not only a request
+  head in flight but every idle wait between requests on a kept-alive
+  connection; when it fires the connection closes with no response, and a
+  client or proxy reusing a connection older than the bound races that
+  close (Go's `readLoopPeekFailLocked`, status 0; a proxy, a 502 for a
+  non-idempotent request). No server-side idle bound can remove the race
+  for every client — HTTP/1.1 keep-alive always has one — so the bounds
+  are pinned where reuses originate: the deploy `Caddyfile` transport
+  sets `keepalive 5s`, and `perf/loadgen` sets
+  `pool_idle_timeout(5s)`, both below the default 10 s head bound (and
+  below it under any deploy that lowers the bound, which operators must
+  keep in mind). A socket-level test idles a kept-alive connection past
+  the bound and reuses it, asserting the reuse reads a whole response or
+  a clean close — never a reset mid-request or a truncated body.
 
 ## Open questions (blocked on the maintainer or an outside party)
 

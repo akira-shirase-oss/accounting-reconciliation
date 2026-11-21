@@ -384,6 +384,9 @@ async fn main() -> anyhow::Result<()> {
         // default 150 s — the spawned server inherits it), so a genuinely slow
         // request answers with a real status instead of a client-side timeout.
         .timeout(Duration::from_secs(180))
+        // The server's head bound also closes idle keep-alive connections
+        // (D-078); pool idle below it so a reuse never races the close.
+        .pool_idle_timeout(Duration::from_secs(5))
         .build()?;
     // Every 503 the server sheds, counted across the whole run (D-075).
     let shed = Arc::new(AtomicUsize::new(0));
