@@ -55,6 +55,9 @@ pub enum Act {
     ApproveProposal,
     /// The second eye on a four-eyes match, and any approval above the threshold.
     ApproveFourEyes,
+    /// Acknowledge an exception in place — reviewer-level, it is what a close
+    /// accepts (D-006).
+    AcknowledgeException,
     /// Approve or create a rule version (D-015).
     ManageRules,
     /// Close a period.
@@ -80,6 +83,7 @@ pub const fn may(role: Role, act: Act) -> bool {
                 | A::Resolve
                 | A::ApproveProposal
                 | A::ApproveFourEyes
+                | A::AcknowledgeException
                 | A::ManageRules
                 | A::ClosePeriod
         ),
@@ -109,6 +113,7 @@ mod tests {
                         Act::Resolve,
                         Act::ApproveProposal,
                         Act::ApproveFourEyes,
+                        Act::AcknowledgeException,
                         Act::ManageRules,
                         Act::ClosePeriod,
                     ] {

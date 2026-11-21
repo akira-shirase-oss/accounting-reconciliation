@@ -1059,3 +1059,76 @@ async fn rules_and_periods_keep_their_tenant() {
         .collect();
     assert_eq!(ids, [rule.as_str()]);
 }
+
+/// D-006: acknowledging an exception is a reviewer-level act — a preparer's
+/// `Resolve` power does not stretch to it (S2-4).
+#[tokio::test]
+async fn a_preparer_cannot_acknowledge_an_exception() {
+    let db = TestDb::new().await;
+    let state = checked(&db);
+    let seed = seed(&state).await;
+    let (pt, pc, _) = enrolled(&state, &db.pool, &seed, "preparer").await;
+
+    let (s, body) = upload_statement(&state, &seed, &statement(&[2], "BANK FEE")).await;
+    assert_eq!(s, StatusCode::CREATED, "{body}");
+    let (exception, _, _) = lines(&db.pool, &seed).await.pop().unwrap();
+    let job = match matching::start(
+        &db.pool,
+        recon_domain::FirmId::from_uuid(Uuid::parse_str(&seed.firm).unwrap()),
+        recon_domain::ClientId::from_uuid(Uuid::parse_str(&seed.client).unwrap()),
+        LEASE,
+        ENGINE,
+    )
+    .await
+    .unwrap()
+    {
+        Start::Created(l) | Start::Resumed(l) => l,
+        Start::Busy { job } => panic!("the job {job} is busy"),
+    };
+    matching::snapshot(&db.pool, &job).await.unwrap();
+    matching::commit_chunk(
+        &db.pool,
+        &job,
+        &[DecidedLine {
+            seq: 1,
+            line: recon_domain::LineId::from_uuid(Uuid::parse_str(&exception).unwrap()),
+            outcome: Decided::Exception {
+                kind: ExceptionKind::NoCandidate,
+                candidates: vec![],
+            },
+        }],
+        LEASE,
+        TX_TIMEOUT,
+    )
+    .await
+    .unwrap();
+
+    let (s, body) = call(
+        &state,
+        session(
+            post_json(
+                &format!(
+                    "/v1/firms/{}/clients/{}/lines/{exception}/acknowledge",
+                    seed.firm, seed.client
+                ),
+                &json!({}),
+            ),
+            &pt,
+            &pc,
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"]["code"], "forbidden");
+    // And the exception stays unacknowledged in the store.
+    let acked: bool = sqlx::query_scalar(
+        "SELECT e.acknowledged_at IS NOT NULL FROM recon.line_exceptions e
+          JOIN recon.statement_lines l ON l.firm_id = e.firm_id AND l.id = e.line_id
+         WHERE l.id = $1",
+    )
+    .bind(Uuid::parse_str(&exception).unwrap())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert!(!acked);
+}

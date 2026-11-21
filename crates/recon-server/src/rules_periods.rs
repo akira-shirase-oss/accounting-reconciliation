@@ -429,7 +429,7 @@ pub async fn acknowledge(
 ) -> ApiResult {
     let (firm, client) = path_ids(&firm, &client)?;
     let line = LineId::from_uuid(line.parse().map_err(|_| ApiError::not_found())?);
-    let session = scoped(&state, &auth, firm, client, Act::Resolve).await?;
+    let session = scoped(&state, &auth, firm, client, Act::AcknowledgeException).await?;
     recon_db::review::acknowledge(&state.pool, firm, client, line, session.user.as_uuid())
         .await
         .map_err(|e| match e {
