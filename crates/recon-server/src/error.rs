@@ -116,7 +116,7 @@ impl ApiError {
                 let contention = matches!(e, sqlx::Error::PoolTimedOut)
                     || matches!(
                         error.sqlstate().as_deref(),
-                        Some("55P03" | "53300" | "40001" | "40P01")
+                        Some("55P03" | "53300" | "40001" | "40P01" | "57014")
                     );
                 if contention {
                     tracing::warn!(error = %error, sqlstate = ?error.sqlstate(), "service overloaded");

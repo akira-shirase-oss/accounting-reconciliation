@@ -624,3 +624,26 @@ async fn an_end_of_file_refusal_keeps_its_byte_count() {
     assert_eq!(body["error"]["import"]["file_bytes"], length, "{body}");
     db.cleanup().await;
 }
+
+/// The drill's named answer (D-075): a statement timeout — a killed flip's
+/// session still finishing its transaction — is contention named `overloaded`
+/// with Retry-After, never `database_unavailable` while the database is up.
+#[tokio::test]
+async fn a_statement_timeout_is_named_overloaded() {
+    let db = TestDb::new().await;
+    let mut conn = db.pool.acquire().await.unwrap();
+    sqlx::query("SET statement_timeout = '10ms'")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    let error = sqlx::query("SELECT pg_sleep(1)")
+        .execute(&mut *conn)
+        .await
+        .unwrap_err();
+    let api = recon_server::error::ApiError::from_db(&recon_db::DbError::from(error));
+    assert_eq!(
+        (api.status(), api.code()),
+        (StatusCode::SERVICE_UNAVAILABLE, "overloaded")
+    );
+    db.cleanup().await;
+}
