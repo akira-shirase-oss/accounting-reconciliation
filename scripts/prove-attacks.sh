@@ -16,10 +16,14 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 
 EXPECTED=18
-if ! mapfile -t MUTANTS < <(python3 scripts/attacks-mutants.py list); then
+if ! MUTANT_LIST="$(python3 scripts/attacks-mutants.py list)"; then
   echo "prove-attacks: could not list mutants" >&2
   exit 1
 fi
+MUTANTS=()
+while IFS= read -r line; do
+  [ -n "$line" ] && MUTANTS+=("$line")
+done <<< "$MUTANT_LIST"
 if [ "${#MUTANTS[@]}" -ne "$EXPECTED" ]; then
   echo "prove-attacks: expected $EXPECTED mutants, got ${#MUTANTS[@]} — an empty or stale list proves nothing" >&2
   exit 1
