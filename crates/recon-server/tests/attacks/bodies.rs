@@ -26,6 +26,10 @@ async fn a_body_past_the_cap_is_refused() {
     while body.len() <= 50 * 1024 * 1024 {
         body.extend_from_slice(ROW);
     }
+    // Expect: 100-continue — a well-behaved client announces the body and waits
+    // for the server's verdict before streaming it; without it, reqwest is
+    // still mid-write when the 413 + connection-drop arrive and the named
+    // refusal never surfaces (the reset is the refusal, but can't be read).
     let r = http()
         .post(format!(
             "{}/v1/firms/{}/accounts/{}/imports",
@@ -33,19 +37,25 @@ async fn a_body_past_the_cap_is_refused() {
         ))
         .bearer_auth(TOKEN)
         .header("content-type", "text/csv")
+        .header("expect", "100-continue")
         .body(body)
         .send()
-        .await;
-    match r {
-        Ok(response) => assert_eq!(
-            response.status(),
-            413,
-            "the oversized body answered {}",
-            response.status()
-        ),
-        // Refused at the connection level is also a refusal — never a 5xx wedge.
-        Err(e) => assert!(e.is_body() || e.is_request(), "unexpected error: {e}"),
-    }
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status(),
+        413,
+        "the oversized body answered {}",
+        r.status()
+    );
+    // The named refusal, not just any 4xx: `file_too_large` is the contract a
+    // client can act on — anything else means some other check fired first.
+    let body: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(
+        body["error"]["code"].as_str().unwrap_or(""),
+        "file_too_large",
+        "the refusal code: {body}"
+    );
     // The stored-state check: nothing was staged or imported.
     let (imports, lines): (i64, i64) = sqlx::query_as(
         "SELECT
@@ -92,22 +102,39 @@ async fn a_drip_fed_body_dies_at_the_idle_deadline() {
          booking_date,value_date,amount,currency,narration,reference,counterparty,balance_after\n"
     );
     stream.write_all(head.as_bytes()).unwrap();
-    // Nothing more for > 500 ms of body-idle: the server must answer the named
-    // refusal (408 upload_stalled) or close — never wedge a worker.
-    std::thread::sleep(std::time::Duration::from_millis(1500));
-    let mut buf = [0_u8; 512];
-    match std::io::Read::read(&mut stream, &mut buf) {
-        Ok(0) => {} // closed — the honest refusal
-        Ok(n) => {
-            let text = String::from_utf8_lossy(&buf[..n]);
-            assert!(
-                text.contains("408") || text.contains("upload_stalled"),
-                "unexpected answer: {text}"
-            );
+    // The deadline is 500 ms of body-idle: the named refusal must be ON THE WIRE
+    // inside ~1 s of the stall, or the worker was wedged. Read immediately —
+    // the answer is the signal, not a sleep — with a read timeout that fails
+    // the test when the deadline didn't fire. EOF/silence is a wedge here, not
+    // a refusal: `upload_stalled` is the contract.
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_millis(1500)))
+        .unwrap();
+    let mut received = Vec::new();
+    let mut buf = [0_u8; 1024];
+    loop {
+        match std::io::Read::read(&mut stream, &mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                received.extend_from_slice(&buf[..n]);
+                if String::from_utf8_lossy(&received).contains("upload_stalled") {
+                    break;
+                }
+            }
+            Err(e) => panic!(
+                "no answer inside the idle deadline — the drip-fed body wedged the worker: {e}"
+            ),
         }
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {}
-        Err(e) => panic!("the drip-feed wedged the connection: {e}"),
     }
+    assert!(
+        !received.is_empty(),
+        "the connection closed without an answer"
+    );
+    let text = String::from_utf8_lossy(&received);
+    assert!(
+        text.contains("408") && text.contains("upload_stalled"),
+        "expected the named refusal, got: {text}"
+    );
     // The stored-state check: the stalled upload completed nothing and staged
     // nothing a later request can see.
     let complete: i64 = sqlx::query_scalar(

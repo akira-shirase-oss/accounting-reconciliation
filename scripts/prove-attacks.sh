@@ -8,7 +8,9 @@
 # test must fail. A test that stays green under its mutant is a survivor —
 # the suite does not actually watch that protection, and this script fails.
 #
-# The source tree is restored after every mutant and on exit.
+# The source tree is restored after every mutant and on exit — by file
+# content, never `git checkout`, so uncommitted work under the touched
+# directories survives the proof (mutants only edit files, never add them).
 
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -16,9 +18,18 @@ cd "$(dirname "$0")/.."
 MUTANTS=( $(python3 scripts/attacks-mutants.py list) )
 SRC="crates/recon-server/src crates/recon-db/src crates/recon-import/src"
 
-restore() { git checkout -- $SRC 2>/dev/null || true; }
-trap restore EXIT
-restore
+SNAP=$(mktemp -d)
+snapshot() {
+  for f in $SRC; do
+    mkdir -p "$SNAP/$f"
+    cp -a "$f/." "$SNAP/$f/"
+  done
+}
+restore() {
+  for f in $SRC; do cp -a "$SNAP/$f/." "$f/"; done
+}
+trap 'restore; rm -rf "$SNAP"' EXIT
+snapshot
 
 if [ -z "${RECON_TEST_ADMIN_URL:-}" ]; then
   eval "$(scripts/stack.sh env)"

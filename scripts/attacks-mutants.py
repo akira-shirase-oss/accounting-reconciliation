@@ -194,22 +194,23 @@ MUTANTS = {
                         .extensions_mut()
                         .insert(axum::extract::ConnectInfo(peer));""",
     ),
-    # healthz starts gating on the Host header — a lie now changes the answer.
+    # The actor gate starts trusting the Host header — a lie now fails the
+    # session before the handler runs (the test probes a gated route).
     "a_host_header_lie_changes_nothing": (
-        HANDLERS,
-        """pub async fn healthz() -> Json<Value> {
-    Json(json!({ "ok": true }))
-}""",
-        """pub async fn healthz(headers: HeaderMap) -> Result<Json<Value>, StatusCode> {
-    let host = headers
-        .get(axum::http::header::HOST)
+        AUTH,
+        """    request.extensions_mut().insert(Auth::Person(session));
+    next.run(request).await""",
+        """    if !request
+        .headers()
+        .get(header::HOST)
         .and_then(|v| v.to_str().ok())
-        .unwrap_or_default();
-    if !host.starts_with("127.0.0.1") {
-        return Err(StatusCode::FORBIDDEN);
+        .unwrap_or_default()
+        .starts_with("127.0.0.1")
+    {
+        return ApiError::unauthorized().into_response();
     }
-    Ok(Json(json!({ "ok": true })))
-}""",
+    request.extensions_mut().insert(Auth::Person(session));
+    next.run(request).await""",
     ),
     # sign_in's throttle peer is the client-supplied X-Forwarded-For.
     "a_spoofed_client_ip_does_not_beat_the_sign_in_back_off": (

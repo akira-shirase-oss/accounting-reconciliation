@@ -100,6 +100,14 @@ async fn a_session_without_csrf_cannot_mutate() {
         .await
         .unwrap();
     assert_eq!(r.status(), 403);
+    // The named refusal: `csrf_mismatch`, not a role or not-found 403 that a
+    // different gate could also produce.
+    let body: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(
+        body["error"]["code"].as_str().unwrap_or(""),
+        "csrf_mismatch",
+        "the refusal code: {body}"
+    );
     // The store says the attack changed nothing: no decision, the line unreviewed.
     let (decisions, state): (i64, String) = sqlx::query_as(
         "SELECT
