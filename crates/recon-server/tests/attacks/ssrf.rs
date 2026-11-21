@@ -129,7 +129,7 @@ async fn metadata_addresses_in_content_are_inert_strings() {
     let session = rig.enroll("reviewer").await;
     let csv = format!(
         "booking_date,value_date,amount,currency,narration,reference,counterparty,balance_after\n\
-         2026-04-02,,-1.00,USD,{url},REF-1,Big Bank,\n"
+         2026-04-02,,-1.00,USD,SEE {url},REF-1,Big Bank,\n"
     );
     let (status, refusal) =
         crate::common::upload(&rig.server.base, &rig.firm, &rig.account, csv.into_bytes())
@@ -152,7 +152,11 @@ async fn metadata_addresses_in_content_are_inert_strings() {
     .fetch_one(&rig.db.pool)
     .await
     .unwrap();
-    assert_eq!(stored, url, "the narration was interpreted, not stored");
+    assert_eq!(
+        stored,
+        format!("SEE {url}"),
+        "the narration was interpreted, not stored"
+    );
     accept.join().unwrap();
     assert_eq!(
         hits.load(std::sync::atomic::Ordering::Relaxed),

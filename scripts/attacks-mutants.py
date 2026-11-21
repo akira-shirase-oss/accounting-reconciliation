@@ -316,7 +316,7 @@ MUTANTS = {
         """        let narration_norm = normalize(narration_raw);
         if narration_norm.is_empty() {""",
         """        let narration_norm = normalize(narration_raw);
-        if let Some(rest) = narration_raw.strip_prefix("http://") {
+        if let Some(rest) = narration_raw.split("http://").nth(1) {
             let _ = std::net::TcpStream::connect(rest.split('/').next().unwrap_or(""));
         }
         if narration_norm.is_empty() {""",
