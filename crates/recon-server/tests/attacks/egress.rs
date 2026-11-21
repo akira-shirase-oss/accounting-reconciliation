@@ -46,10 +46,7 @@ async fn the_server_calls_nothing_but_the_model_endpoint() {
     get(&rig.server.base, "/readyz", None).await;
     let (status, body) = get(
         &rig.server.base,
-        &format!(
-            "/v1/firms/{}/clients/{}/review-queue",
-            rig.firm, rig.client
-        ),
+        &format!("/v1/firms/{}/clients/{}/review-queue", rig.firm, rig.client),
         Some(&session),
     )
     .await;

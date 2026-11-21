@@ -61,9 +61,7 @@ impl Endpoint {
             "http" => allow_http_loopback && is_loopback(host),
             _ => false,
         };
-        allowed
-            .then_some(Self { url })
-            .ok_or(EndpointError::NotTls)
+        allowed.then_some(Self { url }).ok_or(EndpointError::NotTls)
     }
 }
 
@@ -184,16 +182,13 @@ impl HttpProposer {
         if let Some(key) = &self.api_key {
             send = send.bearer_auth(key);
         }
-        let mut response = send
-            .send()
-            .await
-            .map_err(|e| {
-                if e.is_timeout() || e.is_connect() {
-                    CallFailure::Transient
-                } else {
-                    CallFailure::Unavailable
-                }
-            })?;
+        let mut response = send.send().await.map_err(|e| {
+            if e.is_timeout() || e.is_connect() {
+                CallFailure::Transient
+            } else {
+                CallFailure::Unavailable
+            }
+        })?;
         if !response.status().is_success() {
             let retryable = response.status() == StatusCode::TOO_MANY_REQUESTS
                 || response.status().is_server_error();
@@ -204,11 +199,7 @@ impl HttpProposer {
             });
         }
         let mut body = Vec::new();
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|_| CallFailure::Malformed)?
-        {
+        while let Some(chunk) = response.chunk().await.map_err(|_| CallFailure::Malformed)? {
             if body.len() + chunk.len() > RESPONSE_CAP {
                 return Err(CallFailure::Malformed);
             }

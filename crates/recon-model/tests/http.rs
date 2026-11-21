@@ -111,9 +111,8 @@ impl Fake {
                     .set_read_timeout(Some(Duration::from_secs(2)))
                     .unwrap();
                 let mut head = String::new();
-                let mut reader = BufReader::new(
-                    stream.try_clone().unwrap_or_else(|_| panic!("clone")),
-                );
+                let mut reader =
+                    BufReader::new(stream.try_clone().unwrap_or_else(|_| panic!("clone")));
                 let mut content_length = 0_usize;
                 loop {
                     head.clear();
@@ -124,8 +123,7 @@ impl Fake {
                         break;
                     }
                     if head.to_ascii_lowercase().starts_with("content-length:") {
-                        content_length =
-                            head[15..].trim().parse().unwrap_or(0);
+                        content_length = head[15..].trim().parse().unwrap_or(0);
                     }
                     if head == "\r\n" {
                         break;
@@ -169,8 +167,13 @@ impl Fake {
 }
 
 fn proposer(fake: &Fake, calls: usize) -> HttpProposer {
-    HttpProposer::loopback(&fake.url(), "test-model", Duration::from_secs(3), Budget::calls(calls))
-        .unwrap()
+    HttpProposer::loopback(
+        &fake.url(),
+        "test-model",
+        Duration::from_secs(3),
+        Budget::calls(calls),
+    )
+    .unwrap()
 }
 
 #[tokio::test]
@@ -205,10 +208,7 @@ async fn a_down_provider_is_unavailable() {
 
 #[tokio::test]
 async fn transient_statuses_retry_at_most_twice() {
-    let fake = Fake::start(
-        vec![(503, String::new()); 10],
-        Duration::ZERO,
-    );
+    let fake = Fake::start(vec![(503, String::new()); 10], Duration::ZERO);
     let started = Instant::now();
     let err = proposer(&fake, 8).propose(&request()).await.unwrap_err();
     assert_eq!(err, ProposeError::Unavailable);
@@ -275,7 +275,11 @@ async fn a_redirect_is_never_followed() {
     )
     .unwrap();
     let err = proposer.propose(&request()).await.unwrap_err();
-    assert_eq!(err, ProposeError::Unavailable, "a 302 is a refusal, not a hop");
+    assert_eq!(
+        err,
+        ProposeError::Unavailable,
+        "a 302 is a refusal, not a hop"
+    );
     assert_eq!(target.hits(), 0, "the redirect's Location was dialed");
 }
 
@@ -306,11 +310,30 @@ fn http_to_a_non_loopback_host_is_refused_at_construction() {
         "http://user:pw@127.0.0.1/x",
     ] {
         assert!(
-            HttpProposer::loopback(endpoint, "m", Duration::from_secs(1), Budget::calls(1)).is_err(),
+            HttpProposer::loopback(endpoint, "m", Duration::from_secs(1), Budget::calls(1))
+                .is_err(),
             "{endpoint} was accepted"
         );
     }
     // The online adapter accepts https, never http — not even loopback.
-    assert!(HttpProposer::new("http://127.0.0.1/x", "m", None, Duration::from_secs(1), Budget::calls(1)).is_err());
-    assert!(HttpProposer::new("https://model.example/v1/chat/completions", "m", Some("k"), Duration::from_secs(1), Budget::calls(1)).is_ok());
+    assert!(
+        HttpProposer::new(
+            "http://127.0.0.1/x",
+            "m",
+            None,
+            Duration::from_secs(1),
+            Budget::calls(1)
+        )
+        .is_err()
+    );
+    assert!(
+        HttpProposer::new(
+            "https://model.example/v1/chat/completions",
+            "m",
+            Some("k"),
+            Duration::from_secs(1),
+            Budget::calls(1)
+        )
+        .is_ok()
+    );
 }

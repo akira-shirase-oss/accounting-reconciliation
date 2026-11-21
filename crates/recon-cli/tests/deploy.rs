@@ -7,7 +7,11 @@
 const SERVER_HEAD_BOUND_MS: u64 = 10_000;
 
 fn deploy_file(name: &str) -> String {
-    std::fs::read_to_string(format!("{}/../../deploy/{name}", env!("CARGO_MANIFEST_DIR"))).unwrap()
+    std::fs::read_to_string(format!(
+        "{}/../../deploy/{name}",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .unwrap()
 }
 
 /// Parses `keepalive <dur>` durations (`5s`, `500ms`, `2m`) into milliseconds.
@@ -16,8 +20,11 @@ fn keepalive_ms(text: &str) -> Vec<u64> {
         .filter_map(|line| {
             let line = line.trim();
             let value = line.strip_prefix("keepalive")?.trim();
-            let (num, unit) = value
-                .split_at(value.find(|c: char| c.is_ascii_alphabetic()).unwrap_or(value.len()));
+            let (num, unit) = value.split_at(
+                value
+                    .find(|c: char| c.is_ascii_alphabetic())
+                    .unwrap_or(value.len()),
+            );
             let n: u64 = num.trim().parse().ok()?;
             Some(match unit {
                 "ms" => n,
@@ -52,14 +59,19 @@ fn the_caddy_upstream_idle_bound_is_below_the_servers() {
 
 #[test]
 fn the_load_client_pool_idles_below_the_servers_bound() {
-    let loadgen =
-        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../perf/loadgen/src/main.rs"))
-            .unwrap();
+    let loadgen = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../perf/loadgen/src/main.rs"
+    ))
+    .unwrap();
     let setting = loadgen
         .lines()
         .find(|line| line.contains("pool_idle_timeout"))
         .expect("the load client must bound its pooled idle below the server's");
-    let millis = if let Some(n) = setting.split("from_secs(").nth(1).and_then(|s| s.split(')').next())
+    let millis = if let Some(n) = setting
+        .split("from_secs(")
+        .nth(1)
+        .and_then(|s| s.split(')').next())
     {
         n.trim_end_matches('u').parse::<u64>().unwrap() * 1_000
     } else {
