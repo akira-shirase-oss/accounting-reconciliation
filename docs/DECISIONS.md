@@ -917,6 +917,31 @@ conservative side.
   refuses it until the owner reopens the month with a reason, which is
   itself a decision. Cost: a rule and a close are each a named act with a
   named actor; nothing rewrites either silently.
+- **D-077 — The period write lock (migrations 0012, 0013).** D-076's "the
+  database locks the month" made true for every write, not only line rows.
+  A close takes the account's advisory transaction lock (`7262`, the same
+  key the import flip holds) before it touches the period — contention is a
+  named `409 account_busy` with `Retry-After: 2`, never a wait — and then
+  `FOR UPDATE` on the period row. Every statement that can move a line's
+  world — line rows, exception rows, match status, all three allocation
+  tables, proposals, and line/match-subject decisions — runs a
+  statement-level transition-table trigger that upserts the touched
+  `(firm, client, account, month)` periods, locks them `FOR KEY SHARE` in
+  one sorted order, and raises `RCP02` if any is closed. `FOR KEY SHARE`
+  never conflicts with itself, and a close locks exactly one row, so the
+  scheme cannot deadlock; a write either lands before the close's lock
+  (the digest sees it) or waits and is refused — the stored digest cannot
+  miss a decision that landed. A rule create takes the client's `7264`
+  advisory lock around its count+insert so racing creates cannot pass
+  `MAX_RULES_PER_CLIENT`; versions are capped at `MAX_VERSIONS_PER_RULE`
+  (100) and `list` bounded to them. Regex rule predicates compile with a
+  Thompson `nfa_size_limit` and a syntax nest limit (32) — the 10 KiB cap
+  bounds the build, not a check after it — and the pattern's source is
+  never normalized, with case-insensitivity a compile flag. Exception
+  acknowledgement is its own reviewer-level act (`AcknowledgeException`),
+  not the preparer's `Resolve`. And `57014` (statement timeout) is named
+  `overloaded`, not `database_unavailable`: a cancelled statement is
+  contention, the database is up.
 
 ## Open questions (blocked on the maintainer or an outside party)
 
