@@ -48,9 +48,18 @@ restore() {
   local f
   while read -r f; do
     [ -n "$f" ] || continue
-    cp -a "$SNAP/$f" "$f" || return 1
+    cp "$SNAP/$f" "$f" || return 1
+    # `cp` gives the restored file a fresh mtime on purpose: `cp -a` would preserve the
+    # snapshot's older one, cargo's staleness check would then see the sources as
+    # unchanged, and the mutant-built binary would survive into the next suite run —
+    # that is how `metadata_…` once refused `://` narrations with the tree unmutated.
+    touch "$f" || return 1
     if ! cmp -s "$SNAP/$f" "$f"; then
       echo "prove-attacks: restore of $f is not byte-identical" >&2
+      return 1
+    fi
+    if [ ! "$f" -nt "$SNAP/$f" ]; then
+      echo "prove-attacks: restore of $f kept a stale mtime — cargo would skip the rebuild" >&2
       return 1
     fi
   done < <(files_of "$1")
@@ -78,7 +87,7 @@ export RECON_TEST_ADMIN_URL
 
 # A mutant proves a test watches its protection only if the suite is green
 # without it — prove the baseline first.
-if ! cargo test -p recon-server --test attacks --locked -- --test-threads=1 \
+if ! cargo test -p recon-server --test attacks --locked \
      > "target/prove-baseline.log" 2>&1; then
   echo "prove-attacks: the unmutated attack suite is not green — nothing can be proved:" >&2
   grep -E 'FAILED|^error' "target/prove-baseline.log" | head -20 >&2

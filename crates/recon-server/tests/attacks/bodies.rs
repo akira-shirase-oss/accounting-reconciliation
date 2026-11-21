@@ -52,9 +52,13 @@ async fn a_body_past_the_cap_is_refused() {
             Some(r.json().await.unwrap())
         }
         // Under load the 413 + connection-drop can land while reqwest is still
-        // writing the 50 MiB — the reset is the refusal reaching the wire; there
-        // is no body to read, and the staged-nothing check below still applies.
-        Err(e) if e.to_string().contains("Connection reset") => None,
+        // writing the 50 MiB — the refusal reached the wire as a broken
+        // connection; there is no body to read, and the staged-nothing check
+        // below still applies. The error KIND is the check: reqwest's Display
+        // is only `error sending request for url (…)` and never names the
+        // reset, so a `to_string()` match is dead code. A connect or timeout
+        // failure is still a wedge, not a refusal — those panic.
+        Err(e) if e.is_request() || e.is_body() => None,
         Err(e) => panic!("the oversized upload failed oddly: {e}"),
     };
     if let Some(body) = body {
