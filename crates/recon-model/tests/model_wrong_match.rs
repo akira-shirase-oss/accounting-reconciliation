@@ -156,6 +156,52 @@ fn a_residual_that_balances_validates() {
         panic!("a balanced residual is a proposal");
     };
     assert_eq!(proposal.residual.unwrap().code.code(), "bank_fee");
+    // D-014/S2-5: a residual always needs the second pair of eyes.
+    assert!(proposal.needs_four_eyes);
+}
+
+/// The review's example (S2-5): a 15.00 document to a 10.00 line whose
+/// "bank fee" residual is negative — arithmetically balanced, semantically
+/// refused: residuals are positive magnitudes on the wire.
+#[test]
+fn a_negative_residual_cannot_balance() {
+    let mut req = request();
+    req.line.amount = usd(-1000);
+    req.candidates[0].open = usd(1500);
+    let ans = answer(&json!({
+        "kind": "proposal",
+        "allocations": [{"document": DOC_A, "amount_minor": 1500, "currency": "USD"}],
+        "residual": {"code": "bank_fee", "amount_minor": -500, "currency": "USD"},
+        "reason": "invoice less a fee",
+    }));
+    assert_eq!(validate(&req, &ans), Err(Refusal::NonPositiveResidual));
+    // Zero fares no better — the named residual must carry a real amount.
+    let ans = answer(&json!({
+        "kind": "proposal",
+        "allocations": [{"document": DOC_A, "amount_minor": 4215, "currency": "USD"}],
+        "residual": {"code": "bank_fee", "amount_minor": 0, "currency": "USD"},
+        "reason": "invoice exactly, plus nothing",
+    }));
+    assert_eq!(
+        validate(&request(), &ans),
+        Err(Refusal::NonPositiveResidual)
+    );
+}
+
+/// A `rounding` residual is at most one minor unit per document (D-014) —
+/// anything bigger is a made-up difference, not rounding (S2-5).
+#[test]
+fn a_rounding_residual_past_one_minor_unit_per_document_is_refused() {
+    let answer = answer(&json!({
+        "kind": "proposal",
+        "allocations": [{"document": DOC_A, "amount_minor": 4210, "currency": "USD"}],
+        "residual": {"code": "rounding", "amount_minor": 5, "currency": "USD"},
+        "reason": "invoice close enough",
+    }));
+    assert_eq!(
+        validate(&request(), &answer),
+        Err(Refusal::RoundingTooLarge)
+    );
 }
 
 #[test]

@@ -11,7 +11,9 @@ use std::fmt;
 
 use recon_domain::{
     DocumentId, Money,
-    matching::{DocumentAllocation, Residual, ResidualCode},
+    matching::{
+        BalancedMatch, DocumentAllocation, LineAllocation, MatchRefusal, Residual, ResidualCode,
+    },
 };
 
 use crate::{Answer, ProposeRequest};
@@ -37,6 +39,12 @@ pub enum Refusal {
     ReasonTooLong,
     /// A residual code outside the named set (D-014).
     UnknownResidualCode,
+    /// A residual of zero or less — residuals are positive magnitudes on the
+    /// wire; the code says which side they explain (D-014, S2-5).
+    NonPositiveResidual,
+    /// A `rounding` residual larger than one minor unit per document — the
+    /// same bound [`BalancedMatch::new`] applies everywhere else (D-014, S2-5).
+    RoundingTooLarge,
     /// One document named twice.
     DuplicateCandidate,
     /// A proposal with nothing allocated.
@@ -54,6 +62,8 @@ impl Refusal {
             Self::NonPositiveAllocation => "nonpositive_allocation",
             Self::ReasonTooLong => "reason_too_long",
             Self::UnknownResidualCode => "unknown_residual_code",
+            Self::NonPositiveResidual => "nonpositive_residual",
+            Self::RoundingTooLarge => "rounding_too_large",
             Self::DuplicateCandidate => "duplicate_candidate",
             Self::NoChoices => "no_choices",
         }
@@ -105,6 +115,9 @@ pub struct ValidatedProposal {
     pub allocations: Vec<DocumentAllocation>,
     /// The named residual that completed the balance, if any.
     pub residual: Option<Residual>,
+    /// `true` whenever the proposal carries a residual — the same
+    /// `BalancedMatch::needs_four_eyes` rule the engine applies (D-014).
+    pub needs_four_eyes: bool,
     /// The model's reason, within the bound.
     pub reason: String,
 }
@@ -180,6 +193,9 @@ pub fn validate(request: &ProposeRequest, answer: &Answer) -> Result<Validated, 
                 return Err(Refusal::CurrencyMismatch);
             }
             let code = residual_code(&r.code).ok_or(Refusal::UnknownResidualCode)?;
+            if r.amount_minor <= 0 {
+                return Err(Refusal::NonPositiveResidual);
+            }
             covered = covered
                 .checked_add(r.amount_minor)
                 .ok_or(Refusal::Unbalanced)?;
@@ -194,9 +210,29 @@ pub fn validate(request: &ProposeRequest, answer: &Answer) -> Result<Validated, 
         return Err(Refusal::Unbalanced);
     }
 
+    // The same balance law the engine applies (D-014, S2-5): build the proposed
+    // match through `BalancedMatch::new` so its typed refusals — a rounding
+    // residual past one minor unit per document, a zero allocation — are this
+    // port's refusals too, not just the write path's.
+    let residuals: Vec<Residual> = residual.into_iter().collect();
+    let needs_four_eyes = !residuals.is_empty();
+    BalancedMatch::new(
+        vec![LineAllocation {
+            line: request.line.id,
+            amount: Money::new(line_abs, currency).map_err(|_| Refusal::Unbalanced)?,
+        }],
+        out.clone(),
+        residuals.clone(),
+    )
+    .map_err(|e| match e {
+        MatchRefusal::RoundingTooLarge => Refusal::RoundingTooLarge,
+        _ => Refusal::Unbalanced,
+    })?;
+
     Ok(Validated::Proposal(ValidatedProposal {
         allocations: out,
-        residual,
+        residual: residuals.first().copied(),
+        needs_four_eyes,
         reason: reason.clone(),
     }))
 }
