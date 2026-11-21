@@ -20,7 +20,7 @@ pub const REGEX_COMPILED_LIMIT: usize = 10 * 1024;
 /// The most nested groups/classes a regex predicate may use — bounds parse depth.
 pub const REGEX_NEST_LIMIT: u32 = 32;
 /// The most narration bytes × predicates one re-evaluation may scan — the
-/// PikeVM cost is linear in searched bytes, so the bound counts the real work
+/// `PikeVM` cost is linear in searched bytes, so the bound counts the real work
 /// (S1-2).
 pub const MAX_EVALUATION_WORK_BYTES: u64 = 128 * 1024 * 1024;
 
@@ -262,9 +262,7 @@ impl CompiledPredicate {
                             .case_insensitive(true)
                             .nest_limit(REGEX_NEST_LIMIT),
                     )
-                    .thompson(
-                        thompson::Config::new().nfa_size_limit(Some(REGEX_COMPILED_LIMIT)),
-                    )
+                    .thompson(thompson::Config::new().nfa_size_limit(Some(REGEX_COMPILED_LIMIT)))
                     .build(&m.value)
                     .map_err(|e| {
                         if e.size_limit().is_some() {

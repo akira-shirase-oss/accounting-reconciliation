@@ -950,8 +950,15 @@ async fn a_close_during_a_flip_is_refused_busy() {
         let pool = db.pool.clone();
         let gate = std::sync::Arc::clone(&gate);
         tokio::spawn(async move {
-            imports::flip(&pool, staging, &summary, common::OPERATOR, &*gate, common::FLIP_TIMEOUT)
-                .await
+            imports::flip(
+                &pool,
+                staging,
+                &summary,
+                common::OPERATOR,
+                &*gate,
+                common::FLIP_TIMEOUT,
+            )
+            .await
         })
     };
     gate.reached.notified().await;
@@ -975,5 +982,244 @@ async fn a_close_during_a_flip_is_refused_busy() {
     gate.release.notify_one();
     flip.await.unwrap().unwrap();
     assert_eq!(lines_in(&db.pool, &account, "unreviewed").await.len(), 2);
+    db.cleanup().await;
+}
+
+/// S2-7: a rule's version history is bounded — the cap+1'th proposal refuses by
+/// name and a listing never returns more than the cap.
+#[tokio::test]
+async fn a_rules_versions_are_capped() {
+    let db = TestDb::new().await;
+    let account = tenant(&db.pool).await;
+    let user = owner(&db.pool, account.firm, "owner").await;
+    let (predicate, action) = fee_rule();
+    let rule = rules::create(
+        &db.pool,
+        account.firm,
+        account.client,
+        user,
+        "fees",
+        &predicate,
+        &action,
+    )
+    .await
+    .unwrap();
+    // Version 1 exists from create; propose up to the cap.
+    for _ in 1..rules::MAX_VERSIONS_PER_RULE {
+        rules::propose_version(
+            &db.pool,
+            account.firm,
+            account.client,
+            rule.id,
+            user,
+            &predicate,
+            &action,
+        )
+        .await
+        .unwrap();
+    }
+    let refused = rules::propose_version(
+        &db.pool,
+        account.firm,
+        account.client,
+        rule.id,
+        user,
+        &predicate,
+        &action,
+    )
+    .await;
+    assert!(
+        matches!(refused, Err(rules::RuleError::Conflict(_))),
+        "the cap+1'th proposal answered {refused:?} — the version history must be bounded"
+    );
+    let listed = rules::list(&db.pool, account.firm, account.client)
+        .await
+        .unwrap();
+    assert!(
+        listed[0].versions.len()
+            <= usize::try_from(rules::MAX_VERSIONS_PER_RULE).unwrap_or(usize::MAX)
+    );
+    db.cleanup().await;
+}
+
+/// S2-7: two creates racing the client's last rule slot land exactly once —
+/// the limit check and the insert are one serialization, not a read-then-write.
+#[tokio::test]
+async fn concurrent_creates_cannot_pass_the_client_limit() {
+    let db = TestDb::new().await;
+    let account = tenant(&db.pool).await;
+    let user = owner(&db.pool, account.firm, "owner").await;
+    let (predicate, action) = fee_rule();
+    for i in 0..(rules::MAX_RULES_PER_CLIENT - 1) {
+        rules::create(
+            &db.pool,
+            account.firm,
+            account.client,
+            user,
+            &format!("rule {i}"),
+            &predicate,
+            &action,
+        )
+        .await
+        .unwrap();
+    }
+    let (a, b) = tokio::join!(
+        rules::create(
+            &db.pool,
+            account.firm,
+            account.client,
+            user,
+            "racer a",
+            &predicate,
+            &action,
+        ),
+        rules::create(
+            &db.pool,
+            account.firm,
+            account.client,
+            user,
+            "racer b",
+            &predicate,
+            &action,
+        )
+    );
+    assert!(
+        a.is_ok() ^ b.is_ok(),
+        "two racing creates answered {a:?} and {b:?} — exactly one may land",
+    );
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM recon.rules WHERE firm_id = $1 AND client_id = $2",
+    )
+    .bind(account.firm.as_uuid())
+    .bind(account.client.as_uuid())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(count, rules::MAX_RULES_PER_CLIENT);
+    db.cleanup().await;
+}
+
+/// The deterministic half of the limit-race fix: while the client's rule-create
+/// advisory lock is held, a create refuses by name — the count check and the
+/// insert share one serialization (S2-7). `7264` is `RULES_LOCK`.
+#[tokio::test]
+async fn a_create_refuses_while_the_clients_rule_lock_is_held() {
+    let db = TestDb::new().await;
+    let account = tenant(&db.pool).await;
+    let user = owner(&db.pool, account.firm, "owner").await;
+    let mut tx = db.pool.begin().await.unwrap();
+    sqlx::query(
+        "SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended($1::text, 7264))",
+    )
+    .bind(account.client.as_uuid())
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    let (predicate, action) = fee_rule();
+    let refused = rules::create(
+        &db.pool,
+        account.firm,
+        account.client,
+        user,
+        "blocked",
+        &predicate,
+        &action,
+    )
+    .await;
+    assert!(
+        matches!(refused, Err(rules::RuleError::Conflict(_))),
+        "a create under the held lock answered {refused:?} — it must refuse busy"
+    );
+    tx.rollback().await.unwrap();
+    db.cleanup().await;
+}
+
+/// S2-6 (D-076): the period lock covers exception writes, not only line writes.
+/// A close racing an in-flight acknowledgement waits on the period's key-share
+/// lock, then sees the acknowledged truth — the pre-guard close would read the
+/// stale count and refuse the month it should have closed (or commit a digest
+/// the landed decision was absent from).
+#[tokio::test]
+async fn a_close_waits_on_an_in_flight_acknowledgement() {
+    let db = TestDb::new().await;
+    let account = tenant(&db.pool).await;
+    let user = owner(&db.pool, account.firm, "owner").await;
+    import(&db.pool, &account, &rows(0, 1))
+        .await
+        .unwrap()
+        .complete();
+    let line = LineId::from_uuid(lines_in(&db.pool, &account, "unreviewed").await[0]);
+    let job = start_job(&db, &account).await;
+    matching::commit_chunk(
+        &db.pool,
+        &job,
+        &[DecidedLine {
+            seq: 1,
+            line,
+            outcome: Decided::Exception {
+                kind: ExceptionKind::NoCandidate,
+                candidates: vec![],
+            },
+        }],
+        LEASE,
+        TX_TIMEOUT,
+    )
+    .await
+    .unwrap();
+
+    // Connection A: the acknowledgement's own write, uncommitted — the trigger's
+    // FOR KEY SHARE on the line's period is what the close must wait on.
+    let mut a = db.pool.begin().await.unwrap();
+    sqlx::query(
+        "UPDATE recon.line_exceptions
+            SET acknowledged_by = $3, acknowledged_at = now()
+          WHERE firm_id = $1 AND line_id = $2 AND acknowledged_at IS NULL",
+    )
+    .bind(account.firm.as_uuid())
+    .bind(line.as_uuid())
+    .bind(user.as_uuid())
+    .execute(&mut *a)
+    .await
+    .unwrap();
+
+    // Connection B: the close — it must block on the in-flight stamp, not read
+    // the pre-ack count and refuse (or commit past it).
+    let close = tokio::spawn({
+        let pool = db.pool.clone();
+        async move {
+            periods::close(
+                &pool,
+                account.firm,
+                account.client,
+                account.id,
+                march(),
+                user,
+            )
+            .await
+        }
+    });
+    // Wait on the definite signal: B is blocked on the period row's lock.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity
+              WHERE wait_event_type = 'Lock' AND datname = current_database()",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        if waiting > 0 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the close finished ({:?}) or never blocked — it did not wait on the \
+             in-flight acknowledgement's period lock",
+            close.await.unwrap().err()
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    a.commit().await.unwrap();
+    close.await.unwrap().unwrap();
     db.cleanup().await;
 }

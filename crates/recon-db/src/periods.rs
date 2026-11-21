@@ -512,57 +512,7 @@ pub async fn re_evaluate(
     .bind(MAX_EVALUATED_LINES)
     .fetch_all(&mut *tx)
     .await?;
-    // The lines × rules × bytes bound (S1-2): PikeVM cost is linear in the
-    // searched narration bytes, so the bound counts the real work and the
-    // refusal names it. 10k lines of 8 KiB narrations under a handful of rules
-    // would otherwise wedge a Tokio worker while the row lock is held.
-    let mut owned: Vec<(Uuid, String, Option<String>, i64, Uuid)> =
-        Vec::with_capacity(lines.len());
-    let mut searched_bytes: u64 = 0;
-    for line in &lines {
-        let narration: String = line.try_get("narration_norm")?;
-        searched_bytes = searched_bytes.saturating_add(narration.len() as u64);
-        owned.push((
-            line.try_get("id")?,
-            narration,
-            line.try_get("counterparty_norm")?,
-            line.try_get("amount_minor")?,
-            line.try_get("account_id")?,
-        ));
-    }
-    if rule::evaluation_too_big(searched_bytes, compiled.len()) {
-        return Err(PeriodError::EvaluationTooLarge);
-    }
-    let (compiled, proposals, truncated) = tokio::task::spawn_blocking(move || {
-        let mut proposals = Vec::new();
-        let mut truncated = false;
-        'lines: for (id, narration, counterparty, amount_minor, account) in &owned {
-            let facts = rule::LineFacts {
-                narration,
-                counterparty: counterparty.as_deref(),
-                amount_minor: *amount_minor,
-                account: *account,
-            };
-            for (rule_id, version, predicate, action) in &mut compiled {
-                if predicate.matches(&facts) {
-                    if proposals.len() >= MAX_PROPOSALS {
-                        truncated = true;
-                        break 'lines;
-                    }
-                    proposals.push(RuleProposal {
-                        line: *id,
-                        rule: *rule_id,
-                        version: *version,
-                        action: action.clone(),
-                    });
-                    break; // first matching rule wins
-                }
-            }
-        }
-        (compiled, proposals, truncated)
-    })
-    .await
-    .map_err(|e| DbError::Inconsistent(format!("re-evaluation worker: {e}")))?;
+    let (compiled, proposals, truncated) = run_evaluation(compiled, &lines).await?;
     let rule_versions: Vec<serde_json::Value> = compiled
         .iter()
         .map(|(id, v, _, _)| serde_json::json!({"rule": id, "version": v}))
@@ -594,4 +544,65 @@ pub async fn re_evaluate(
         proposals,
         truncated,
     })
+}
+
+/// The compiled form of one active rule for [`run_evaluation`].
+type CompiledRule = (Uuid, i32, CompiledPredicate, RuleAction);
+
+/// The lines × rules × bytes bound (S1-2): `PikeVM` cost is linear in the
+/// searched narration bytes, so the bound counts the real work and the refusal
+/// names it. 10k lines of 8 KiB narrations under a handful of rules would
+/// otherwise wedge a Tokio worker while the row lock is held — the search runs
+/// in a blocking worker, bounded.
+async fn run_evaluation(
+    compiled: Vec<CompiledRule>,
+    lines: &[sqlx::postgres::PgRow],
+) -> Result<(Vec<CompiledRule>, Vec<RuleProposal>, bool), PeriodError> {
+    let mut owned: Vec<(Uuid, String, Option<String>, i64, Uuid)> = Vec::with_capacity(lines.len());
+    let mut searched_bytes: u64 = 0;
+    for line in lines {
+        let narration: String = line.try_get("narration_norm")?;
+        searched_bytes = searched_bytes.saturating_add(narration.len() as u64);
+        owned.push((
+            line.try_get("id")?,
+            narration,
+            line.try_get("counterparty_norm")?,
+            line.try_get("amount_minor")?,
+            line.try_get("account_id")?,
+        ));
+    }
+    if rule::evaluation_too_big(searched_bytes, compiled.len()) {
+        return Err(PeriodError::EvaluationTooLarge);
+    }
+    tokio::task::spawn_blocking(move || {
+        let mut compiled = compiled;
+        let mut proposals = Vec::new();
+        let mut truncated = false;
+        'lines: for (id, narration, counterparty, amount_minor, account) in &owned {
+            let facts = rule::LineFacts {
+                narration,
+                counterparty: counterparty.as_deref(),
+                amount_minor: *amount_minor,
+                account: *account,
+            };
+            for (rule_id, version, predicate, action) in &mut compiled {
+                if predicate.matches(&facts) {
+                    if proposals.len() >= MAX_PROPOSALS {
+                        truncated = true;
+                        break 'lines;
+                    }
+                    proposals.push(RuleProposal {
+                        line: *id,
+                        rule: *rule_id,
+                        version: *version,
+                        action: action.clone(),
+                    });
+                    break; // first matching rule wins
+                }
+            }
+        }
+        Ok((compiled, proposals, truncated))
+    })
+    .await
+    .map_err(|e| DbError::Inconsistent(format!("re-evaluation worker: {e}")))?
 }

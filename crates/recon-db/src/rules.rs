@@ -17,6 +17,11 @@ use crate::decisions::{self, NewDecision};
 
 /// The most rules one client may hold (bounded everything).
 pub const MAX_RULES_PER_CLIENT: i64 = 200;
+/// The most versions one rule may hold — the history is bounded (S2-7).
+pub const MAX_VERSIONS_PER_RULE: i32 = 100;
+/// The advisory-lock space serializing one client's rule creates, so the
+/// limit check and the insert share one serialization (S2-7).
+const RULES_LOCK: i64 = 7264;
 /// The most rules one evaluation pass compiles.
 const MAX_EVALUATED_RULES: i64 = 500;
 
@@ -180,6 +185,9 @@ pub async fn create(
         return Err(RuleError::Invalid("a rule name is 1-200 bytes"));
     }
     let mut tx = pool.begin().await?;
+    if !crate::imports::try_lock(&mut tx, client.as_uuid(), RULES_LOCK).await? {
+        return Err(RuleError::Conflict("the client's rule set is busy"));
+    }
     let count: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM recon.rules WHERE firm_id = $1 AND client_id = $2",
     )
@@ -297,6 +305,9 @@ pub async fn propose_version(
         .try_get::<Option<i32>, _>("max_version")?
         .unwrap_or(0)
         .saturating_add(1);
+    if version > MAX_VERSIONS_PER_RULE {
+        return Err(RuleError::Conflict("the rule's version history is bounded"));
+    }
     insert_version(
         &mut tx, firm, client, rule, version, user, &predicate, &action,
     )
@@ -468,16 +479,18 @@ pub async fn list(pool: &PgPool, firm: FirmId, client: ClientId) -> Result<Vec<R
     .await?;
     let mut rules = Vec::with_capacity(rule_rows.len());
     for r in &rule_rows {
-        let versions = sqlx::query(
+        let mut versions = sqlx::query(
             "SELECT version, predicate, action, action_arg, auto_apply, status,
                     proposed_by, approved_by
                FROM recon.rule_versions
-              WHERE firm_id = $1 AND rule_id = $2 ORDER BY version",
+              WHERE firm_id = $1 AND rule_id = $2 ORDER BY version DESC LIMIT $3",
         )
         .bind(firm.as_uuid())
         .bind(r.try_get::<Uuid, _>("id")?)
+        .bind(i64::from(MAX_VERSIONS_PER_RULE))
         .fetch_all(pool)
         .await?;
+        versions.reverse();
         rules.push(Rule {
             id: r.try_get("id")?,
             name: r.try_get("name")?,
