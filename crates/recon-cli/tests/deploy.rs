@@ -1,8 +1,13 @@
 //! The deploy files pin the keep-alive contract (D-078): the proxy's upstream
 //! idle bound sits below the server's head bound so a pooled reuse never races
 //! the idle close into a reset, and the load client's pool idle is below it too.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration tests: a panic is the failure report"
+)]
 
-/// The server's default head bound (RECON_HEADER_READ_TIMEOUT_MS); a proxy or
+/// The server's default head bound (`RECON_HEADER_READ_TIMEOUT_MS`); a proxy or
 /// client idling above it reuses a connection the server may have closed.
 const SERVER_HEAD_BOUND_MS: u64 = 10_000;
 
