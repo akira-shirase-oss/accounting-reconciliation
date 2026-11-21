@@ -78,7 +78,7 @@ export RECON_TEST_ADMIN_URL
 
 # A mutant proves a test watches its protection only if the suite is green
 # without it — prove the baseline first.
-if ! cargo test -p recon-server --test attacks --locked -- --test-threads=6 \
+if ! cargo test -p recon-server --test attacks --locked -- --test-threads=1 \
      > "target/prove-baseline.log" 2>&1; then
   echo "prove-attacks: the unmutated attack suite is not green — nothing can be proved:" >&2
   grep -E 'FAILED|^error' "target/prove-baseline.log" | head -20 >&2
